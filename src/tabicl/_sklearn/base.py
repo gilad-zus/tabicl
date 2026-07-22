@@ -159,6 +159,69 @@ class TabICLBaseEstimator(BaseEstimator):
         else:
             self.inference_config_ = self.inference_config
 
+    def _setup_hyperspline(self) -> None:
+        """Construct or load the frozen zero-shot numerical transformer."""
+        from tabicl._hyperspline import backbone_state_dict_hash, HyperSplineTransform, load_hyperspline_checkpoint
+
+        self.model_.eval()
+        for parameter in self.model_.parameters():
+            parameter.requires_grad_(False)
+        if self.hyperspline_checkpoint is not None:
+            module, _ = load_hyperspline_checkpoint(
+                self.hyperspline_checkpoint,
+                device=self.device_,
+                expected_backbone_reference=self.checkpoint_version,
+                expected_backbone_hash=backbone_state_dict_hash(self.model_),
+            )
+        else:
+            config = dict(self.hyperspline_config or {})
+            config.setdefault("target_aware", self.hyperspline_target_aware)
+            module = HyperSplineTransform(**config).to(self.device_)
+        module.eval()
+        for parameter in module.parameters():
+            parameter.requires_grad_(False)
+        self.hyperspline_ = module
+
+    def _fit_hyperspline_context(self, y: np.ndarray) -> None:
+        """Generate and cache parameters from numerical context rows only."""
+        from tabicl._hyperspline.statistics import summarize_context
+
+        if self.hyper_ensemble_.n_numerical_features_ == 0:
+            self.hyperspline_parameters_ = None
+            self.hyperspline_context_ = None
+            return
+        x_context = torch.as_tensor(self.hyper_ensemble_.context_numerical_, dtype=torch.float32, device=self.device_).unsqueeze(0)
+        missing = torch.as_tensor(self.hyper_ensemble_.context_missing_, dtype=torch.bool, device=self.device_).unsqueeze(0)
+        y_context = torch.as_tensor(y, dtype=torch.float32, device=self.device_).unsqueeze(0)
+        with torch.no_grad():
+            stats = summarize_context(
+                x_context,
+                missing,
+                y_context if self.hyperspline_.target_aware else None,
+                eps=self.hyperspline_.eps,
+            )
+            self.hyperspline_parameters_ = self.hyperspline_.generate_parameters(stats)
+            self.hyperspline_context_ = self.hyperspline_.apply_transform(
+                x_context, self.hyperspline_parameters_, missing
+            )
+
+    def _hyperspline_ensemble_data(self, parts):
+        """Apply cached context-generated parameters to a typed query table."""
+        if self.hyperspline_parameters_ is None:
+            context_empty = torch.empty(
+                (1, self.hyper_ensemble_.context_numerical_.shape[0], 0),
+                dtype=torch.float32,
+                device=self.device_,
+            )
+            query_empty = torch.empty((1, parts.numerical.shape[0], 0), dtype=torch.float32, device=self.device_)
+            return self.hyper_ensemble_.build(parts, context_empty, query_empty)
+        query_num, query_missing = self.hyper_ensemble_.query_numerical(parts)
+        x_query = torch.as_tensor(query_num, dtype=torch.float32, device=self.device_).unsqueeze(0)
+        missing = torch.as_tensor(query_missing, dtype=torch.bool, device=self.device_).unsqueeze(0)
+        with torch.no_grad():
+            query_out = self.hyperspline_.apply_transform(x_query, self.hyperspline_parameters_, missing)
+        return self.hyper_ensemble_.build(parts, self.hyperspline_context_, query_out)
+
     def _move_cache_to_device(self) -> None:
         """Move KV cache to the current device, auto-upcasting if needed.
 

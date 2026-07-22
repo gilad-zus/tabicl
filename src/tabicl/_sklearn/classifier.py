@@ -19,6 +19,7 @@ from huggingface_hub.utils import LocalEntryNotFoundError
 
 from .base import TabICLBaseEstimator
 from .preprocessing import TransformToNumerical, EnsembleGenerator
+from tabicl._hyperspline.preprocessing import HyperSplineEnsembleGenerator
 from .sklearn_utils import validate_data, _num_samples
 
 from tabicl import InferenceConfig
@@ -297,6 +298,10 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
         n_jobs: Optional[int] = None,
         verbose: bool = False,
         inference_config: Optional[InferenceConfig | Dict] = None,
+        numerical_preprocessing: str = "existing",
+        hyperspline_checkpoint: Optional[str | Path] = None,
+        hyperspline_config: Optional[Dict] = None,
+        hyperspline_target_aware: bool = False,
     ):
         self.n_estimators = n_estimators
         self.norm_methods = norm_methods
@@ -320,6 +325,10 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
         self.random_state = random_state
         self.verbose = verbose
         self.inference_config = inference_config
+        self.numerical_preprocessing = numerical_preprocessing
+        self.hyperspline_checkpoint = hyperspline_checkpoint
+        self.hyperspline_config = hyperspline_config
+        self.hyperspline_target_aware = hyperspline_target_aware
 
     def _load_model(self) -> None:
         """Load a model from a given path or download it if not available.
@@ -493,8 +502,32 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
                     f"ensembling during column-wise embedding and hierarchical classification during in-context learning."
                 )
 
-        #  Transform input features
+        if self.numerical_preprocessing not in ("existing", "hyperspline"):
+            raise ValueError("numerical_preprocessing must be 'existing' or 'hyperspline'")
+
+        # Transform input features
         self.X_encoder_ = TransformToNumerical(verbose=self.verbose)
+        if self.numerical_preprocessing == "hyperspline":
+            parts = self.X_encoder_.fit_transform_parts(X)
+            self.hyper_ensemble_ = HyperSplineEnsembleGenerator(
+                classification=True,
+                n_estimators=self.n_estimators,
+                norm_methods=self.norm_methods or ["none", "power"],
+                feat_shuffle_method=self.feat_shuffle_method,
+                class_shuffle_method=self.class_shuffle_method,
+                outlier_threshold=self.outlier_threshold,
+                random_state=self.random_state,
+            ).fit(parts, y)
+            # Keep the existing attribute for persistence and class-shuffle
+            # aggregation; its numerical preprocessors are not used here.
+            self.ensemble_generator_ = self.hyper_ensemble_.ensemble_
+            self._setup_hyperspline()
+            self._fit_hyperspline_context(y)
+            self.model_kv_cache_ = None
+            if self.kv_cache:
+                raise ValueError("kv_cache is not yet supported with numerical_preprocessing='hyperspline'")
+            return self
+
         X = self.X_encoder_.fit_transform(X)
 
         # Fit ensemble generator to create multiple dataset views
@@ -741,32 +774,41 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
             else:
                 X[:, feature_mask] = 0.0
 
-        X = self.X_encoder_.transform(X)
-
-        # Skip KV cache when features are masked
-        has_kv_cache = hasattr(self, "model_kv_cache_") and self.model_kv_cache_ is not None
-        use_cache = has_kv_cache and feature_mask is None
-
-        if use_cache:
-            # Cache exists: forward only test data and use the pre-computed cache for training data
-            test_data = self.ensemble_generator_.transform(X, mode="test")
-            outputs = []
-            for norm_method, (Xs_test,) in test_data.items():
-                kv_cache = self.model_kv_cache_[norm_method]
-                outputs.append(self._batch_forward_with_cache(Xs_test, kv_cache))
-            outputs = np.concatenate(outputs, axis=0)
-        else:
-            # No cache or masked features: forward both training and test data
-            data = self.ensemble_generator_.transform(X, mode="both", feature_mask=feature_mask)
+        if self.numerical_preprocessing == "hyperspline":
+            if feature_mask is not None:
+                raise ValueError("all-NaN feature masking is not yet supported with numerical_preprocessing='hyperspline'")
+            data = self._hyperspline_ensemble_data(self.X_encoder_.transform_parts(X))
             outputs = []
             for norm_method, (Xs, ys) in data.items():
-                if feature_mask is None:
-                    feature_shuffles = self.ensemble_generator_.feature_shuffles_[norm_method]
-                else:
-                    feature_shuffles = self.ensemble_generator_.masked_feature_shuffles_[norm_method]
-
-                outputs.append(self._batch_forward(Xs, ys, feature_shuffles))
+                outputs.append(self._batch_forward(Xs, ys, self.hyper_ensemble_.feature_shuffles_[norm_method]))
             outputs = np.concatenate(outputs, axis=0)
+        else:
+            X = self.X_encoder_.transform(X)
+
+            # Skip KV cache when features are masked
+            has_kv_cache = hasattr(self, "model_kv_cache_") and self.model_kv_cache_ is not None
+            use_cache = has_kv_cache and feature_mask is None
+
+            if use_cache:
+                # Cache exists: forward only test data and use the pre-computed cache for training data
+                test_data = self.ensemble_generator_.transform(X, mode="test")
+                outputs = []
+                for norm_method, (Xs_test,) in test_data.items():
+                    kv_cache = self.model_kv_cache_[norm_method]
+                    outputs.append(self._batch_forward_with_cache(Xs_test, kv_cache))
+                outputs = np.concatenate(outputs, axis=0)
+            else:
+                # No cache or masked features: forward both training and test data
+                data = self.ensemble_generator_.transform(X, mode="both", feature_mask=feature_mask)
+                outputs = []
+                for norm_method, (Xs, ys) in data.items():
+                    if feature_mask is None:
+                        feature_shuffles = self.ensemble_generator_.feature_shuffles_[norm_method]
+                    else:
+                        feature_shuffles = self.ensemble_generator_.masked_feature_shuffles_[norm_method]
+
+                    outputs.append(self._batch_forward(Xs, ys, feature_shuffles))
+                outputs = np.concatenate(outputs, axis=0)
 
         # Extract class shuffle patterns from ensemble generator
         class_shuffles = []

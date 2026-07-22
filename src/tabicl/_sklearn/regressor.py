@@ -18,6 +18,7 @@ from huggingface_hub.utils import LocalEntryNotFoundError
 
 from .base import TabICLBaseEstimator
 from .preprocessing import TransformToNumerical, EnsembleGenerator
+from tabicl._hyperspline.preprocessing import HyperSplineEnsembleGenerator
 from .sklearn_utils import validate_data, _num_samples
 
 from tabicl import InferenceConfig
@@ -256,6 +257,10 @@ class TabICLRegressor(RegressorMixin, TabICLBaseEstimator):
         n_jobs: Optional[int] = None,
         verbose: bool = False,
         inference_config: Optional[InferenceConfig | Dict] = None,
+        numerical_preprocessing: str = "existing",
+        hyperspline_checkpoint: Optional[str | Path] = None,
+        hyperspline_config: Optional[Dict] = None,
+        hyperspline_target_aware: bool = False,
     ):
         self.n_estimators = n_estimators
         self.norm_methods = norm_methods
@@ -275,6 +280,10 @@ class TabICLRegressor(RegressorMixin, TabICLBaseEstimator):
         self.random_state = random_state
         self.verbose = verbose
         self.inference_config = inference_config
+        self.numerical_preprocessing = numerical_preprocessing
+        self.hyperspline_checkpoint = hyperspline_checkpoint
+        self.hyperspline_config = hyperspline_config
+        self.hyperspline_target_aware = hyperspline_target_aware
 
     def _load_model(self) -> None:
         """Load a model from a given path or download it if not available.
@@ -412,8 +421,30 @@ class TabICLRegressor(RegressorMixin, TabICLBaseEstimator):
         self.y_scaler_ = StandardScaler()
         y_scaled = self.y_scaler_.fit_transform(y.reshape(-1, 1)).flatten()
 
+        if self.numerical_preprocessing not in {"existing", "hyperspline"}:
+            raise ValueError("numerical_preprocessing must be 'existing' or 'hyperspline'.")
+
         # Transform input features
         self.X_encoder_ = TransformToNumerical(verbose=self.verbose)
+        if self.numerical_preprocessing == "hyperspline":
+            parts = self.X_encoder_.fit_transform_parts(X)
+            self.hyper_ensemble_ = HyperSplineEnsembleGenerator(
+                classification=False,
+                n_estimators=self.n_estimators,
+                norm_methods=self.norm_methods or ["none", "power"],
+                feat_shuffle_method=self.feat_shuffle_method,
+                outlier_threshold=self.outlier_threshold,
+                random_state=self.random_state,
+            ).fit(parts, y_scaled)
+            # Preserve the established ensemble metadata used by prediction and persistence.
+            self.ensemble_generator_ = self.hyper_ensemble_.ensemble_
+            self._setup_hyperspline()
+            self._fit_hyperspline_context(y_scaled)
+            self.model_kv_cache_ = None
+            if self.kv_cache:
+                raise ValueError("kv_cache is not supported with numerical_preprocessing='hyperspline'.")
+            return self
+
         X = self.X_encoder_.fit_transform(X)
 
         # Fit ensemble generator to create multiple dataset views
@@ -720,29 +751,12 @@ class TabICLRegressor(RegressorMixin, TabICLBaseEstimator):
             else:
                 X[:, feature_mask] = 0.0
 
-        X = self.X_encoder_.transform(X)
-
         output_type = [output_type] if isinstance(output_type, str) else list(output_type)
 
-        # Skip KV cache when features are masked
-        has_kv_cache = hasattr(self, "model_kv_cache_") and self.model_kv_cache_ is not None
-        use_cache = has_kv_cache and feature_mask is None
-
-        if use_cache:
-            # Cache exists: forward only test data and use the pre-computed cache for training data
-            test_data = self.ensemble_generator_.transform(X, mode="test")
-            results = {key: [] for key in output_type}
-            for norm_method, (Xs_test,) in test_data.items():
-                kv_cache = self.model_kv_cache_[norm_method]
-                batch_out = self._batch_forward_with_cache(Xs_test, kv_cache, output_type=output_type, alphas=alphas)
-                if isinstance(batch_out, dict):
-                    for key in output_type:
-                        results[key].append(batch_out[key])
-                else:
-                    results[output_type[0]].append(batch_out)
-        else:
-            # No cache or masked features: forward both training and test data
-            data = self.ensemble_generator_.transform(X, mode="both", feature_mask=feature_mask)
+        if self.numerical_preprocessing == "hyperspline":
+            if feature_mask is not None:
+                raise ValueError("Feature masking is not supported with numerical_preprocessing='hyperspline'.")
+            data = self._hyperspline_ensemble_data(self.X_encoder_.transform_parts(X))
             results = {key: [] for key in output_type}
             for Xs, ys in data.values():
                 batch_out = self._batch_forward(Xs, ys, output_type=output_type, alphas=alphas)
@@ -751,6 +765,36 @@ class TabICLRegressor(RegressorMixin, TabICLBaseEstimator):
                         results[key].append(batch_out[key])
                 else:
                     results[output_type[0]].append(batch_out)
+        else:
+            X = self.X_encoder_.transform(X)
+
+            # Skip KV cache when features are masked
+            has_kv_cache = hasattr(self, "model_kv_cache_") and self.model_kv_cache_ is not None
+            use_cache = has_kv_cache and feature_mask is None
+
+            if use_cache:
+                # Cache exists: forward only test data and use the pre-computed cache for training data
+                test_data = self.ensemble_generator_.transform(X, mode="test")
+                results = {key: [] for key in output_type}
+                for norm_method, (Xs_test,) in test_data.items():
+                    kv_cache = self.model_kv_cache_[norm_method]
+                    batch_out = self._batch_forward_with_cache(Xs_test, kv_cache, output_type=output_type, alphas=alphas)
+                    if isinstance(batch_out, dict):
+                        for key in output_type:
+                            results[key].append(batch_out[key])
+                    else:
+                        results[output_type[0]].append(batch_out)
+            else:
+                # No cache or masked features: forward both training and test data
+                data = self.ensemble_generator_.transform(X, mode="both", feature_mask=feature_mask)
+                results = {key: [] for key in output_type}
+                for Xs, ys in data.values():
+                    batch_out = self._batch_forward(Xs, ys, output_type=output_type, alphas=alphas)
+                    if isinstance(batch_out, dict):
+                        for key in output_type:
+                            results[key].append(batch_out[key])
+                    else:
+                        results[output_type[0]].append(batch_out)
 
         # Concatenate across ensemble members and apply inverse transform
         final_results = {}

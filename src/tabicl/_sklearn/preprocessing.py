@@ -5,6 +5,7 @@ import random
 import itertools
 from collections import OrderedDict
 from copy import deepcopy
+from dataclasses import dataclass
 from typing import List, Optional
 
 import numpy as np
@@ -24,6 +25,24 @@ from sklearn.preprocessing import (
 from sklearn.utils.validation import check_is_fitted
 
 from .sklearn_utils import validate_data
+
+
+@dataclass(frozen=True)
+class EncodedTable:
+    """Typed result of ``TransformToNumerical`` for deferred numerical transforms.
+
+    The ordinary ``transform`` API deliberately remains a merged ndarray for
+    sklearn compatibility.  HyperSpline uses this structure to leave ordinal
+    categorical values outside its numerical transform.
+    """
+
+    categorical: np.ndarray
+    numerical: np.ndarray
+    numerical_missing: np.ndarray
+
+    @property
+    def n_features(self) -> int:
+        return self.categorical.shape[1] + self.numerical.shape[1]
 
 
 class RecursionLimitManager:
@@ -125,6 +144,10 @@ class TransformToNumerical(TransformerMixin, BaseEstimator):
                     "DataFrame instead, so each column can be typed and preprocessed accordingly."
                 ) from None
             self.tfm_ = num_tfm
+            self.categorical_input_positions_ = np.empty(0, dtype=int)
+            self.numeric_input_positions_ = np.arange(X_arr.shape[1], dtype=int)
+            self.categorical_output_positions_ = np.empty(0, dtype=int)
+            self.numeric_output_positions_ = np.arange(X_arr.shape[1], dtype=int)
 
         else:
 
@@ -143,6 +166,11 @@ class TransformToNumerical(TransformerMixin, BaseEstimator):
 
             numeric_cols = make_column_selector(dtype_include="number")(X)
             numeric_pos = [X.columns.get_loc(col) for col in numeric_cols]
+
+            self.categorical_input_positions_ = np.asarray(cat_pos, dtype=int)
+            self.numeric_input_positions_ = np.asarray(numeric_pos, dtype=int)
+            self.categorical_output_positions_ = np.arange(len(cat_pos), dtype=int)
+            self.numeric_output_positions_ = np.arange(len(cat_pos), len(cat_pos) + len(numeric_pos), dtype=int)
 
             self.tfm_ = ColumnTransformer(
                 transformers=[("categorical", cat_tfm, cat_pos), ("continuous", num_tfm, numeric_pos)]
@@ -178,6 +206,31 @@ class TransformToNumerical(TransformerMixin, BaseEstimator):
             Transformed array with numerical representations.
         """
         return self.tfm_.transform(X)
+
+    def transform_parts(self, X) -> EncodedTable:
+        """Return encoded categorical and imputed numerical values separately.
+
+        This is intentionally additive: existing callers continue to receive the
+        exact merged matrix from :meth:`transform`.
+        """
+        X_out = np.asarray(self.transform(X))
+        if hasattr(X, "columns"):
+            if len(self.numeric_input_positions_):
+                numerical_missing = X.iloc[:, self.numeric_input_positions_].isna().to_numpy(dtype=bool)
+            else:
+                numerical_missing = np.zeros((len(X), 0), dtype=bool)
+        else:
+            raw = np.asarray(X, dtype=float)
+            numerical_missing = np.isnan(raw[:, self.numeric_input_positions_])
+        return EncodedTable(
+            categorical=X_out[:, self.categorical_output_positions_],
+            numerical=X_out[:, self.numeric_output_positions_],
+            numerical_missing=numerical_missing,
+        )
+
+    def fit_transform_parts(self, X, y=None) -> EncodedTable:
+        """Fit the existing encoder then expose its typed encoded result."""
+        return self.fit(X, y).transform_parts(X)
 
 
 class UniqueFeatureFilter(TransformerMixin, BaseEstimator):
