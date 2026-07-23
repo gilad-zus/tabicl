@@ -55,13 +55,22 @@ def train_fold(backbone, train_episodes, validation_episodes, test_episodes, arg
     hyperspline = HyperSplineTransform(**config).to(args.device).train()
     optimizer = torch.optim.Adam(hyperspline.parameters(), lr=args.lr)
     print(f"[{fold}] initialized HyperSpline with {sum(p.numel() for p in hyperspline.parameters()):,} trainable parameters", flush=True)
-    evaluate_group(backbone, hyperspline, f"{fold}/identity_train", train_episodes, 0, records)
+    identity_train_loss = evaluate_group(backbone, hyperspline, f"{fold}/identity_train", train_episodes, 0, records)
     if validation_episodes:
-        evaluate_group(backbone, hyperspline, f"{fold}/identity_validation", validation_episodes, 0, records)
+        identity_selection_loss = evaluate_group(
+            backbone, hyperspline, f"{fold}/identity_validation", validation_episodes, 0, records
+        )
+    else:
+        # LODO has no validation datasets; select against training loss only and
+        # label the resulting checkpoint accordingly in the console output.
+        identity_selection_loss = identity_train_loss
     evaluate_group(backbone, hyperspline, f"{fold}/identity_test", test_episodes, 0, records)
 
-    best_validation = float("inf")
-    best_state = None
+    # Identity is a first-class checkpoint candidate.  This is essential for a
+    # safe zero-shot preprocessor: a learned transform must beat doing nothing.
+    best_selection_loss = identity_selection_loss
+    best_epoch = 0
+    best_state = {key: value.detach().cpu().clone() for key, value in hyperspline.state_dict().items()}
     rng = np.random.default_rng(args.training_seed)
     for epoch in range(1, args.epochs + 1):
         hyperspline.train()
@@ -77,21 +86,25 @@ def train_fold(backbone, train_episodes, validation_episodes, test_episodes, arg
         if epoch == 1 or epoch % args.log_every == 0 or epoch == args.epochs:
             print(f"[{fold} train epoch={epoch}] mean_train_loss={np.mean(losses):.6f}", flush=True)
             hyperspline.eval()
-            evaluate_group(backbone, hyperspline, f"{fold}/trained_train", train_episodes, epoch, records)
-            validation_loss = evaluate_group(backbone, hyperspline, f"{fold}/validation", validation_episodes, epoch, records) if validation_episodes else float(np.mean(losses))
+            trained_loss = evaluate_group(backbone, hyperspline, f"{fold}/trained_train", train_episodes, epoch, records)
+            selection_loss = (
+                evaluate_group(backbone, hyperspline, f"{fold}/validation", validation_episodes, epoch, records)
+                if validation_episodes
+                else trained_loss
+            )
             evaluate_group(backbone, hyperspline, f"{fold}/test", test_episodes, epoch, records)
-            if validation_loss < best_validation:
-                best_validation = validation_loss
+            if selection_loss < best_selection_loss:
+                best_selection_loss = selection_loss
+                best_epoch = epoch
                 best_state = {key: value.detach().cpu().clone() for key, value in hyperspline.state_dict().items()}
 
-    if best_state is not None:
-        hyperspline.load_state_dict(best_state)
-        hyperspline.eval()
-        evaluate_group(backbone, hyperspline, f"{fold}/selected_train", train_episodes, args.epochs, records)
-        if validation_episodes:
-            evaluate_group(backbone, hyperspline, f"{fold}/selected_validation", validation_episodes, args.epochs, records)
-        evaluate_group(backbone, hyperspline, f"{fold}/selected_test", test_episodes, args.epochs, records)
-    return hyperspline, config, best_validation
+    hyperspline.load_state_dict(best_state)
+    hyperspline.eval()
+    evaluate_group(backbone, hyperspline, f"{fold}/selected_train", train_episodes, best_epoch, records)
+    if validation_episodes:
+        evaluate_group(backbone, hyperspline, f"{fold}/selected_validation", validation_episodes, best_epoch, records)
+    evaluate_group(backbone, hyperspline, f"{fold}/selected_test", test_episodes, best_epoch, records)
+    return hyperspline, config, best_selection_loss, best_epoch
 
 
 def main() -> None:
@@ -150,11 +163,25 @@ def main() -> None:
         train_episodes = make_episodes(train_names, train_seeds, args, device)
         validation_episodes = make_episodes(validation_names, eval_seeds, args, device) if validation_names else []
         test_episodes = make_episodes(test_names, eval_seeds, args, device)
-        hyperspline, config, best_validation = train_fold(backbone, train_episodes, validation_episodes, test_episodes, args, fold, records)
+        hyperspline, config, best_selection_loss, best_epoch = train_fold(
+            backbone, train_episodes, validation_episodes, test_episodes, args, fold, records
+        )
         checkpoint_path = args.output_checkpoint_dir / f"{fold}.pt"
         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-        save_hyperspline_checkpoint(checkpoint_path, hyperspline, config, backbone_reference=args.checkpoint_version, backbone_hash=backbone_state_dict_hash(backbone), step=args.epochs)
-        print(f"[{fold}] best_validation_loss={best_validation:.6f}; saved {checkpoint_path}", flush=True)
+        save_hyperspline_checkpoint(
+            checkpoint_path,
+            hyperspline,
+            config,
+            backbone_reference=args.checkpoint_version,
+            backbone_hash=backbone_state_dict_hash(backbone),
+            step=best_epoch,
+        )
+        selection_name = "validation" if validation_episodes else "training (LODO has no validation group)"
+        print(
+            f"[{fold}] selected_epoch={best_epoch}, best_{selection_name}_loss={best_selection_loss:.6f}; "
+            f"saved {checkpoint_path}",
+            flush=True,
+        )
 
     args.output_csv.parent.mkdir(parents=True, exist_ok=True)
     with args.output_csv.open("w", newline="", encoding="utf-8") as handle:
