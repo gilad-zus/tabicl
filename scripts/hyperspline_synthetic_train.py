@@ -27,6 +27,7 @@ from tabicl._hyperspline import (
     save_hyperspline_checkpoint,
     summarize_context,
 )
+from tabicl._hyperspline.checkpoint import load_hyperspline_checkpoint
 
 
 @dataclass(frozen=True)
@@ -325,6 +326,18 @@ def main() -> None:
         help="Append class-permutation-invariant context-label statistics to each column summary.",
     )
     parser.add_argument(
+        "--supervised-residual",
+        action="store_true",
+        help="Add a separately gated label-only residual branch on a frozen marginal HyperSpline.",
+    )
+    parser.add_argument(
+        "--marginal-checkpoint",
+        type=Path,
+        default=None,
+        help="Required trained marginal checkpoint used as the frozen base for --supervised-residual.",
+    )
+    parser.add_argument("--supervised-residual-gate-initial-probability", type=float, default=0.01)
+    parser.add_argument(
         "--model-seed",
         type=int,
         default=0,
@@ -350,6 +363,10 @@ def main() -> None:
         raise ValueError("invalid validation or HyperSpline configuration")
     if len({args.train_seed, args.validation_seed, args.test_seed}) != 3:
         raise ValueError("train, validation, and test generator seeds must be distinct")
+    if args.supervised_residual and (not args.target_aware or args.marginal_checkpoint is None):
+        raise ValueError("--supervised-residual requires --target-aware and --marginal-checkpoint")
+    if args.marginal_checkpoint is not None and not args.supervised_residual:
+        raise ValueError("--marginal-checkpoint is only valid with --supervised-residual")
 
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
@@ -371,12 +388,22 @@ def main() -> None:
         "hidden_dim": args.hidden_dim,
         "gate_initial_probability": args.gate_initial_probability,
         "target_aware": args.target_aware,
+        "supervised_residual": args.supervised_residual,
+        "supervised_residual_gate_initial_probability": args.supervised_residual_gate_initial_probability,
     }
     hyperspline = HyperSplineTransform(**config).to(device).train()
+    if args.supervised_residual:
+        marginal, _ = load_hyperspline_checkpoint(
+            args.marginal_checkpoint,
+            device=device,
+            expected_backbone_reference=args.checkpoint_version,
+            expected_backbone_hash=backbone_state_dict_hash(backbone),
+        )
+        hyperspline.initialize_supervised_residual_from(marginal)
     optimizer = torch.optim.Adam(hyperspline.parameters(), lr=args.lr)
     print(
         f"Initialized current HyperSpline baseline: "
-        f"parameters={sum(parameter.numel() for parameter in hyperspline.parameters()):,}, "
+        f"trainable_parameters={sum(parameter.numel() for parameter in hyperspline.parameters() if parameter.requires_grad):,}, "
         f"target_aware={args.target_aware}, train_steps={args.train_steps}, tasks_per_step={args.tasks_per_step}",
         flush=True,
     )

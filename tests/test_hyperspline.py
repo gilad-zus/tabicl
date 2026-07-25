@@ -152,6 +152,32 @@ def test_target_aware_statistics_affect_parameters_and_are_class_id_invariant():
     assert not torch.equal(aware_a.control_points, aware_b.control_points)
 
 
+def test_supervised_residual_starts_as_and_preserves_a_frozen_marginal_policy():
+    torch.manual_seed(0)
+    context = torch.tensor([[[0.0], [0.2], [3.0], [3.2]]])
+    query = torch.zeros(1, 1, 1)
+    labels_a = torch.tensor([[0, 0, 1, 1]])
+    labels_b = torch.tensor([[0, 1, 0, 1]])
+    marginal = HyperSplineTransform(hidden_dim=8)
+    residual = HyperSplineTransform(hidden_dim=8, target_aware=True, supervised_residual=True)
+    residual.initialize_supervised_residual_from(marginal)
+    assert all(not parameter.requires_grad for parameter in residual.mlp.parameters())
+
+    _, _, marginal_parameters = marginal(context, query, return_parameters=True)
+    _, _, initial_parameters = residual(context, query, y_context=labels_a, return_parameters=True)
+    assert torch.equal(initial_parameters.control_points, marginal_parameters.control_points)
+    assert torch.equal(initial_parameters.gate, marginal_parameters.gate)
+
+    # The residual is label-only: after enabling one residual output path, a
+    # label permutation changes generated parameters while the base stays frozen.
+    with torch.no_grad():
+        residual.supervised_residual_mlp[-1].weight[0, 0] = 1.0
+        residual.supervised_residual_mlp[1].weight[0, -1] = 1.0
+    _, _, parameters_a = residual(context, query, y_context=labels_a, return_parameters=True)
+    _, _, parameters_b = residual(context, query, y_context=labels_b, return_parameters=True)
+    assert not torch.equal(parameters_a.control_points, parameters_b.control_points)
+
+
 def test_query_labels_never_enter_parameter_generation():
     context = torch.randn(1, 4, 2)
     query = torch.randn(1, 3, 2)

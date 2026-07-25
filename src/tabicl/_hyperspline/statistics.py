@@ -21,7 +21,8 @@ class ColumnStatistics:
 # The first 23 entries are entirely distributional.  The final entries are a
 # class-permutation-invariant block, populated only when context labels exist.
 SUPERVISED_SUMMARY_DIM = 8
-SUMMARY_DIM = 23 + SUPERVISED_SUMMARY_DIM
+UNSUPERVISED_SUMMARY_DIM = 23
+SUMMARY_DIM = UNSUPERVISED_SUMMARY_DIM + SUPERVISED_SUMMARY_DIM
 
 
 def summarize_context(

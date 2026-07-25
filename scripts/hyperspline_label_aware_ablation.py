@@ -1,8 +1,9 @@
-"""Run paired marginal and class-invariant-supervised HyperSpline experiments.
+"""Run paired marginal and supervised-residual HyperSpline experiments.
 
-Use ``--variants class_invariant_supervised`` to resume an interrupted run
-after the marginal condition has completed.  Existing manifest entries are
-preserved, and the default seeds remain identical to a full paired run.
+Use ``--variants supervised_residual`` to resume an interrupted run
+after the marginal condition has completed.  The residual condition freezes
+that checkpoint's marginal MLP, so labels can affect only a zero-initialized,
+separately gated residual branch.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = ROOT / "scripts"
-VARIANTS = {"marginal": False, "class_invariant_supervised": True}
+VARIANTS = {"marginal": "marginal", "supervised_residual": "supervised_residual"}
 
 
 def run(command: list[str]) -> None:
@@ -41,8 +42,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=Path("results/hyperspline_label_aware_ablation"))
     parser.add_argument(
         "--variants",
-        default="marginal,class_invariant_supervised",
-        help="Comma-separated: marginal,class_invariant_supervised. Select only the unfinished condition to resume.",
+        default="marginal,supervised_residual",
+        help="Comma-separated: marginal,supervised_residual. Select only the unfinished condition to resume.",
     )
     parser.add_argument("--train-steps", type=int, default=10_000)
     parser.add_argument("--tasks-per-step", type=int, default=4)
@@ -53,6 +54,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--n-control-points", type=int, default=20)
     parser.add_argument("--gate-initial-probability", type=float, default=0.10)
+    parser.add_argument("--supervised-residual-gate-initial-probability", type=float, default=0.01)
     parser.add_argument("--prior-type", default="mix_scm")
     parser.add_argument("--sequence-length", type=int, default=256)
     parser.add_argument("--context-fraction", type=float, default=0.70)
@@ -92,6 +94,7 @@ def train_options(args: argparse.Namespace) -> list[str]:
         "--hidden-dim": args.hidden_dim,
         "--n-control-points": args.n_control_points,
         "--gate-initial-probability": args.gate_initial_probability,
+        "--supervised-residual-gate-initial-probability": args.supervised_residual_gate_initial_probability,
         "--model-seed": args.model_seed,
         "--train-seed": args.train_seed,
         "--validation-seed": args.validation_seed,
@@ -120,8 +123,11 @@ def main() -> None:
     for name in requested:
         checkpoint = output_dir / f"{name}.pt"
         train_command = [sys.executable, str(SCRIPTS / "hyperspline_synthetic_train.py"), *train_options(args)]
-        if VARIANTS[name]:
-            train_command.append("--target-aware")
+        if VARIANTS[name] == "supervised_residual":
+            marginal_checkpoint = output_dir / "marginal.pt"
+            if not marginal_checkpoint.is_file():
+                raise FileNotFoundError("supervised_residual requires the completed marginal.pt in --output-dir")
+            train_command.extend(("--target-aware", "--supervised-residual", "--marginal-checkpoint", str(marginal_checkpoint)))
         train_command.extend((
             "--validation-bank", str(validation_bank),
             "--test-bank", str(test_bank),
@@ -130,10 +136,14 @@ def main() -> None:
             "--output-checkpoint", str(checkpoint),
         ))
         run(train_command)
-        manifest["variants"][name] = {"target_aware": VARIANTS[name], "checkpoint": str(checkpoint)}
+        manifest["variants"][name] = {
+            "kind": VARIANTS[name],
+            "target_aware": VARIANTS[name] == "supervised_residual",
+            "checkpoint": str(checkpoint),
+        }
 
     marginal_checkpoint = output_dir / "marginal.pt"
-    supervised_checkpoint = output_dir / "class_invariant_supervised.pt"
+    supervised_checkpoint = output_dir / "supervised_residual.pt"
     if marginal_checkpoint.is_file() and supervised_checkpoint.is_file():
         paired_command = [
             sys.executable, str(SCRIPTS / "hyperspline_real_paired_eval.py"),
@@ -147,8 +157,8 @@ def main() -> None:
             "--max-rows", str(args.real_max_rows),
             "--marginal-output-csv", str(output_dir / "marginal_real.csv"),
             "--marginal-output-summary-csv", str(output_dir / "marginal_real_summary.csv"),
-            "--supervised-output-csv", str(output_dir / "class_invariant_supervised_real.csv"),
-            "--supervised-output-summary-csv", str(output_dir / "class_invariant_supervised_real_summary.csv"),
+            "--supervised-output-csv", str(output_dir / "supervised_residual_real.csv"),
+            "--supervised-output-summary-csv", str(output_dir / "supervised_residual_real_summary.csv"),
             "--comparison-output-csv", str(output_dir / "real_paired_comparison.csv"),
         ]
         if args.checkpoint is not None:

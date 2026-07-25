@@ -1,4 +1,4 @@
-"""Evaluate marginal and label-aware HyperSpline checkpoints on one real bank.
+"""Evaluate marginal and supervised-residual HyperSpline checkpoints on one real bank.
 
 All real episodes are built once, then identity, marginal, and supervised
 checkpoints are evaluated sequentially against those exact tensors.  This is
@@ -97,13 +97,16 @@ def main() -> None:
         args.supervised_checkpoint, device=device, expected_backbone_reference=args.checkpoint_version, expected_backbone_hash=expected_hash
     )
     marginal_config, supervised_config = dict(marginal_metadata["hyperspline_config"]), dict(supervised_metadata["hyperspline_config"])
-    if {key: value for key, value in marginal_config.items() if key != "target_aware"} != {
-        key: value for key, value in supervised_config.items() if key != "target_aware"
+    variant_only_keys = {"target_aware", "supervised_residual", "supervised_residual_gate_initial_probability"}
+    if {key: value for key, value in marginal_config.items() if key not in variant_only_keys} != {
+        key: value for key, value in supervised_config.items() if key not in variant_only_keys
     }:
-        raise ValueError("paired evaluation requires the same HyperSpline configuration except target_aware")
-    if marginal_config.get("target_aware") or not supervised_config.get("target_aware"):
-        raise ValueError("checkpoint labels do not match marginal/supervised arguments")
-    identity_config = {**marginal_config, "target_aware": False}
+        raise ValueError("paired evaluation requires matching marginal HyperSpline configurations")
+    if marginal_config.get("target_aware") or marginal_config.get("supervised_residual"):
+        raise ValueError("--marginal-checkpoint must be marginal-only")
+    if not supervised_config.get("target_aware") or not supervised_config.get("supervised_residual"):
+        raise ValueError("--supervised-checkpoint must use supervised_residual")
+    identity_config = {**marginal_config, "target_aware": False, "supervised_residual": False}
     identity = HyperSplineTransform(**identity_config).to(device).eval()
     marginal.eval()
     supervised.eval()

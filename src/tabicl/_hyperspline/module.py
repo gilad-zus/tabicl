@@ -9,7 +9,13 @@ import torch
 from torch import nn
 
 from .bspline import evaluate_bspline, greville_abscissae, uniform_augmented_knots
-from .statistics import ColumnStatistics, SUMMARY_DIM, summarize_context
+from .statistics import (
+    ColumnStatistics,
+    SUMMARY_DIM,
+    SUPERVISED_SUMMARY_DIM,
+    UNSUPERVISED_SUMMARY_DIM,
+    summarize_context,
+)
 
 
 @dataclass(frozen=True)
@@ -36,6 +42,8 @@ class HyperSplineTransform(nn.Module):
         log_scale_bound: float = 1.0,
         gap_adjustment_bound: float = 2.0,
         target_aware: bool = False,
+        supervised_residual: bool = False,
+        supervised_residual_gate_initial_probability: float = 0.01,
         eps: float = 1e-6,
     ) -> None:
         super().__init__()
@@ -45,6 +53,10 @@ class HyperSplineTransform(nn.Module):
             raise ValueError("n_control_points must exceed degree")
         if standardized_range <= 0:
             raise ValueError("standardized_range must be positive")
+        if supervised_residual and not target_aware:
+            raise ValueError("supervised_residual requires target_aware=True")
+        if not 0 < supervised_residual_gate_initial_probability < 1:
+            raise ValueError("supervised_residual_gate_initial_probability must be in (0, 1)")
         self.n_control_points = n_control_points
         self.degree = degree
         self.standardized_range = standardized_range
@@ -54,6 +66,7 @@ class HyperSplineTransform(nn.Module):
         self.log_scale_bound = log_scale_bound
         self.gap_adjustment_bound = gap_adjustment_bound
         self.target_aware = target_aware
+        self.supervised_residual = supervised_residual
         self.eps = eps
         knots = uniform_augmented_knots(n_control_points, degree)
         identity = greville_abscissae(knots, degree, n_control_points)
@@ -74,9 +87,57 @@ class HyperSplineTransform(nn.Module):
         nn.init.zeros_(last.bias)
         gate_bias = torch.logit(torch.tensor(gate_initial_probability)).item()
         last.bias.data[n_control_points - 1] = gate_bias
+        if supervised_residual:
+            self.supervised_residual_mlp = nn.Sequential(
+                nn.LayerNorm(SUPERVISED_SUMMARY_DIM),
+                nn.Linear(SUPERVISED_SUMMARY_DIM, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, output_dim),
+            )
+            nn.init.zeros_(self.supervised_residual_mlp[-1].weight)
+            nn.init.zeros_(self.supervised_residual_mlp[-1].bias)
+            self.supervised_residual_gate_logit = nn.Parameter(
+                torch.tensor(torch.logit(torch.tensor(supervised_residual_gate_initial_probability)).item())
+            )
+
+    def initialize_supervised_residual_from(self, marginal: "HyperSplineTransform") -> None:
+        """Copy and freeze a trained marginal policy for supervised-residual training."""
+        if not self.supervised_residual:
+            raise ValueError("initialize_supervised_residual_from requires supervised_residual=True")
+        if marginal.target_aware or marginal.supervised_residual:
+            raise ValueError("the residual base must be a marginal-only HyperSpline")
+        if self.n_control_points != marginal.n_control_points or self.degree != marginal.degree:
+            raise ValueError("the residual and marginal HyperSpline architectures must match")
+        self.mlp.load_state_dict(marginal.mlp.state_dict())
+        for parameter in self.mlp.parameters():
+            parameter.requires_grad_(False)
+
+    @property
+    def supervised_residual_gate(self) -> torch.Tensor:
+        if not self.supervised_residual:
+            return self.knots.new_zeros(())
+        return torch.sigmoid(self.supervised_residual_gate_logit)
 
     def generate_parameters(self, statistics: ColumnStatistics) -> HyperSplineParameters:
-        raw = self.mlp(statistics.summary)
+        if self.supervised_residual:
+            # The frozen marginal policy always receives exactly the summary it
+            # saw during marginal training: its 23 distributional entries plus
+            # zeroed label entries.  Labels can affect only the residual path.
+            marginal_summary = torch.cat(
+                (
+                    statistics.summary[..., :UNSUPERVISED_SUMMARY_DIM],
+                    torch.zeros_like(statistics.summary[..., -SUPERVISED_SUMMARY_DIM:]),
+                ),
+                dim=-1,
+            )
+            raw = self.mlp(marginal_summary)
+            raw = raw + self.supervised_residual_gate * self.supervised_residual_mlp(
+                statistics.summary[..., -SUPERVISED_SUMMARY_DIM:]
+            )
+        else:
+            raw = self.mlp(statistics.summary)
         gap_raw = raw[..., : self.n_control_points - 1]
         gap = self.identity_gaps * torch.exp(self.gap_adjustment_bound * torch.tanh(gap_raw))
         gap = 2.0 * gap / gap.sum(dim=-1, keepdim=True).clamp_min(self.eps)
