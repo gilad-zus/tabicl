@@ -1,3 +1,5 @@
+import inspect
+
 import numpy as np
 import pytest
 import torch
@@ -121,24 +123,45 @@ def test_frozen_adapter_preserves_categorical_columns_and_backbone_freezing():
     assert all(parameter is not backbone.weight for parameter in adapter.parameters())
 
 
-def test_target_association_is_explicitly_opt_in(monkeypatch):
-    import tabicl._hyperspline.module as hyperspline_module
+def test_target_aware_statistics_affect_parameters_and_are_class_id_invariant():
+    torch.manual_seed(0)
+    context = torch.tensor([[[0.0, 1.0], [0.2, 1.2], [3.0, 4.0], [3.2, 4.2]]])
+    query = torch.zeros(1, 2, 2)
+    labels_a = torch.tensor([[0, 0, 1, 1]])
+    labels_b = torch.tensor([[0, 1, 0, 1]])
 
-    captured = []
-    original = hyperspline_module.summarize_context
+    # The target-aware summary has no dependence on the arbitrary class IDs.
+    assert torch.allclose(
+        summarize_context(context, y_context=labels_a).summary,
+        summarize_context(context, y_context=torch.tensor([[7, 7, 3, 3]])).summary,
+    )
 
-    def record(*args, **kwargs):
-        captured.append(args[2] if len(args) > 2 else kwargs.get("y_context"))
-        return original(*args, **kwargs)
+    unaware = HyperSplineTransform(hidden_dim=8)
+    _, _, unaware_a = unaware(context, query, y_context=labels_a, return_parameters=True)
+    _, _, unaware_b = unaware(context, query, y_context=labels_b, return_parameters=True)
+    assert torch.equal(unaware_a.control_points, unaware_b.control_points)
 
-    monkeypatch.setattr(hyperspline_module, "summarize_context", record)
-    context = torch.arange(6, dtype=torch.float32).reshape(1, 3, 2)
-    query = torch.zeros(1, 1, 2)
-    y = torch.tensor([[0.0, 1.0, 0.0]])
-    HyperSplineTransform()(context, query, y_context=y)
-    assert captured[-1] is None
-    HyperSplineTransform(target_aware=True)(context, query, y_context=y)
-    assert torch.equal(captured[-1], y)
+    aware = HyperSplineTransform(hidden_dim=8, target_aware=True)
+    # The zero-initialized output layer starts at identity, so make its first
+    # output explicitly depend on a supervised summary coordinate.
+    with torch.no_grad():
+        aware.mlp[-1].weight[0, 0] = 1.0
+        aware.mlp[1].weight[0, -1] = 1.0
+    _, _, aware_a = aware(context, query, y_context=labels_a, return_parameters=True)
+    _, _, aware_b = aware(context, query, y_context=labels_b, return_parameters=True)
+    assert not torch.equal(aware_a.control_points, aware_b.control_points)
+
+
+def test_query_labels_never_enter_parameter_generation():
+    context = torch.randn(1, 4, 2)
+    query = torch.randn(1, 3, 2)
+    y_context = torch.tensor([[0, 1, 0, 1]])
+    module = HyperSplineTransform(target_aware=True)
+    _, _, first = module(context, query, y_context=y_context, return_parameters=True)
+    _, _, second = module(context, query, y_context=y_context, return_parameters=True)
+    assert torch.equal(first.control_points, second.control_points)
+    assert torch.equal(first.gate, second.gate)
+    assert "y_query" not in inspect.signature(module.forward).parameters
 
 
 def test_ensemble_preserves_categorical_pipeline_and_aligns_feature_permutations():

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -42,9 +43,12 @@ class SyntheticEpisode:
 
 
 def seed_generator(seed: int) -> None:
-    """Seed the native prior's NumPy/Torch global RNGs deterministically."""
+    """Seed every RNG used by the native prior deterministically."""
+    random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def prepare_episode(
@@ -107,6 +111,72 @@ def generate_episodes(
         )
         for index in range(count)
     ]
+    return episodes
+
+
+def save_episode_bank(path: Path, episodes: list[SyntheticEpisode], *, source_seed: int) -> None:
+    """Persist a fixed synthetic bank so every ablation consumes identical tensors."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "format_version": 1,
+        "source_seed": source_seed,
+        "episodes": [
+            {
+                "task_id": episode.task_id,
+                "source_seed": episode.source_seed,
+                "x_context": episode.x_context.cpu(),
+                "x_query": episode.x_query.cpu(),
+                "y_context": episode.y_context.cpu(),
+                "y_query": episode.y_query.cpu(),
+                "n_classes": episode.n_classes,
+            }
+            for episode in episodes
+        ],
+    }
+    torch.save(payload, path)
+    print(f"Saved fixed synthetic bank with {len(episodes)} episodes to {path}", flush=True)
+
+
+def load_episode_bank(path: Path, *, expected_seed: int, expected_count: int, device: torch.device) -> list[SyntheticEpisode]:
+    """Load and validate a fixed synthetic bank created by :func:`save_episode_bank`."""
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    if payload.get("format_version") != 1:
+        raise ValueError(f"unsupported synthetic bank format: {path}")
+    if payload.get("source_seed") != expected_seed:
+        raise ValueError(f"synthetic bank {path} has source seed {payload.get('source_seed')}, expected {expected_seed}")
+    stored = payload.get("episodes", [])
+    if len(stored) != expected_count:
+        raise ValueError(f"synthetic bank {path} has {len(stored)} episodes, expected {expected_count}")
+    episodes = [
+        SyntheticEpisode(
+            task_id=int(item["task_id"]),
+            source_seed=int(item["source_seed"]),
+            x_context=item["x_context"].to(device=device),
+            x_query=item["x_query"].to(device=device),
+            y_context=item["y_context"].to(device=device),
+            y_query=item["y_query"].to(device=device),
+            n_classes=int(item["n_classes"]),
+        )
+        for item in stored
+    ]
+    print(f"Loaded fixed synthetic bank with {len(episodes)} episodes from {path}", flush=True)
+    return episodes
+
+
+def get_fixed_episode_bank(
+    args: argparse.Namespace,
+    path: Path | None,
+    count: int,
+    *,
+    source_seed: int,
+    task_offset: int,
+    device: torch.device,
+) -> list[SyntheticEpisode]:
+    if path is not None and path.is_file():
+        return load_episode_bank(path, expected_seed=source_seed, expected_count=count, device=device)
+    episodes = generate_episodes(args, count, source_seed=source_seed, task_offset=task_offset, device=device)
+    if path is not None:
+        save_episode_bank(path, episodes, source_seed=source_seed)
     return episodes
 
 
@@ -249,10 +319,22 @@ def main() -> None:
     parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--n-control-points", type=int, default=20)
     parser.add_argument("--gate-initial-probability", type=float, default=0.10)
-    parser.add_argument("--target-aware", action="store_true", help="Use context labels only in the existing association statistic.")
+    parser.add_argument(
+        "--target-aware",
+        action="store_true",
+        help="Append class-permutation-invariant context-label statistics to each column summary.",
+    )
+    parser.add_argument(
+        "--model-seed",
+        type=int,
+        default=0,
+        help="Seed used only for HyperSpline initialization; set this identically for ablations.",
+    )
     parser.add_argument("--train-seed", type=int, default=0)
     parser.add_argument("--validation-seed", type=int, default=10_001)
     parser.add_argument("--test-seed", type=int, default=20_001)
+    parser.add_argument("--validation-bank", type=Path, default=None, help="Reusable serialized fixed validation bank.")
+    parser.add_argument("--test-bank", type=Path, default=None, help="Reusable serialized fixed test bank.")
     parser.add_argument("--output-csv", type=Path, default=Path("results/hyperspline_synthetic_evaluation.csv"))
     parser.add_argument("--output-train-csv", type=Path, default=Path("results/hyperspline_synthetic_training.csv"))
     parser.add_argument("--output-checkpoint", type=Path, default=Path("results/hyperspline_synthetic_best.pt"))
@@ -279,6 +361,11 @@ def main() -> None:
     if args.max_classes > backbone.max_classes:
         raise ValueError(f"--max-classes exceeds frozen backbone maximum {backbone.max_classes}")
 
+    # Keep initialization controlled separately from the synthetic-task stream:
+    # paired marginal/label-aware ablations should differ only in label access.
+    torch.manual_seed(args.model_seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(args.model_seed)
     config = {
         "n_control_points": args.n_control_points,
         "hidden_dim": args.hidden_dim,
@@ -294,12 +381,17 @@ def main() -> None:
         flush=True,
     )
 
-    print("Generating fixed validation and test banks from disjoint prior seeds...", flush=True)
-    validation_episodes = generate_episodes(
-        args, args.validation_tasks, source_seed=args.validation_seed, task_offset=0, device=device
+    print("Loading or generating fixed validation and test banks from disjoint prior seeds...", flush=True)
+    validation_episodes = get_fixed_episode_bank(
+        args, args.validation_bank, args.validation_tasks, source_seed=args.validation_seed, task_offset=0, device=device
     )
-    test_episodes = generate_episodes(
-        args, args.test_tasks, source_seed=args.test_seed, task_offset=args.validation_tasks, device=device
+    test_episodes = get_fixed_episode_bank(
+        args,
+        args.test_bank,
+        args.test_tasks,
+        source_seed=args.test_seed,
+        task_offset=args.validation_tasks,
+        device=device,
     )
     validate_episode_classes(validation_episodes + test_episodes, backbone.max_classes)
     seed_generator(args.train_seed)

@@ -275,23 +275,30 @@ def summarize_rows(rows: list[dict[str, object]]) -> list[dict[str, object]]:
     summaries: list[dict[str, object]] = []
 
     def emit(group_name: str, group_value: str, group_rows: list[dict[str, object]]) -> None:
-        loss_delta = np.asarray([row["loss_delta"] for row in group_rows], dtype=float)
+        finite_loss_rows = [
+            row
+            for row in group_rows
+            if all(np.isfinite(float(row[field])) for field in ("identity_loss", "loss", "loss_delta", "relative_loss_improvement"))
+        ]
+        loss_delta = np.asarray([row["loss_delta"] for row in finite_loss_rows], dtype=float)
         accuracy_delta = np.asarray([row["accuracy_delta"] for row in group_rows], dtype=float)
-        relative = np.asarray([row["relative_loss_improvement"] for row in group_rows], dtype=float)
-        loss_low, loss_high, loss_se = confidence_interval(loss_delta)
+        relative = np.asarray([row["relative_loss_improvement"] for row in finite_loss_rows], dtype=float)
+        loss_low, loss_high, loss_se = confidence_interval(loss_delta) if len(loss_delta) else (float("nan"),) * 3
         acc_low, acc_high, acc_se = confidence_interval(accuracy_delta)
         summaries.append(
             {
                 "group_name": group_name,
                 "group_value": group_value,
                 "n": len(group_rows),
-                "mean_identity_loss": float(np.mean([row["identity_loss"] for row in group_rows])),
-                "mean_loss": float(np.mean([row["loss"] for row in group_rows])),
-                "mean_loss_delta": float(loss_delta.mean()),
-                "median_loss_delta": float(np.median(loss_delta)),
+                "n_finite_loss": len(finite_loss_rows),
+                "n_nonfinite_loss": len(group_rows) - len(finite_loss_rows),
+                "mean_identity_loss": float(np.mean([row["identity_loss"] for row in finite_loss_rows])) if finite_loss_rows else float("nan"),
+                "mean_loss": float(np.mean([row["loss"] for row in finite_loss_rows])) if finite_loss_rows else float("nan"),
+                "mean_loss_delta": float(loss_delta.mean()) if len(loss_delta) else float("nan"),
+                "median_loss_delta": float(np.median(loss_delta)) if len(loss_delta) else float("nan"),
                 "loss_win_count": int((loss_delta > 0).sum()),
-                "loss_win_rate": float((loss_delta > 0).mean()),
-                "mean_relative_loss_improvement": float(relative.mean()),
+                "loss_win_rate": float((loss_delta > 0).mean()) if len(loss_delta) else float("nan"),
+                "mean_relative_loss_improvement": float(relative.mean()) if len(relative) else float("nan"),
                 "loss_delta_se": loss_se,
                 "loss_delta_ci95_low": loss_low,
                 "loss_delta_ci95_high": loss_high,
@@ -389,6 +396,7 @@ def main() -> None:
                 "loss_delta": loss_delta,
                 "relative_loss_improvement": loss_delta / max(baseline["loss"], 1e-12),
                 "accuracy_delta": accuracy_delta,
+                "loss_is_finite": bool(np.isfinite(baseline["loss"]) and np.isfinite(transformed["loss"])),
             }
             rows.append(row)
             print(
@@ -404,7 +412,8 @@ def main() -> None:
     overall = summaries[0]
     print(
         f"Overall: mean_loss_delta={overall['mean_loss_delta']:+.6f}, "
-        f"loss_wins={overall['loss_win_count']}/{overall['n']}, "
+        f"loss_wins={overall['loss_win_count']}/{overall['n_finite_loss']} "
+        f"(nonfinite={overall['n_nonfinite_loss']}), "
         f"mean_accuracy_delta={overall['mean_accuracy_delta']:+.4f}",
         flush=True,
     )

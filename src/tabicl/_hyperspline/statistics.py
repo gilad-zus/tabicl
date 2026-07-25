@@ -18,7 +18,10 @@ class ColumnStatistics:
     all_missing: torch.Tensor  # (B, D), bool
 
 
-SUMMARY_DIM = 24
+# The first 23 entries are entirely distributional.  The final entries are a
+# class-permutation-invariant block, populated only when context labels exist.
+SUPERVISED_SUMMARY_DIM = 8
+SUMMARY_DIM = 23 + SUPERVISED_SUMMARY_DIM
 
 
 def summarize_context(
@@ -32,8 +35,10 @@ def summarize_context(
 
     ``missing`` identifies values that were imputed by the external pipeline.
     Their values are excluded from distribution summaries but the missing rate is
-    retained.  Optional target association is a fixed-size scalar and is zero
-    when labels are unavailable.
+    retained.  When context labels are supplied, a fixed-size, symmetric
+    class-conditional block is appended.  It deliberately never uses the
+    numeric values of class identifiers, so relabeling classes cannot alter a
+    summary.
     """
     if x_context.ndim != 3:
         raise ValueError("x_context must have shape (B, N, D)")
@@ -69,19 +74,59 @@ def summarize_context(
             values = x[batch_idx, valid[batch_idx, :, feature_idx], feature_idx]
             unique_fraction[batch_idx, feature_idx] = values.unique().numel() / max(values.numel(), 1)
 
-    association = torch.zeros((b, d), dtype=x.dtype, device=x.device)
+    supervised = torch.zeros((b, d, SUPERVISED_SUMMARY_DIM), dtype=x.dtype, device=x.device)
     if y_context is not None:
-        y = y_context.float()
+        y = y_context
         if y.shape != (b, n):
             raise ValueError("y_context must have shape (B, N)")
         for batch_idx in range(b):
             for feature_idx in range(d):
-                keep = valid[batch_idx, :, feature_idx] & torch.isfinite(y[batch_idx])
-                if keep.sum() >= 2:
-                    xv, yv = x[batch_idx, keep, feature_idx], y[batch_idx, keep]
-                    denom = xv.std(unbiased=False) * yv.std(unbiased=False)
-                    if denom > eps:
-                        association[batch_idx, feature_idx] = ((xv - xv.mean()) * (yv - yv.mean())).mean() / denom
+                labels = y[batch_idx]
+                keep = valid[batch_idx, :, feature_idx] & torch.isfinite(labels.float())
+                if not keep.any():
+                    continue
+                values = z[batch_idx, feature_idx, keep]
+                labels = labels[keep]
+                classes, inverse, class_counts = torch.unique(
+                    labels, sorted=True, return_inverse=True, return_counts=True
+                )
+                n_classes = classes.numel()
+                frequencies = class_counts.float() / values.numel()
+                class_means = torch.stack(
+                    [values[inverse == class_idx].mean() for class_idx in range(n_classes)]
+                )
+                class_variances = torch.stack(
+                    [values[inverse == class_idx].var(unbiased=False) for class_idx in range(n_classes)]
+                )
+                between_variance = (frequencies * (class_means - values.mean()).square()).sum()
+                within_variance = (frequencies * class_variances).sum()
+                if n_classes > 1:
+                    normalized_entropy = -(frequencies * frequencies.clamp_min(eps).log()).sum() / torch.log(
+                        torch.tensor(float(n_classes), device=x.device)
+                    )
+                    max_mean_separation = torch.pdist(class_means.unsqueeze(-1)).max()
+                else:
+                    normalized_entropy = values.new_zeros(())
+                    max_mean_separation = values.new_zeros(())
+                class_iqrs = torch.stack(
+                    [
+                        torch.quantile(values[inverse == class_idx], .75)
+                        - torch.quantile(values[inverse == class_idx], .25)
+                        for class_idx in range(n_classes)
+                    ]
+                )
+                supervised[batch_idx, feature_idx] = torch.stack(
+                    (
+                        values.new_tensor(n_classes / max(n, 1)),
+                        normalized_entropy,
+                        frequencies.min(),
+                        between_variance.sqrt(),
+                        within_variance.sqrt(),
+                        between_variance / within_variance.clamp_min(eps),
+                        max_mean_separation,
+                        (frequencies * class_iqrs).sum(),
+                    )
+                )
 
     summary = torch.cat(
         (
@@ -98,7 +143,7 @@ def summarize_context(
             tails,
             (count <= 1).float().unsqueeze(-1),
             all_missing.float().unsqueeze(-1),
-            association.unsqueeze(-1),
+            supervised,
         ),
         dim=-1,
     )
