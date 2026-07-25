@@ -178,6 +178,33 @@ def test_supervised_residual_starts_as_and_preserves_a_frozen_marginal_policy():
     assert not torch.equal(parameters_a.control_points, parameters_b.control_points)
 
 
+def test_cross_column_residual_is_bounded_and_feature_permutation_equivariant():
+    torch.manual_seed(0)
+    context = torch.tensor([[[0.0, 2.0], [0.2, 1.8], [3.0, -1.0], [3.2, -0.8]]])
+    query = torch.zeros(1, 1, 2)
+    labels = torch.tensor([[0, 0, 1, 1]])
+    marginal = HyperSplineTransform(hidden_dim=8)
+    cross_column = HyperSplineTransform(
+        hidden_dim=8, target_aware=True, cross_column_residual=True, cross_column_num_heads=2
+    )
+    cross_column.initialize_supervised_residual_from(marginal)
+    assert all(not parameter.requires_grad for parameter in cross_column.mlp.parameters())
+    _, _, marginal_parameters = marginal(context, query, return_parameters=True)
+    _, _, initial_parameters = cross_column(context, query, y_context=labels, return_parameters=True)
+    assert torch.equal(initial_parameters.control_points, marginal_parameters.control_points)
+
+    with torch.no_grad():
+        cross_column.cross_column_residual_head.weight[0, 0] = 1.0
+    _, _, parameters = cross_column(context, query, y_context=labels, return_parameters=True)
+    permutation = torch.tensor([1, 0])
+    _, _, permuted = cross_column(context[..., permutation], query[..., permutation], y_context=labels, return_parameters=True)
+    assert torch.allclose(permuted.control_points, parameters.control_points[..., permutation, :], atol=2e-6, rtol=2e-6)
+    assert torch.allclose(permuted.supervised_residual_gate, parameters.supervised_residual_gate[..., permutation], atol=2e-6, rtol=2e-6)
+    assert torch.all((parameters.supervised_residual_gate > 0) & (parameters.supervised_residual_gate < 1))
+    residual_raw, _ = cross_column._supervised_residual(summarize_context(context, y_context=labels).summary[..., -8:])
+    assert residual_raw.abs().max() <= cross_column.cross_column_residual_bound
+
+
 def test_query_labels_never_enter_parameter_generation():
     context = torch.randn(1, 4, 2)
     query = torch.randn(1, 3, 2)

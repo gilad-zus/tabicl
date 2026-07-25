@@ -220,6 +220,11 @@ def forward_episode(
         "mean_abs_deformation": deformation.mean(),
         "max_abs_deformation": deformation.max(),
         "clip_fraction": clip_fraction,
+        "mean_supervised_residual_gate": (
+            parameters.supervised_residual_gate.mean()
+            if parameters.supervised_residual_gate is not None
+            else parameters.gate.new_zeros(())
+        ),
     }
     return loss, logits, diagnostics
 
@@ -331,12 +336,20 @@ def main() -> None:
         help="Add a separately gated label-only residual branch on a frozen marginal HyperSpline.",
     )
     parser.add_argument(
+        "--cross-column-residual",
+        action="store_true",
+        help="Use permutation-equivariant cross-column conditioning with bounded per-column residual gates.",
+    )
+    parser.add_argument(
         "--marginal-checkpoint",
         type=Path,
         default=None,
         help="Required trained marginal checkpoint used as the frozen base for --supervised-residual.",
     )
     parser.add_argument("--supervised-residual-gate-initial-probability", type=float, default=0.01)
+    parser.add_argument("--cross-column-num-heads", type=int, default=4)
+    parser.add_argument("--cross-column-residual-bound", type=float, default=0.1)
+    parser.add_argument("--cross-column-gate-initial-probability", type=float, default=0.01)
     parser.add_argument(
         "--model-seed",
         type=int,
@@ -363,10 +376,14 @@ def main() -> None:
         raise ValueError("invalid validation or HyperSpline configuration")
     if len({args.train_seed, args.validation_seed, args.test_seed}) != 3:
         raise ValueError("train, validation, and test generator seeds must be distinct")
-    if args.supervised_residual and (not args.target_aware or args.marginal_checkpoint is None):
-        raise ValueError("--supervised-residual requires --target-aware and --marginal-checkpoint")
-    if args.marginal_checkpoint is not None and not args.supervised_residual:
-        raise ValueError("--marginal-checkpoint is only valid with --supervised-residual")
+    if args.supervised_residual and args.cross_column_residual:
+        raise ValueError("--supervised-residual and --cross-column-residual are mutually exclusive")
+    if (args.supervised_residual or args.cross_column_residual) and (
+        not args.target_aware or args.marginal_checkpoint is None
+    ):
+        raise ValueError("supervised residuals require --target-aware and --marginal-checkpoint")
+    if args.marginal_checkpoint is not None and not (args.supervised_residual or args.cross_column_residual):
+        raise ValueError("--marginal-checkpoint is only valid with a supervised residual")
 
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
@@ -390,9 +407,13 @@ def main() -> None:
         "target_aware": args.target_aware,
         "supervised_residual": args.supervised_residual,
         "supervised_residual_gate_initial_probability": args.supervised_residual_gate_initial_probability,
+        "cross_column_residual": args.cross_column_residual,
+        "cross_column_num_heads": args.cross_column_num_heads,
+        "cross_column_residual_bound": args.cross_column_residual_bound,
+        "cross_column_gate_initial_probability": args.cross_column_gate_initial_probability,
     }
     hyperspline = HyperSplineTransform(**config).to(device).train()
-    if args.supervised_residual:
+    if args.supervised_residual or args.cross_column_residual:
         marginal, _ = load_hyperspline_checkpoint(
             args.marginal_checkpoint,
             device=device,

@@ -239,7 +239,7 @@ def evaluate(backbone, hyperspline: HyperSplineTransform, episode: RealEpisode) 
     loss = F.cross_entropy(logits.flatten(0, 1), episode.y_query.flatten())
     accuracy = (logits.argmax(dim=-1).flatten() == episode.y_query).float().mean()
     if parameters is None:
-        diagnostics = {"mean_gate": 0.0, "min_gate": 0.0, "max_gate": 0.0, "mean_abs_deformation": 0.0, "max_abs_deformation": 0.0, "clip_fraction": 0.0}
+        diagnostics = {"mean_gate": 0.0, "min_gate": 0.0, "max_gate": 0.0, "mean_abs_deformation": 0.0, "max_abs_deformation": 0.0, "clip_fraction": 0.0, "mean_supervised_residual_gate": 0.0}
     else:
         raw = torch.cat((episode.x_context[..., episode.numerical_mask], episode.x_query[..., episode.numerical_mask]), dim=1)
         transformed_context = hyperspline.apply_transform(
@@ -259,6 +259,11 @@ def evaluate(backbone, hyperspline: HyperSplineTransform, episode: RealEpisode) 
             "mean_abs_deformation": float(deformation.mean()),
             "max_abs_deformation": float(deformation.max()),
             "clip_fraction": float(clip_fraction),
+            "mean_supervised_residual_gate": (
+                float(parameters.supervised_residual_gate.mean())
+                if parameters.supervised_residual_gate is not None
+                else 0.0
+            ),
         }
     return {"loss": float(loss), "accuracy": float(accuracy), **diagnostics}
 
@@ -312,6 +317,9 @@ def summarize_rows(rows: list[dict[str, object]]) -> list[dict[str, object]]:
                 "accuracy_delta_ci95_low": acc_low,
                 "accuracy_delta_ci95_high": acc_high,
                 "mean_gate": float(np.mean([row["mean_gate"] for row in group_rows])),
+                "mean_supervised_residual_gate": float(
+                    np.mean([row["mean_supervised_residual_gate"] for row in group_rows])
+                ),
                 "mean_abs_deformation": float(np.mean([row["mean_abs_deformation"] for row in group_rows])),
                 "mean_clip_fraction": float(np.mean([row["clip_fraction"] for row in group_rows])),
             }

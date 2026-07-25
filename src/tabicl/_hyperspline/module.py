@@ -24,6 +24,7 @@ class HyperSplineParameters:
     gate: torch.Tensor  # (B, D)
     location: torch.Tensor  # (B, D)
     scale: torch.Tensor  # (B, D)
+    supervised_residual_gate: Optional[torch.Tensor] = None  # (B, D) when a supervised residual is active
 
 
 class HyperSplineTransform(nn.Module):
@@ -44,6 +45,10 @@ class HyperSplineTransform(nn.Module):
         target_aware: bool = False,
         supervised_residual: bool = False,
         supervised_residual_gate_initial_probability: float = 0.01,
+        cross_column_residual: bool = False,
+        cross_column_num_heads: int = 4,
+        cross_column_residual_bound: float = 0.1,
+        cross_column_gate_initial_probability: float = 0.01,
         eps: float = 1e-6,
     ) -> None:
         super().__init__()
@@ -53,10 +58,18 @@ class HyperSplineTransform(nn.Module):
             raise ValueError("n_control_points must exceed degree")
         if standardized_range <= 0:
             raise ValueError("standardized_range must be positive")
-        if supervised_residual and not target_aware:
-            raise ValueError("supervised_residual requires target_aware=True")
+        if (supervised_residual or cross_column_residual) and not target_aware:
+            raise ValueError("supervised residuals require target_aware=True")
+        if supervised_residual and cross_column_residual:
+            raise ValueError("supervised_residual and cross_column_residual are mutually exclusive")
         if not 0 < supervised_residual_gate_initial_probability < 1:
             raise ValueError("supervised_residual_gate_initial_probability must be in (0, 1)")
+        if cross_column_num_heads <= 0 or hidden_dim % cross_column_num_heads:
+            raise ValueError("cross_column_num_heads must divide hidden_dim")
+        if cross_column_residual_bound <= 0:
+            raise ValueError("cross_column_residual_bound must be positive")
+        if not 0 < cross_column_gate_initial_probability < 1:
+            raise ValueError("cross_column_gate_initial_probability must be in (0, 1)")
         self.n_control_points = n_control_points
         self.degree = degree
         self.standardized_range = standardized_range
@@ -67,6 +80,8 @@ class HyperSplineTransform(nn.Module):
         self.gap_adjustment_bound = gap_adjustment_bound
         self.target_aware = target_aware
         self.supervised_residual = supervised_residual
+        self.cross_column_residual = cross_column_residual
+        self.cross_column_residual_bound = cross_column_residual_bound
         self.eps = eps
         knots = uniform_augmented_knots(n_control_points, degree)
         identity = greville_abscissae(knots, degree, n_control_points)
@@ -101,18 +116,51 @@ class HyperSplineTransform(nn.Module):
             self.supervised_residual_gate_logit = nn.Parameter(
                 torch.tensor(torch.logit(torch.tensor(supervised_residual_gate_initial_probability)).item())
             )
+        if cross_column_residual:
+            # Every operation is shared over the column-token axis and has no
+            # positional encoding, making this block permutation equivariant.
+            self.supervised_token_encoder = nn.Sequential(
+                nn.LayerNorm(SUPERVISED_SUMMARY_DIM),
+                nn.Linear(SUPERVISED_SUMMARY_DIM, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
+            self.cross_column_attention = nn.MultiheadAttention(
+                hidden_dim, cross_column_num_heads, batch_first=True
+            )
+            self.cross_column_attention_norm = nn.LayerNorm(hidden_dim)
+            self.cross_column_feedforward = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, hidden_dim)
+            )
+            self.cross_column_feedforward_norm = nn.LayerNorm(hidden_dim)
+            self.cross_column_residual_head = nn.Linear(hidden_dim, output_dim)
+            self.cross_column_gate_head = nn.Linear(hidden_dim, 1)
+            nn.init.zeros_(self.cross_column_residual_head.weight)
+            nn.init.zeros_(self.cross_column_residual_head.bias)
+            nn.init.zeros_(self.cross_column_gate_head.weight)
+            self.cross_column_gate_head.bias.data.fill_(
+                torch.logit(torch.tensor(cross_column_gate_initial_probability)).item()
+            )
+
+    @property
+    def has_supervised_residual(self) -> bool:
+        return self.supervised_residual or self.cross_column_residual
+
+    def freeze_marginal_policy(self) -> None:
+        """Prevent the copied marginal MLP from receiving future gradients."""
+        for parameter in self.mlp.parameters():
+            parameter.requires_grad_(False)
 
     def initialize_supervised_residual_from(self, marginal: "HyperSplineTransform") -> None:
         """Copy and freeze a trained marginal policy for supervised-residual training."""
-        if not self.supervised_residual:
-            raise ValueError("initialize_supervised_residual_from requires supervised_residual=True")
+        if not self.has_supervised_residual:
+            raise ValueError("initialize_supervised_residual_from requires a supervised residual")
         if marginal.target_aware or marginal.supervised_residual:
             raise ValueError("the residual base must be a marginal-only HyperSpline")
         if self.n_control_points != marginal.n_control_points or self.degree != marginal.degree:
             raise ValueError("the residual and marginal HyperSpline architectures must match")
         self.mlp.load_state_dict(marginal.mlp.state_dict())
-        for parameter in self.mlp.parameters():
-            parameter.requires_grad_(False)
+        self.freeze_marginal_policy()
 
     @property
     def supervised_residual_gate(self) -> torch.Tensor:
@@ -120,8 +168,25 @@ class HyperSplineTransform(nn.Module):
             return self.knots.new_zeros(())
         return torch.sigmoid(self.supervised_residual_gate_logit)
 
-    def generate_parameters(self, statistics: ColumnStatistics) -> HyperSplineParameters:
+    def _supervised_residual(
+        self, supervised_statistics: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return a bounded raw correction and its per-column gate."""
         if self.supervised_residual:
+            gate = self.supervised_residual_gate.expand(supervised_statistics.shape[:-1])
+            return gate.unsqueeze(-1) * self.supervised_residual_mlp(supervised_statistics), gate
+        if self.cross_column_residual:
+            tokens = self.supervised_token_encoder(supervised_statistics)
+            attended, _ = self.cross_column_attention(tokens, tokens, tokens, need_weights=False)
+            tokens = self.cross_column_attention_norm(tokens + attended)
+            tokens = self.cross_column_feedforward_norm(tokens + self.cross_column_feedforward(tokens))
+            gate = torch.sigmoid(self.cross_column_gate_head(tokens)).squeeze(-1)
+            residual = self.cross_column_residual_bound * torch.tanh(self.cross_column_residual_head(tokens))
+            return gate.unsqueeze(-1) * residual, gate
+        raise RuntimeError("_supervised_residual called without a supervised residual architecture")
+
+    def generate_parameters(self, statistics: ColumnStatistics) -> HyperSplineParameters:
+        if self.has_supervised_residual:
             # The frozen marginal policy always receives exactly the summary it
             # saw during marginal training: its 23 distributional entries plus
             # zeroed label entries.  Labels can affect only the residual path.
@@ -133,11 +198,13 @@ class HyperSplineTransform(nn.Module):
                 dim=-1,
             )
             raw = self.mlp(marginal_summary)
-            raw = raw + self.supervised_residual_gate * self.supervised_residual_mlp(
+            residual_raw, residual_gate = self._supervised_residual(
                 statistics.summary[..., -SUPERVISED_SUMMARY_DIM:]
             )
+            raw = raw + residual_raw
         else:
             raw = self.mlp(statistics.summary)
+            residual_gate = None
         gap_raw = raw[..., : self.n_control_points - 1]
         gap = self.identity_gaps * torch.exp(self.gap_adjustment_bound * torch.tanh(gap_raw))
         gap = 2.0 * gap / gap.sum(dim=-1, keepdim=True).clamp_min(self.eps)
@@ -151,7 +218,7 @@ class HyperSplineTransform(nn.Module):
             location = location + scale * self.location_bound * torch.tanh(loc_raw)
         if self.generate_scale:
             scale = scale * torch.exp(self.log_scale_bound * torch.tanh(scale_raw))
-        return HyperSplineParameters(control_points, gate, location, scale.clamp_min(self.eps))
+        return HyperSplineParameters(control_points, gate, location, scale.clamp_min(self.eps), residual_gate)
 
     def apply_transform(
         self, x: torch.Tensor, parameters: HyperSplineParameters, missing: Optional[torch.Tensor] = None

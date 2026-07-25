@@ -74,5 +74,9 @@ def load_hyperspline_checkpoint(
     config = dict(payload["hyperspline_config"])
     module = HyperSplineTransform(**config)
     module.load_state_dict(payload["state_dict"], strict=True)
+    if module.has_supervised_residual:
+        # requires_grad flags are not encoded in a state dict; restore the
+        # architectural guarantee when loading a residual checkpoint.
+        module.freeze_marginal_policy()
     module.to(device)
     return module, payload

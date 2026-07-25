@@ -1,4 +1,4 @@
-"""Evaluate marginal and supervised-residual HyperSpline checkpoints on one real bank.
+"""Evaluate marginal and cross-column-residual HyperSpline checkpoints on one real bank.
 
 All real episodes are built once, then identity, marginal, and supervised
 checkpoints are evaluated sequentially against those exact tensors.  This is
@@ -97,16 +97,29 @@ def main() -> None:
         args.supervised_checkpoint, device=device, expected_backbone_reference=args.checkpoint_version, expected_backbone_hash=expected_hash
     )
     marginal_config, supervised_config = dict(marginal_metadata["hyperspline_config"]), dict(supervised_metadata["hyperspline_config"])
-    variant_only_keys = {"target_aware", "supervised_residual", "supervised_residual_gate_initial_probability"}
+    variant_only_keys = {
+        "target_aware",
+        "supervised_residual",
+        "supervised_residual_gate_initial_probability",
+        "cross_column_residual",
+        "cross_column_num_heads",
+        "cross_column_residual_bound",
+        "cross_column_gate_initial_probability",
+    }
     if {key: value for key, value in marginal_config.items() if key not in variant_only_keys} != {
         key: value for key, value in supervised_config.items() if key not in variant_only_keys
     }:
         raise ValueError("paired evaluation requires matching marginal HyperSpline configurations")
-    if marginal_config.get("target_aware") or marginal_config.get("supervised_residual"):
+    if marginal_config.get("target_aware") or marginal_config.get("supervised_residual") or marginal_config.get("cross_column_residual"):
         raise ValueError("--marginal-checkpoint must be marginal-only")
-    if not supervised_config.get("target_aware") or not supervised_config.get("supervised_residual"):
-        raise ValueError("--supervised-checkpoint must use supervised_residual")
-    identity_config = {**marginal_config, "target_aware": False, "supervised_residual": False}
+    if not supervised_config.get("target_aware") or not supervised_config.get("cross_column_residual"):
+        raise ValueError("--supervised-checkpoint must use cross_column_residual")
+    identity_config = {
+        **marginal_config,
+        "target_aware": False,
+        "supervised_residual": False,
+        "cross_column_residual": False,
+    }
     identity = HyperSplineTransform(**identity_config).to(device).eval()
     marginal.eval()
     supervised.eval()
