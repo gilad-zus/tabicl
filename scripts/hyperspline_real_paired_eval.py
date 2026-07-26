@@ -1,4 +1,4 @@
-"""Evaluate marginal and cross-column-residual HyperSpline checkpoints on one real bank.
+"""Evaluate marginal and supervised-residual HyperSpline checkpoints on one real bank.
 
 All real episodes are built once, then identity, marginal, and supervised
 checkpoints are evaluated sequentially against those exact tensors.  This is
@@ -105,20 +105,32 @@ def main() -> None:
         "cross_column_num_heads",
         "cross_column_residual_bound",
         "cross_column_gate_initial_probability",
+        "raw_context_residual",
+        "raw_context_num_heads",
+        "raw_context_residual_bound",
+        "raw_context_gate_initial_probability",
     }
     if {key: value for key, value in marginal_config.items() if key not in variant_only_keys} != {
         key: value for key, value in supervised_config.items() if key not in variant_only_keys
     }:
         raise ValueError("paired evaluation requires matching marginal HyperSpline configurations")
-    if marginal_config.get("target_aware") or marginal_config.get("supervised_residual") or marginal_config.get("cross_column_residual"):
+    if (
+        marginal_config.get("target_aware")
+        or marginal_config.get("supervised_residual")
+        or marginal_config.get("cross_column_residual")
+        or marginal_config.get("raw_context_residual")
+    ):
         raise ValueError("--marginal-checkpoint must be marginal-only")
-    if not supervised_config.get("target_aware") or not supervised_config.get("cross_column_residual"):
-        raise ValueError("--supervised-checkpoint must use cross_column_residual")
+    if not supervised_config.get("target_aware") or not (
+        supervised_config.get("cross_column_residual") or supervised_config.get("raw_context_residual")
+    ):
+        raise ValueError("--supervised-checkpoint must use a supported supervised residual")
     identity_config = {
         **marginal_config,
         "target_aware": False,
         "supervised_residual": False,
         "cross_column_residual": False,
+        "raw_context_residual": False,
     }
     identity = HyperSplineTransform(**identity_config).to(device).eval()
     marginal.eval()

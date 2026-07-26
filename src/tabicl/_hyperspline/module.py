@@ -49,6 +49,10 @@ class HyperSplineTransform(nn.Module):
         cross_column_num_heads: int = 4,
         cross_column_residual_bound: float = 0.1,
         cross_column_gate_initial_probability: float = 0.01,
+        raw_context_residual: bool = False,
+        raw_context_num_heads: int = 4,
+        raw_context_residual_bound: float = 0.5,
+        raw_context_gate_initial_probability: float = 0.5,
         eps: float = 1e-6,
     ) -> None:
         super().__init__()
@@ -58,10 +62,11 @@ class HyperSplineTransform(nn.Module):
             raise ValueError("n_control_points must exceed degree")
         if standardized_range <= 0:
             raise ValueError("standardized_range must be positive")
-        if (supervised_residual or cross_column_residual) and not target_aware:
+        residual_variants = supervised_residual + cross_column_residual + raw_context_residual
+        if residual_variants and not target_aware:
             raise ValueError("supervised residuals require target_aware=True")
-        if supervised_residual and cross_column_residual:
-            raise ValueError("supervised_residual and cross_column_residual are mutually exclusive")
+        if residual_variants > 1:
+            raise ValueError("supervised residual variants are mutually exclusive")
         if not 0 < supervised_residual_gate_initial_probability < 1:
             raise ValueError("supervised_residual_gate_initial_probability must be in (0, 1)")
         if cross_column_num_heads <= 0 or hidden_dim % cross_column_num_heads:
@@ -70,6 +75,12 @@ class HyperSplineTransform(nn.Module):
             raise ValueError("cross_column_residual_bound must be positive")
         if not 0 < cross_column_gate_initial_probability < 1:
             raise ValueError("cross_column_gate_initial_probability must be in (0, 1)")
+        if raw_context_num_heads <= 0 or hidden_dim % raw_context_num_heads:
+            raise ValueError("raw_context_num_heads must divide hidden_dim")
+        if raw_context_residual_bound <= 0:
+            raise ValueError("raw_context_residual_bound must be positive")
+        if not 0 < raw_context_gate_initial_probability < 1:
+            raise ValueError("raw_context_gate_initial_probability must be in (0, 1)")
         self.n_control_points = n_control_points
         self.degree = degree
         self.standardized_range = standardized_range
@@ -82,6 +93,8 @@ class HyperSplineTransform(nn.Module):
         self.supervised_residual = supervised_residual
         self.cross_column_residual = cross_column_residual
         self.cross_column_residual_bound = cross_column_residual_bound
+        self.raw_context_residual = raw_context_residual
+        self.raw_context_residual_bound = raw_context_residual_bound
         self.eps = eps
         knots = uniform_augmented_knots(n_control_points, degree)
         identity = greville_abscissae(knots, degree, n_control_points)
@@ -141,10 +154,51 @@ class HyperSplineTransform(nn.Module):
             self.cross_column_gate_head.bias.data.fill_(
                 torch.logit(torch.tensor(cross_column_gate_initial_probability)).item()
             )
+        if raw_context_residual:
+            # Cell tokens contain only standardized values, missingness, and a
+            # shared encoding of the column's distributional summary.  There
+            # is no feature or class positional embedding, so all subsequent
+            # attention and pooling operations are permutation equivariant.
+            self.raw_context_column_encoder = nn.Sequential(
+                nn.LayerNorm(UNSUPERVISED_SUMMARY_DIM),
+                nn.Linear(UNSUPERVISED_SUMMARY_DIM, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
+            self.raw_context_cell_encoder = nn.Sequential(
+                nn.Linear(4, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, hidden_dim)
+            )
+            self.raw_context_row_attention = nn.MultiheadAttention(
+                hidden_dim, raw_context_num_heads, batch_first=True
+            )
+            self.raw_context_row_norm = nn.LayerNorm(hidden_dim)
+            self.raw_context_class_encoder = nn.Sequential(
+                nn.Linear(2 * hidden_dim + 1, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, hidden_dim)
+            )
+            self.raw_context_class_attention = nn.MultiheadAttention(
+                hidden_dim, raw_context_num_heads, batch_first=True
+            )
+            self.raw_context_class_norm = nn.LayerNorm(hidden_dim)
+            self.raw_context_column_attention = nn.MultiheadAttention(
+                hidden_dim, raw_context_num_heads, batch_first=True
+            )
+            self.raw_context_column_norm = nn.LayerNorm(hidden_dim)
+            self.raw_context_feedforward = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, hidden_dim)
+            )
+            self.raw_context_feedforward_norm = nn.LayerNorm(hidden_dim)
+            self.raw_context_residual_head = nn.Linear(hidden_dim, output_dim)
+            self.raw_context_gate_head = nn.Linear(hidden_dim, 1)
+            nn.init.zeros_(self.raw_context_residual_head.weight)
+            nn.init.zeros_(self.raw_context_residual_head.bias)
+            nn.init.zeros_(self.raw_context_gate_head.weight)
+            self.raw_context_gate_head.bias.data.fill_(
+                torch.logit(torch.tensor(raw_context_gate_initial_probability)).item()
+            )
 
     @property
     def has_supervised_residual(self) -> bool:
-        return self.supervised_residual or self.cross_column_residual
+        return self.supervised_residual or self.cross_column_residual or self.raw_context_residual
 
     def freeze_marginal_policy(self) -> None:
         """Prevent the copied marginal MLP from receiving future gradients."""
@@ -155,7 +209,7 @@ class HyperSplineTransform(nn.Module):
         """Copy and freeze a trained marginal policy for supervised-residual training."""
         if not self.has_supervised_residual:
             raise ValueError("initialize_supervised_residual_from requires a supervised residual")
-        if marginal.target_aware or marginal.supervised_residual:
+        if marginal.target_aware or marginal.has_supervised_residual:
             raise ValueError("the residual base must be a marginal-only HyperSpline")
         if self.n_control_points != marginal.n_control_points or self.degree != marginal.degree:
             raise ValueError("the residual and marginal HyperSpline architectures must match")
@@ -185,7 +239,72 @@ class HyperSplineTransform(nn.Module):
             return gate.unsqueeze(-1) * residual, gate
         raise RuntimeError("_supervised_residual called without a supervised residual architecture")
 
-    def generate_parameters(self, statistics: ColumnStatistics) -> HyperSplineParameters:
+    def _raw_context_residual(
+        self,
+        x_context: torch.Tensor,
+        statistics: ColumnStatistics,
+        y_context: torch.Tensor,
+        context_missing: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Encode labelled context rows without relying on class-ID ordering.
+
+        Labels only choose which rows are aggregated together.  Classes are
+        subsequently processed with shared weights and mean pooled, making the
+        branch invariant to arbitrary relabeling.
+        """
+        if context_missing is None:
+            context_missing = ~torch.isfinite(x_context)
+        valid = (~context_missing) & torch.isfinite(x_context)
+        z = (x_context.float() - statistics.location.unsqueeze(1)) / statistics.scale.unsqueeze(1)
+        z = z.masked_fill(~valid, 0.0).clamp(-8.0, 8.0)
+        cell_features = torch.stack((z, z.square(), z.abs(), valid.float()), dim=-1)
+        column_tokens = self.raw_context_column_encoder(
+            statistics.summary[..., :UNSUPERVISED_SUMMARY_DIM]
+        ).unsqueeze(1)
+        cells = self.raw_context_cell_encoder(cell_features) + column_tokens
+        b, n, d, h = cells.shape
+        row_tokens = cells.reshape(b * n, d, h)
+        attended, _ = self.raw_context_row_attention(row_tokens, row_tokens, row_tokens, need_weights=False)
+        cells = self.raw_context_row_norm((row_tokens + attended).reshape(b, n, d, h))
+
+        pooled_batches = []
+        for batch_idx in range(b):
+            labels = y_context[batch_idx]
+            finite_labels = torch.isfinite(labels.float())
+            classes, inverse = torch.unique(labels[finite_labels], sorted=True, return_inverse=True)
+            class_tokens = []
+            for class_idx in range(classes.numel()):
+                rows = torch.where(finite_labels)[0][inverse == class_idx]
+                class_cells = cells[batch_idx, rows]  # (N_class, D, H)
+                mean = class_cells.mean(dim=0)
+                spread = (class_cells - mean).square().mean(dim=0).sqrt()
+                frequency = mean.new_full((d, 1), rows.numel() / max(n, 1)).log1p()
+                class_tokens.append(self.raw_context_class_encoder(torch.cat((mean, spread, frequency), dim=-1)))
+            if not class_tokens:
+                pooled_batches.append(cells.new_zeros((d, h)))
+                continue
+            class_tokens_tensor = torch.stack(class_tokens, dim=0).transpose(0, 1)  # (D, C, H)
+            class_attended, _ = self.raw_context_class_attention(
+                class_tokens_tensor, class_tokens_tensor, class_tokens_tensor, need_weights=False
+            )
+            class_tokens_tensor = self.raw_context_class_norm(class_tokens_tensor + class_attended)
+            pooled_batches.append(class_tokens_tensor.mean(dim=1))
+        tokens = torch.stack(pooled_batches, dim=0)
+        attended, _ = self.raw_context_column_attention(tokens, tokens, tokens, need_weights=False)
+        tokens = self.raw_context_column_norm(tokens + attended)
+        tokens = self.raw_context_feedforward_norm(tokens + self.raw_context_feedforward(tokens))
+        gate = torch.sigmoid(self.raw_context_gate_head(tokens)).squeeze(-1)
+        residual = self.raw_context_residual_bound * torch.tanh(self.raw_context_residual_head(tokens))
+        return gate.unsqueeze(-1) * residual, gate
+
+    def generate_parameters(
+        self,
+        statistics: ColumnStatistics,
+        *,
+        x_context: Optional[torch.Tensor] = None,
+        y_context: Optional[torch.Tensor] = None,
+        context_missing: Optional[torch.Tensor] = None,
+    ) -> HyperSplineParameters:
         if self.has_supervised_residual:
             # The frozen marginal policy always receives exactly the summary it
             # saw during marginal training: its 23 distributional entries plus
@@ -198,13 +317,41 @@ class HyperSplineTransform(nn.Module):
                 dim=-1,
             )
             raw = self.mlp(marginal_summary)
-            residual_raw, residual_gate = self._supervised_residual(
-                statistics.summary[..., -SUPERVISED_SUMMARY_DIM:]
-            )
+            if self.raw_context_residual:
+                if x_context is None or y_context is None:
+                    raise ValueError("raw_context_residual requires x_context and y_context")
+                residual_raw, residual_gate = self._raw_context_residual(
+                    x_context, statistics, y_context, context_missing
+                )
+            else:
+                residual_raw, residual_gate = self._supervised_residual(
+                    statistics.summary[..., -SUPERVISED_SUMMARY_DIM:]
+                )
             raw = raw + residual_raw
         else:
             raw = self.mlp(statistics.summary)
             residual_gate = None
+        return self._parameters_from_raw(raw, statistics, residual_gate)
+
+    def generate_marginal_parameters(self, statistics: ColumnStatistics) -> HyperSplineParameters:
+        """Generate the frozen marginal reference used by residual stabilizers."""
+        if not self.has_supervised_residual:
+            return self._parameters_from_raw(self.mlp(statistics.summary), statistics, None)
+        marginal_summary = torch.cat(
+            (
+                statistics.summary[..., :UNSUPERVISED_SUMMARY_DIM],
+                torch.zeros_like(statistics.summary[..., -SUPERVISED_SUMMARY_DIM:]),
+            ),
+            dim=-1,
+        )
+        return self._parameters_from_raw(self.mlp(marginal_summary), statistics, None)
+
+    def _parameters_from_raw(
+        self,
+        raw: torch.Tensor,
+        statistics: ColumnStatistics,
+        residual_gate: Optional[torch.Tensor],
+    ) -> HyperSplineParameters:
         gap_raw = raw[..., : self.n_control_points - 1]
         gap = self.identity_gaps * torch.exp(self.gap_adjustment_bound * torch.tanh(gap_raw))
         gap = 2.0 * gap / gap.sum(dim=-1, keepdim=True).clamp_min(self.eps)
@@ -219,6 +366,34 @@ class HyperSplineTransform(nn.Module):
         if self.generate_scale:
             scale = scale * torch.exp(self.log_scale_bound * torch.tanh(scale_raw))
         return HyperSplineParameters(control_points, gate, location, scale.clamp_min(self.eps), residual_gate)
+
+    def grid_deformation_penalty(
+        self,
+        parameters: HyperSplineParameters,
+        grid_size: int = 33,
+        reference_parameters: Optional[HyperSplineParameters] = None,
+    ) -> torch.Tensor:
+        """Mean squared transform difference on a standardized grid.
+
+        Residual training supplies the frozen marginal parameters as the
+        reference.  Without one, this retains the useful identity-relative
+        diagnostic used by marginal-only models.
+        """
+        if grid_size < 2:
+            raise ValueError("grid_size must be at least 2")
+        grid = torch.linspace(
+            -self.standardized_range, self.standardized_range, grid_size,
+            dtype=parameters.location.dtype, device=parameters.location.device,
+        ).view(1, grid_size, 1)
+        grid = grid.expand(parameters.location.shape[0], -1, parameters.location.shape[1])
+        raw_grid = parameters.location.unsqueeze(1) + grid * parameters.scale.unsqueeze(1)
+        transformed = self.apply_transform(raw_grid, parameters)
+        reference = (
+            grid
+            if reference_parameters is None
+            else self.apply_transform(raw_grid, reference_parameters).float()
+        )
+        return (transformed.float() - reference).square().mean()
 
     def apply_transform(
         self, x: torch.Tensor, parameters: HyperSplineParameters, missing: Optional[torch.Tensor] = None
@@ -246,7 +421,12 @@ class HyperSplineTransform(nn.Module):
         statistics = summarize_context(
             x_context, context_missing, y_context if self.target_aware else None, eps=self.eps
         )
-        parameters = self.generate_parameters(statistics)
+        parameters = self.generate_parameters(
+            statistics,
+            x_context=x_context,
+            y_context=y_context if self.target_aware else None,
+            context_missing=context_missing,
+        )
         context_out = self.apply_transform(x_context, parameters, context_missing)
         query_out = self.apply_transform(x_query, parameters, query_missing)
         if return_parameters:

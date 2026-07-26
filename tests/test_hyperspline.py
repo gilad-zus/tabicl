@@ -205,6 +205,60 @@ def test_cross_column_residual_is_bounded_and_feature_permutation_equivariant():
     assert residual_raw.abs().max() <= cross_column.cross_column_residual_bound
 
 
+def test_raw_context_residual_is_label_invariant_bounded_and_feature_equivariant():
+    torch.manual_seed(0)
+    context = torch.tensor([[[0.0, 2.0], [0.2, 1.8], [3.0, -1.0], [3.2, -0.8]]])
+    query = torch.zeros(1, 1, 2)
+    labels = torch.tensor([[0, 0, 1, 1]])
+    marginal = HyperSplineTransform(hidden_dim=8)
+    raw_context = HyperSplineTransform(
+        hidden_dim=8,
+        target_aware=True,
+        raw_context_residual=True,
+        raw_context_num_heads=2,
+        raw_context_residual_bound=0.25,
+    )
+    raw_context.initialize_supervised_residual_from(marginal)
+    _, _, marginal_parameters = marginal(context, query, return_parameters=True)
+    _, _, initial = raw_context(context, query, y_context=labels, return_parameters=True)
+    assert torch.equal(initial.control_points, marginal_parameters.control_points)
+    assert all(not parameter.requires_grad for parameter in raw_context.mlp.parameters())
+    statistics = summarize_context(context, y_context=labels)
+    reference = raw_context.generate_marginal_parameters(statistics)
+    assert raw_context.grid_deformation_penalty(initial, reference_parameters=reference).item() == 0.0
+
+    with torch.no_grad():
+        raw_context.raw_context_residual_head.weight[0, 0] = 1.0
+    _, _, parameters = raw_context(context, query, y_context=labels, return_parameters=True)
+    relabelled = torch.tensor([[9, 9, 4, 4]])
+    _, _, relabelled_parameters = raw_context(context, query, y_context=relabelled, return_parameters=True)
+    assert torch.allclose(parameters.control_points, relabelled_parameters.control_points, atol=2e-6, rtol=2e-6)
+    row_permutation = torch.tensor([2, 0, 3, 1])
+    _, _, row_permuted = raw_context(
+        context[:, row_permutation], query, y_context=labels[:, row_permutation], return_parameters=True
+    )
+    assert torch.allclose(parameters.control_points, row_permuted.control_points, atol=2e-6, rtol=2e-6)
+    _, _, changed_query = raw_context(
+        context, torch.full_like(query, 1000.0), y_context=labels, return_parameters=True
+    )
+    assert torch.equal(parameters.control_points, changed_query.control_points)
+
+    permutation = torch.tensor([1, 0])
+    _, _, permuted = raw_context(
+        context[..., permutation], query[..., permutation], y_context=labels, return_parameters=True
+    )
+    assert torch.allclose(permuted.control_points, parameters.control_points[..., permutation, :], atol=2e-6, rtol=2e-6)
+    assert torch.allclose(
+        permuted.supervised_residual_gate,
+        parameters.supervised_residual_gate[..., permutation],
+        atol=2e-6,
+        rtol=2e-6,
+    )
+    residual_raw, _ = raw_context._raw_context_residual(context, statistics, labels, None)
+    assert residual_raw.abs().max() <= raw_context.raw_context_residual_bound
+    assert raw_context.grid_deformation_penalty(parameters).isfinite()
+
+
 def test_query_labels_never_enter_parameter_generation():
     context = torch.randn(1, 4, 2)
     query = torch.randn(1, 3, 2)

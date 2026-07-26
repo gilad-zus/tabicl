@@ -201,7 +201,16 @@ def forward_episode(
             y_context=episode.y_context if hyperspline.target_aware else None,
             eps=hyperspline.eps,
         )
-    parameters = hyperspline.generate_parameters(statistics)
+    parameters = hyperspline.generate_parameters(
+        statistics,
+        x_context=episode.x_context,
+        y_context=episode.y_context if hyperspline.target_aware else None,
+    )
+    marginal_parameters = (
+        hyperspline.generate_marginal_parameters(statistics)
+        if hyperspline.has_supervised_residual
+        else None
+    )
     transformed_context = hyperspline.apply_transform(episode.x_context, parameters)
     transformed_query = hyperspline.apply_transform(episode.x_query, parameters)
     transformed = torch.cat((transformed_context, transformed_query), dim=1)
@@ -221,6 +230,14 @@ def forward_episode(
         "max_abs_deformation": deformation.max(),
         "clip_fraction": clip_fraction,
         "mean_supervised_residual_gate": (
+            parameters.supervised_residual_gate.mean()
+            if parameters.supervised_residual_gate is not None
+            else parameters.gate.new_zeros(())
+        ),
+        "grid_deformation_penalty": hyperspline.grid_deformation_penalty(
+            parameters, reference_parameters=marginal_parameters
+        ),
+        "supervised_gate_penalty": (
             parameters.supervised_residual_gate.mean()
             if parameters.supervised_residual_gate is not None
             else parameters.gate.new_zeros(())
@@ -341,6 +358,11 @@ def main() -> None:
         help="Use permutation-equivariant cross-column conditioning with bounded per-column residual gates.",
     )
     parser.add_argument(
+        "--raw-context-residual",
+        action="store_true",
+        help="Use class-invariant raw labelled-context encoding with row-level and cross-column attention.",
+    )
+    parser.add_argument(
         "--marginal-checkpoint",
         type=Path,
         default=None,
@@ -350,6 +372,21 @@ def main() -> None:
     parser.add_argument("--cross-column-num-heads", type=int, default=4)
     parser.add_argument("--cross-column-residual-bound", type=float, default=0.1)
     parser.add_argument("--cross-column-gate-initial-probability", type=float, default=0.01)
+    parser.add_argument("--raw-context-num-heads", type=int, default=4)
+    parser.add_argument("--raw-context-residual-bound", type=float, default=0.5)
+    parser.add_argument("--raw-context-gate-initial-probability", type=float, default=0.5)
+    parser.add_argument(
+        "--transform-regularization",
+        type=float,
+        default=0.0,
+        help="Weight on mean squared spline deformation over a fixed standardized grid.",
+    )
+    parser.add_argument(
+        "--supervised-gate-regularization",
+        type=float,
+        default=0.0,
+        help="Weight on mean supervised residual gate activation; leave zero unless needed for stability.",
+    )
     parser.add_argument(
         "--model-seed",
         type=int,
@@ -376,14 +413,17 @@ def main() -> None:
         raise ValueError("invalid validation or HyperSpline configuration")
     if len({args.train_seed, args.validation_seed, args.test_seed}) != 3:
         raise ValueError("train, validation, and test generator seeds must be distinct")
-    if args.supervised_residual and args.cross_column_residual:
-        raise ValueError("--supervised-residual and --cross-column-residual are mutually exclusive")
-    if (args.supervised_residual or args.cross_column_residual) and (
+    residual_flags = (args.supervised_residual, args.cross_column_residual, args.raw_context_residual)
+    if sum(residual_flags) > 1:
+        raise ValueError("supervised residual variants are mutually exclusive")
+    if any(residual_flags) and (
         not args.target_aware or args.marginal_checkpoint is None
     ):
         raise ValueError("supervised residuals require --target-aware and --marginal-checkpoint")
-    if args.marginal_checkpoint is not None and not (args.supervised_residual or args.cross_column_residual):
+    if args.marginal_checkpoint is not None and not any(residual_flags):
         raise ValueError("--marginal-checkpoint is only valid with a supervised residual")
+    if args.transform_regularization < 0 or args.supervised_gate_regularization < 0:
+        raise ValueError("regularization weights must be non-negative")
 
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
@@ -411,9 +451,13 @@ def main() -> None:
         "cross_column_num_heads": args.cross_column_num_heads,
         "cross_column_residual_bound": args.cross_column_residual_bound,
         "cross_column_gate_initial_probability": args.cross_column_gate_initial_probability,
+        "raw_context_residual": args.raw_context_residual,
+        "raw_context_num_heads": args.raw_context_num_heads,
+        "raw_context_residual_bound": args.raw_context_residual_bound,
+        "raw_context_gate_initial_probability": args.raw_context_gate_initial_probability,
     }
     hyperspline = HyperSplineTransform(**config).to(device).train()
-    if args.supervised_residual or args.cross_column_residual:
+    if any(residual_flags):
         marginal, _ = load_hyperspline_checkpoint(
             args.marginal_checkpoint,
             device=device,
@@ -466,18 +510,29 @@ def main() -> None:
         episodes = generate_episodes(args, args.tasks_per_step, source_seed=None, task_offset=step * args.tasks_per_step, device=device)
         validate_episode_classes(episodes, backbone.max_classes)
         optimizer.zero_grad(set_to_none=True)
-        losses = []
+        losses, grid_penalties, gate_penalties = [], [], []
         for episode in episodes:
             backbone.clear_cache()
-            loss, _, _ = forward_episode(backbone, hyperspline, episode)
-            (loss / len(episodes)).backward()
+            loss, _, diagnostics = forward_episode(backbone, hyperspline, episode)
+            objective = (
+                loss
+                + args.transform_regularization * diagnostics["grid_deformation_penalty"]
+                + args.supervised_gate_regularization * diagnostics["supervised_gate_penalty"]
+            )
+            (objective / len(episodes)).backward()
             losses.append(loss.detach().item())
+            grid_penalties.append(diagnostics["grid_deformation_penalty"].detach().item())
+            gate_penalties.append(diagnostics["supervised_gate_penalty"].detach().item())
         gradient_norm = torch.nn.utils.clip_grad_norm_(hyperspline.parameters(), max_norm=1.0)
         optimizer.step()
         train_records.append(
             {
                 "step": step,
                 "mean_query_loss": float(np.mean(losses)),
+                "mean_grid_deformation_penalty": float(np.mean(grid_penalties)),
+                "mean_supervised_gate_penalty": float(np.mean(gate_penalties)),
+                "transform_regularization": args.transform_regularization,
+                "supervised_gate_regularization": args.supervised_gate_regularization,
                 "pre_clip_gradient_norm": gradient_norm.item(),
                 "tasks_per_step": len(episodes),
             }
