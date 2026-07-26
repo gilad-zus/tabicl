@@ -18,6 +18,13 @@ from tabicl._hyperspline import (
     save_hyperspline_checkpoint,
     summarize_context,
 )
+from scripts.hyperspline_real_task_bank import (
+    DEFAULT_TRAIN_OPENML_IDS,
+    DEFAULT_VALIDATION_OPENML_IDS,
+    FINAL_EVALUATION_OPENML_IDS,
+    parse_ids,
+)
+from scripts.hyperspline_real_meta_train import stratified_context_subset
 
 
 def test_shapes_identity_and_feature_permutation():
@@ -257,6 +264,23 @@ def test_raw_context_residual_is_label_invariant_bounded_and_feature_equivariant
     residual_raw, _ = raw_context._raw_context_residual(context, statistics, labels, None)
     assert residual_raw.abs().max() <= raw_context.raw_context_residual_bound
     assert raw_context.grid_deformation_penalty(parameters).isfinite()
+    raw_context.zero_grad(set_to_none=True)
+    context_out, query_out = raw_context(context, query, y_context=labels)
+    (context_out.square().mean() + query_out.square().mean()).backward()
+    assert all(
+        torch.isfinite(parameter.grad).all()
+        for parameter in raw_context.parameters()
+        if parameter.requires_grad and parameter.grad is not None
+    )
+    raw_context.zero_grad(set_to_none=True)
+    singleton_labels = torch.tensor([[0, 1, 1, 2]])
+    context_out, query_out = raw_context(context, query, y_context=singleton_labels)
+    (context_out.square().mean() + query_out.square().mean()).backward()
+    assert all(
+        torch.isfinite(parameter.grad).all()
+        for parameter in raw_context.parameters()
+        if parameter.requires_grad and parameter.grad is not None
+    )
 
 
 def test_query_labels_never_enter_parameter_generation():
@@ -269,6 +293,41 @@ def test_query_labels_never_enter_parameter_generation():
     assert torch.equal(first.control_points, second.control_points)
     assert torch.equal(first.gate, second.gate)
     assert "y_query" not in inspect.signature(module.forward).parameters
+
+
+def test_real_meta_stage_can_unfreeze_only_the_copied_marginal_policy():
+    marginal = HyperSplineTransform(hidden_dim=8)
+    residual = HyperSplineTransform(
+        hidden_dim=8,
+        target_aware=True,
+        raw_context_residual=True,
+        raw_context_num_heads=2,
+    )
+    residual.initialize_supervised_residual_from(marginal)
+    assert all(not parameter.requires_grad for parameter in residual.mlp.parameters())
+    assert any(parameter.requires_grad for name, parameter in residual.named_parameters() if not name.startswith("mlp."))
+    residual.unfreeze_marginal_policy()
+    assert all(parameter.requires_grad for parameter in residual.mlp.parameters())
+
+
+def test_real_meta_default_openml_splits_are_dataset_disjoint_from_final_suite():
+    train_ids = set(parse_ids(DEFAULT_TRAIN_OPENML_IDS))
+    validation_ids = set(parse_ids(DEFAULT_VALIDATION_OPENML_IDS))
+    assert not train_ids.intersection(validation_ids)
+    assert not (train_ids | validation_ids).intersection(FINAL_EVALUATION_OPENML_IDS)
+    assert len(train_ids) >= 20
+    assert len(validation_ids) >= 8
+
+
+def test_context_subset_is_stratified_and_strictly_smaller():
+    labels = torch.tensor([[0.0, 0.0, 1.0, 1.0, 1.0, 2.0]])
+    torch.manual_seed(3)
+    indices = stratified_context_subset(labels, 0.5)
+    selected = labels[0, indices]
+    assert indices.numel() < labels.shape[1]
+    assert int((selected == 0).sum()) == 1
+    assert int((selected == 1).sum()) == 2
+    assert int((selected == 2).sum()) == 1
 
 
 def test_ensemble_preserves_categorical_pipeline_and_aligns_feature_permutations():

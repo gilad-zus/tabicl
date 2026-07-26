@@ -205,6 +205,11 @@ class HyperSplineTransform(nn.Module):
         for parameter in self.mlp.parameters():
             parameter.requires_grad_(False)
 
+    def unfreeze_marginal_policy(self) -> None:
+        """Allow controlled real-meta fine-tuning of the copied marginal MLP."""
+        for parameter in self.mlp.parameters():
+            parameter.requires_grad_(True)
+
     def initialize_supervised_residual_from(self, marginal: "HyperSplineTransform") -> None:
         """Copy and freeze a trained marginal policy for supervised-residual training."""
         if not self.has_supervised_residual:
@@ -277,7 +282,11 @@ class HyperSplineTransform(nn.Module):
                 rows = torch.where(finite_labels)[0][inverse == class_idx]
                 class_cells = cells[batch_idx, rows]  # (N_class, D, H)
                 mean = class_cells.mean(dim=0)
-                spread = (class_cells - mean).square().mean(dim=0).sqrt()
+                # A singleton class (or a constant class token) has exactly
+                # zero variance.  ``sqrt(0)`` has an infinite derivative,
+                # which can turn the zero gradient from the initialised
+                # residual head into NaN during the first backward pass.
+                spread = (class_cells - mean).square().mean(dim=0).clamp_min(self.eps).sqrt()
                 frequency = mean.new_full((d, 1), rows.numel() / max(n, 1)).log1p()
                 class_tokens.append(self.raw_context_class_encoder(torch.cat((mean, spread, frequency), dim=-1)))
             if not class_tokens:

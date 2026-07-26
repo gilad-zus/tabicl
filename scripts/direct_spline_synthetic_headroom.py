@@ -17,7 +17,10 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from direct_spline_multidataset_headroom import load_backbone
+try:  # Supports imports from tests as well as ``python scripts/file.py``.
+    from scripts.direct_spline_multidataset_headroom import load_backbone
+except ModuleNotFoundError:  # pragma: no cover - direct script invocation
+    from direct_spline_multidataset_headroom import load_backbone
 from tabicl._hyperspline import DirectSplineTransform
 
 

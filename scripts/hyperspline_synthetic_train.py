@@ -19,8 +19,12 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from direct_spline_multidataset_headroom import load_backbone
-from direct_spline_synthetic_headroom import make_prior
+try:  # Supports imports from tests as well as ``python scripts/file.py``.
+    from scripts.direct_spline_multidataset_headroom import load_backbone
+    from scripts.direct_spline_synthetic_headroom import make_prior
+except ModuleNotFoundError:  # pragma: no cover - direct script invocation
+    from direct_spline_multidataset_headroom import load_backbone
+    from direct_spline_synthetic_headroom import make_prior
 from tabicl._hyperspline import (
     HyperSplineTransform,
     backbone_state_dict_hash,
