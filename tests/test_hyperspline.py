@@ -19,10 +19,10 @@ from tabicl._hyperspline import (
     summarize_context,
 )
 from scripts.hyperspline_real_task_bank import (
-    DEFAULT_TRAIN_OPENML_IDS,
-    DEFAULT_VALIDATION_OPENML_IDS,
-    FINAL_EVALUATION_OPENML_IDS,
-    parse_ids,
+    DEFAULT_TRAIN_PMLB_DATASETS,
+    DEFAULT_VALIDATION_PMLB_DATASETS,
+    FINAL_EVALUATION_PMLB_DATASETS,
+    parse_names,
 )
 from scripts.hyperspline_real_meta_train import stratified_context_subset
 
@@ -310,13 +310,13 @@ def test_real_meta_stage_can_unfreeze_only_the_copied_marginal_policy():
     assert all(parameter.requires_grad for parameter in residual.mlp.parameters())
 
 
-def test_real_meta_default_openml_splits_are_dataset_disjoint_from_final_suite():
-    train_ids = set(parse_ids(DEFAULT_TRAIN_OPENML_IDS))
-    validation_ids = set(parse_ids(DEFAULT_VALIDATION_OPENML_IDS))
-    assert not train_ids.intersection(validation_ids)
-    assert not (train_ids | validation_ids).intersection(FINAL_EVALUATION_OPENML_IDS)
-    assert len(train_ids) >= 20
-    assert len(validation_ids) >= 8
+def test_real_meta_default_pmlb_splits_are_dataset_disjoint_from_final_suite():
+    train_names = set(parse_names(DEFAULT_TRAIN_PMLB_DATASETS))
+    validation_names = set(parse_names(DEFAULT_VALIDATION_PMLB_DATASETS))
+    assert not train_names.intersection(validation_names)
+    assert not (train_names | validation_names).intersection(FINAL_EVALUATION_PMLB_DATASETS)
+    assert len(train_names) >= 20
+    assert len(validation_names) >= 8
 
 
 def test_context_subset_is_stratified_and_strictly_smaller():

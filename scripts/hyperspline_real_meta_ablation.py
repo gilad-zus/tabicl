@@ -12,6 +12,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+try:
+    from scripts.hyperspline_real_task_bank import DEFAULT_TRAIN_PMLB_DATASETS, DEFAULT_VALIDATION_PMLB_DATASETS
+except ModuleNotFoundError:  # pragma: no cover - direct script invocation
+    from hyperspline_real_task_bank import DEFAULT_TRAIN_PMLB_DATASETS, DEFAULT_VALIDATION_PMLB_DATASETS
+
 
 def run(command: list[str]) -> None:
     print("+ " + " ".join(command), flush=True)
@@ -25,8 +30,9 @@ def main() -> None:
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--checkpoint-version", default="tabicl-classifier-v2-20260212.ckpt")
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--train-openml-ids", default="11,23,29,37,44,50,54,59")
-    parser.add_argument("--validation-openml-ids", default="14,16,18,22")
+    parser.add_argument("--train-pmlb-datasets", default=DEFAULT_TRAIN_PMLB_DATASETS)
+    parser.add_argument("--validation-pmlb-datasets", default=DEFAULT_VALIDATION_PMLB_DATASETS)
+    parser.add_argument("--pmlb-cache-dir", type=Path, default=None)
     parser.add_argument("--episodes-per-dataset", type=int, default=4)
     parser.add_argument("--min-train-datasets", type=int, default=20)
     parser.add_argument("--min-validation-datasets", type=int, default=8)
@@ -64,8 +70,9 @@ def main() -> None:
     if args.rebuild_real_banks or not train_bank.exists() or not validation_bank.exists():
         run([
             sys.executable, "scripts/hyperspline_real_task_bank.py",
-            "--train-openml-ids", args.train_openml_ids,
-            "--validation-openml-ids", args.validation_openml_ids,
+            "--train-pmlb-datasets", args.train_pmlb_datasets,
+            "--validation-pmlb-datasets", args.validation_pmlb_datasets,
+            "--pmlb-cache-dir", str(args.pmlb_cache_dir or output / "pmlb_cache"),
             "--episodes-per-dataset", str(args.episodes_per_dataset),
             "--min-train-datasets", str(args.min_train_datasets),
             "--min-validation-datasets", str(args.min_validation_datasets),
