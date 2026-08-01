@@ -10,7 +10,10 @@ training partition:
 * bag guard: labels choose adapted versus identity, never provide gradients.
 
 The outer test labels are used exactly once, after all eight bag decisions are
-fixed.  Bag probabilities are averaged at test time.
+fixed.  Bag probabilities are averaged at test time.  The runner can repeat
+the complete protocol over multiple PMLB datasets and independent outer-split
+seeds; its CSV is deliberately rich enough to audit whether the guard made the
+right decision after the fact (without ever using test labels for selection).
 """
 
 from __future__ import annotations
@@ -151,7 +154,12 @@ def build_tuned_hyperspline(args: argparse.Namespace, backbone, device: torch.de
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--pmlb-dataset", required=True, help="One PMLB classification dataset, e.g. spambase or magic.")
+    parser.add_argument(
+        "--pmlb-dataset",
+        action="append",
+        required=True,
+        help="PMLB classification dataset; repeat this option for each dataset.",
+    )
     parser.add_argument("--pmlb-cache-dir", type=Path, default=Path("results/pmlb_cache"))
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--checkpoint-version", default="tabicl-classifier-v2-20260212.ckpt")
@@ -163,7 +171,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-steps", type=int, default=1_000)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--transform-regularization", type=float, default=0.0)
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--seeds", type=int, nargs="+", default=[0], help="Independent outer-split seeds (default: 0).")
     parser.add_argument("--n-control-points", type=int, default=20)
     parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--gate-initial-probability", type=float, default=0.10)
@@ -177,33 +185,28 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
-    if not 0 < args.outer_test_size < 1 or not 0 < args.adaptation_context_fraction < 1:
-        raise ValueError("outer test size and adaptation context fraction must lie in (0, 1)")
-    if args.bags < 2 or args.train_steps <= 0 or args.lr <= 0 or args.transform_regularization < 0:
-        raise ValueError("invalid bagging or optimization configuration")
-    if args.raw_context_residual and not args.target_aware:
-        raise ValueError("--raw-context-residual requires --target-aware")
-    device = torch.device(args.device)
-    if device.type == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA was requested but is unavailable")
-    x, y, _ = load_pmlb_frame(args.pmlb_dataset, cache_dir=args.pmlb_cache_dir)
+def run_one_protocol(
+    args: argparse.Namespace,
+    backbone,
+    config: dict,
+    *,
+    dataset: str,
+    seed: int,
+    device: torch.device,
+) -> tuple[list[dict[str, object]], dict[str, object]]:
+    """Run one fully isolated outer split and return audit rows plus its summary."""
+    x, y, _ = load_pmlb_frame(dataset, cache_dir=args.pmlb_cache_dir)
     _, y = np.unique(y, return_inverse=True)
     classes, counts = np.unique(y, return_counts=True)
     if classes.size < 2 or classes.size > 10 or counts.min() < max(args.bags, 3):
         raise ValueError("dataset must have 2..10 classes and enough examples per class for outer/bag splits")
     x_train, x_test, y_train, y_test = train_test_split(
-        x, y, test_size=args.outer_test_size, random_state=args.seed, stratify=y
+        x, y, test_size=args.outer_test_size, random_state=seed, stratify=y
     )
-    backbone, _ = load_backbone(args, device)
     if classes.size > backbone.max_classes:
         raise ValueError(f"dataset has {classes.size} classes but backbone supports {backbone.max_classes}")
-    # Get the config once so every identity model has exactly the same spline settings.
-    prototype, config = build_tuned_hyperspline(args, backbone, device)
-    del prototype
     identity = make_identity(config, device)
-    bagger = StratifiedKFold(n_splits=args.bags, shuffle=True, random_state=args.seed + 1)
+    bagger = StratifiedKFold(n_splits=args.bags, shuffle=True, random_state=seed + 1)
     test_x, test_y = tensor_episode(x_test, y_test, device=device)
     identity_probabilities, adapted_probabilities, guarded_probabilities = [], [], []
     rows: list[dict[str, object]] = []
@@ -213,13 +216,13 @@ def main() -> None:
         guard_x, guard_y = x_train[guard_indices], y_train[guard_indices]
         context_x_np, tune_x_np, context_y_np, tune_y_np = train_test_split(
             fit_x, fit_y, train_size=args.adaptation_context_fraction,
-            random_state=args.seed + 10_000 + bag, stratify=fit_y,
+            random_state=seed + 10_000 + bag, stratify=fit_y,
         )
         context_x, context_y = tensor_episode(context_x_np, context_y_np, device=device)
         tune_x, tune_y = tensor_episode(tune_x_np, tune_y_np, device=device)
         fit_context_x, fit_context_y = tensor_episode(fit_x, fit_y, device=device)
         guard_x_tensor, guard_y_tensor = tensor_episode(guard_x, guard_y, device=device)
-        torch.manual_seed(args.seed + 100_000 + bag)
+        torch.manual_seed(seed + 100_000 + bag)
         hyperspline, _ = build_tuned_hyperspline(args, backbone, device)
         optimizer = torch.optim.Adam(hyperspline.parameters(), lr=args.lr)
         first_tune_loss = None
@@ -255,21 +258,41 @@ def main() -> None:
         adapted_test_loss, adapted_test_accuracy, adapted_test_probs = evaluate(
             backbone, hyperspline, fit_context_x, fit_context_y, test_x, test_y
         )
+        guard_loss_delta = adapted_guard_loss - identity_guard_loss
+        test_loss_delta = adapted_test_loss - identity_test_loss
+        guard_accuracy_delta = adapted_guard_accuracy - identity_guard_accuracy
+        test_accuracy_delta = adapted_test_accuracy - identity_test_accuracy
+        test_prefers_adapted_loss = test_loss_delta < 0.0
+        test_prefers_adapted_accuracy = test_accuracy_delta > 0.0
+        # These fields are analysis only.  They explicitly use outer-test
+        # labels *after* the decision has been made, to show whether the guard
+        # is a useful proxy rather than to affect the deployed ensemble.
+        guard_correct_for_test_loss = use_adapted == test_prefers_adapted_loss
+        guard_correct_for_test_accuracy = (adapted_guard_accuracy > identity_guard_accuracy) == test_prefers_adapted_accuracy
         identity_probabilities.append(identity_test_probs)
         adapted_probabilities.append(adapted_test_probs)
         guarded_probabilities.append(adapted_test_probs if use_adapted else identity_test_probs)
         rows.append({
-            "bag": bag, "fit_rows": len(fit_indices), "adaptation_context_rows": len(context_y_np),
+            "dataset": dataset, "outer_seed": seed, "bag": bag,
+            "fit_rows": len(fit_indices), "adaptation_context_rows": len(context_y_np),
             "adaptation_query_rows": len(tune_y_np), "guard_rows": len(guard_indices),
             "initial_tune_loss": first_tune_loss, "final_tune_loss": float(query_loss.detach()),
             "identity_guard_loss": identity_guard_loss, "adapted_guard_loss": adapted_guard_loss,
             "identity_guard_accuracy": identity_guard_accuracy, "adapted_guard_accuracy": adapted_guard_accuracy,
+            "guard_loss_delta": guard_loss_delta, "guard_accuracy_delta": guard_accuracy_delta,
             "identity_guard_selected_adapted": use_adapted,
             "identity_outer_test_loss": identity_test_loss, "adapted_outer_test_loss": adapted_test_loss,
             "identity_outer_test_accuracy": identity_test_accuracy, "adapted_outer_test_accuracy": adapted_test_accuracy,
+            "outer_test_loss_delta": test_loss_delta, "outer_test_accuracy_delta": test_accuracy_delta,
+            "outer_test_prefers_adapted_loss": test_prefers_adapted_loss,
+            "outer_test_prefers_adapted_accuracy": test_prefers_adapted_accuracy,
+            "guard_correct_for_outer_test_loss": guard_correct_for_test_loss,
+            "guard_correct_for_outer_test_accuracy": guard_correct_for_test_accuracy,
+            "guard_false_positive_loss": use_adapted and not test_prefers_adapted_loss,
+            "guard_false_negative_loss": not use_adapted and test_prefers_adapted_loss,
         })
         print(
-            f"[bag={bag}] tune_loss={first_tune_loss:.4f}->{float(query_loss.detach()):.4f}, "
+            f"[{dataset} seed={seed} bag={bag}] tune_loss={first_tune_loss:.4f}->{float(query_loss.detach()):.4f}, "
             f"guard identity={identity_guard_loss:.4f}, adapted={adapted_guard_loss:.4f}, "
             f"selected={'adapted' if use_adapted else 'identity'}", flush=True,
         )
@@ -283,21 +306,85 @@ def main() -> None:
     identity_loss, identity_accuracy = ensemble_metrics(identity_probabilities)
     adapted_loss, adapted_accuracy = ensemble_metrics(adapted_probabilities)
     guarded_loss, guarded_accuracy = ensemble_metrics(guarded_probabilities)
+    # Oracle bag selection is intentionally post-hoc and leaky.  Its distance
+    # above the guarded result measures the guard's remaining headroom.
+    oracle_probabilities = [
+        adapted_probabilities[index] if bool(row["outer_test_prefers_adapted_loss"]) else identity_probabilities[index]
+        for index, row in enumerate(rows)
+    ]
+    oracle_loss, oracle_accuracy = ensemble_metrics(oracle_probabilities)
     summary = {
-        "dataset": args.pmlb_dataset,
+        "dataset": dataset, "outer_seed": seed,
         "outer_train_rows": int(y_train.size), "outer_test_rows": int(y_test.size), "n_features": int(x.shape[1]),
         "n_classes": int(classes.size), "bags": args.bags, "train_steps_per_bag": args.train_steps,
         "identity_outer_test_loss": identity_loss, "identity_outer_test_accuracy": identity_accuracy,
         "adapted_outer_test_loss": adapted_loss, "adapted_outer_test_accuracy": adapted_accuracy,
         "guarded_outer_test_loss": guarded_loss, "guarded_outer_test_accuracy": guarded_accuracy,
+        "oracle_per_bag_outer_test_loss": oracle_loss, "oracle_per_bag_outer_test_accuracy": oracle_accuracy,
         "adapted_minus_identity_loss": adapted_loss - identity_loss,
         "guarded_minus_identity_loss": guarded_loss - identity_loss,
         "adapted_minus_identity_accuracy": adapted_accuracy - identity_accuracy,
         "guarded_minus_identity_accuracy": guarded_accuracy - identity_accuracy,
         "guard_selected_adapted_fraction": float(np.mean([bool(row["identity_guard_selected_adapted"]) for row in rows])),
+        "outer_test_prefers_adapted_fraction_loss": float(np.mean([bool(row["outer_test_prefers_adapted_loss"]) for row in rows])),
+        "outer_test_prefers_adapted_fraction_accuracy": float(np.mean([bool(row["outer_test_prefers_adapted_accuracy"]) for row in rows])),
+        "guard_correct_fraction_for_outer_test_loss": float(np.mean([bool(row["guard_correct_for_outer_test_loss"]) for row in rows])),
+        "guard_correct_fraction_for_outer_test_accuracy": float(np.mean([bool(row["guard_correct_for_outer_test_accuracy"]) for row in rows])),
+        "guard_false_positive_fraction_loss": float(np.mean([bool(row["guard_false_positive_loss"]) for row in rows])),
+        "guard_false_negative_fraction_loss": float(np.mean([bool(row["guard_false_negative_loss"]) for row in rows])),
+        "guard_false_positive_count_loss": int(sum(bool(row["guard_false_positive_loss"]) for row in rows)),
+        "guard_false_negative_count_loss": int(sum(bool(row["guard_false_negative_loss"]) for row in rows)),
+        "oracle_per_bag_minus_identity_loss": oracle_loss - identity_loss,
+        "oracle_per_bag_minus_identity_accuracy": oracle_accuracy - identity_accuracy,
         "protocol": "outer_holdout + nested_8_fold_bagging + train_only_adaptation + external_identity_guard",
     }
-    write_csv(args.output_fold_csv, rows)
+    return rows, summary
+
+
+def main() -> None:
+    args = parse_args()
+    if not 0 < args.outer_test_size < 1 or not 0 < args.adaptation_context_fraction < 1:
+        raise ValueError("outer test size and adaptation context fraction must lie in (0, 1)")
+    if args.bags < 2 or args.train_steps <= 0 or args.lr <= 0 or args.transform_regularization < 0:
+        raise ValueError("invalid bagging or optimization configuration")
+    if args.raw_context_residual and not args.target_aware:
+        raise ValueError("--raw-context-residual requires --target-aware")
+    if len(set(args.seeds)) != len(args.seeds):
+        raise ValueError("--seeds must be unique")
+    device = torch.device(args.device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested but is unavailable")
+    backbone, _ = load_backbone(args, device)
+    # All runs use identical HyperSpline construction; every bag still starts
+    # independently from the supplied initial checkpoint.
+    prototype, config = build_tuned_hyperspline(args, backbone, device)
+    del prototype
+    all_rows: list[dict[str, object]] = []
+    run_summaries: list[dict[str, object]] = []
+    for dataset in args.pmlb_dataset:
+        for seed in args.seeds:
+            rows, summary = run_one_protocol(args, backbone, config, dataset=dataset, seed=seed, device=device)
+            all_rows.extend(rows)
+            run_summaries.append(summary)
+            print(json.dumps(summary, indent=2), flush=True)
+    if not all_rows:
+        raise RuntimeError("no dataset/seed runs were requested")
+    write_csv(args.output_fold_csv, all_rows)
+    macro_metric_names = (
+        "adapted_minus_identity_loss", "guarded_minus_identity_loss",
+        "adapted_minus_identity_accuracy", "guarded_minus_identity_accuracy",
+        "guard_correct_fraction_for_outer_test_loss", "guard_false_positive_fraction_loss",
+        "guard_false_negative_fraction_loss", "oracle_per_bag_minus_identity_loss",
+    )
+    macro = {name: float(np.mean([float(run[name]) for run in run_summaries])) for name in macro_metric_names}
+    summary = {
+        "runs": run_summaries,
+        "macro_mean_over_dataset_seed_runs": macro,
+        "n_datasets": len(args.pmlb_dataset), "n_seeds": len(args.seeds), "n_runs": len(run_summaries),
+        "n_bag_decisions": len(all_rows),
+        "datasets": args.pmlb_dataset, "seeds": args.seeds,
+        "protocol": "outer_holdout + nested_bagging + train_only_adaptation + external_identity_guard; oracle fields are post-hoc diagnostics",
+    }
     args.output_summary_json.parent.mkdir(parents=True, exist_ok=True)
     args.output_summary_json.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
     print(json.dumps(summary, indent=2), flush=True)

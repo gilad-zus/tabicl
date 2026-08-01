@@ -103,6 +103,19 @@ def test_direct_spline_has_trainable_per_column_parameters():
     assert direct.gate_logits.grad is not None
 
 
+def test_direct_spline_optional_basis_freedoms_start_at_baseline_and_receive_gradients():
+    context = torch.randn(1, 8, 3)
+    baseline = DirectSplineTransform(context, n_control_points=8)
+    adaptive = DirectSplineTransform(
+        context, n_control_points=8, trainable_range=True, trainable_location_scale=True
+    )
+    assert torch.allclose(baseline.transform(context), adaptive.transform(context), atol=1e-6)
+    adaptive.transform(context).square().mean().backward()
+    assert adaptive.range_logits.grad is not None
+    assert adaptive.location_offsets.grad is not None
+    assert adaptive.log_scale_offsets.grad is not None
+
+
 def test_frozen_adapter_preserves_categorical_columns_and_backbone_freezing():
     class ToyBackbone(nn.Module):
         def __init__(self):

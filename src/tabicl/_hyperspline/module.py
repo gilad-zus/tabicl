@@ -444,9 +444,29 @@ class HyperSplineTransform(nn.Module):
 
 
 class DirectSplineTransform(nn.Module):
-    """Per-dataset trainable spline used only for the headroom experiment."""
+    """Per-dataset trainable spline used only for DirectSpline headroom tests.
 
-    def __init__(self, x_context: torch.Tensor, n_control_points: int = 10, degree: int = 3, standardized_range: float = 4.0, eps: float = 1e-6) -> None:
+    Optional basis freedoms are intentionally kept here first.  They are
+    ablated before adding matching outputs to HyperSpline, so the amortizer is
+    not made more complex without evidence that a freedom improves held-out
+    rows.
+    """
+
+    def __init__(
+        self,
+        x_context: torch.Tensor,
+        n_control_points: int = 10,
+        degree: int = 3,
+        standardized_range: float = 4.0,
+        eps: float = 1e-6,
+        *,
+        trainable_range: bool = False,
+        trainable_location_scale: bool = False,
+        range_min: float = 1.0,
+        range_max: float = 8.0,
+        location_adjustment_bound: float = 1.0,
+        scale_adjustment_bound: float = 2.0,
+    ) -> None:
         super().__init__()
         if x_context.ndim != 3:
             raise ValueError("x_context must have shape (B, N, D)")
@@ -455,6 +475,14 @@ class DirectSplineTransform(nn.Module):
         self.degree = degree
         self.standardized_range = standardized_range
         self.eps = eps
+        if not 0 < range_min < standardized_range < range_max:
+            raise ValueError("range_min < standardized_range < range_max is required")
+        self.trainable_range = trainable_range
+        self.trainable_location_scale = trainable_location_scale
+        self.range_min = range_min
+        self.range_max = range_max
+        self.location_adjustment_bound = location_adjustment_bound
+        self.scale_adjustment_bound = scale_adjustment_bound
         statistics = summarize_context(x_context, eps=eps)
         knots = uniform_augmented_knots(n_control_points, degree)
         identity = greville_abscissae(knots, degree, n_control_points)
@@ -464,19 +492,34 @@ class DirectSplineTransform(nn.Module):
         self.register_buffer("scale", statistics.scale)
         self.gap_logits = nn.Parameter(torch.zeros(x_context.shape[0], x_context.shape[2], n_control_points - 1))
         self.gate_logits = nn.Parameter(torch.full((x_context.shape[0], x_context.shape[2]), torch.logit(torch.tensor(0.01))))
+        self.location_offsets = nn.Parameter(torch.zeros_like(statistics.location), requires_grad=trainable_location_scale)
+        self.log_scale_offsets = nn.Parameter(torch.zeros_like(statistics.scale), requires_grad=trainable_location_scale)
+        initial_range_fraction = (standardized_range - range_min) / (range_max - range_min)
+        self.range_logits = nn.Parameter(
+            torch.full_like(statistics.location, torch.logit(torch.tensor(initial_range_fraction))),
+            requires_grad=trainable_range,
+        )
+
+    def _location_scale_range(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        location = self.location + self.location_adjustment_bound * torch.tanh(self.location_offsets) * self.scale
+        scale = self.scale * torch.exp(torch.log(torch.as_tensor(self.scale_adjustment_bound, device=self.scale.device)) * torch.tanh(self.log_scale_offsets))
+        standardized_range = self.range_min + (self.range_max - self.range_min) * torch.sigmoid(self.range_logits)
+        return location, scale, standardized_range
 
     def parameters_for_transform(self) -> HyperSplineParameters:
         gaps = self.identity_gaps * torch.exp(torch.tanh(self.gap_logits))
         gaps = 2.0 * gaps / gaps.sum(dim=-1, keepdim=True).clamp_min(self.eps)
         controls = torch.cat((torch.full_like(gaps[..., :1], -1.0), -1.0 + gaps.cumsum(dim=-1)), dim=-1)
-        return HyperSplineParameters(controls, torch.sigmoid(self.gate_logits), self.location, self.scale)
+        location, scale, _ = self._location_scale_range()
+        return HyperSplineParameters(controls, torch.sigmoid(self.gate_logits), location, scale)
 
     def transform(self, x: torch.Tensor) -> torch.Tensor:
         params = self.parameters_for_transform()
+        _, _, standardized_range = self._location_scale_range()
         z = (x.float() - params.location.unsqueeze(1)) / params.scale.unsqueeze(1)
-        u = (z / self.standardized_range).clamp(-1.0, 1.0)
+        u = (z / standardized_range.unsqueeze(1)).clamp(-1.0, 1.0)
         spline = evaluate_bspline(u, params.control_points, self.knots, self.degree)
-        return (z + params.gate.unsqueeze(1) * self.standardized_range * (spline - u)).to(x.dtype)
+        return (z + params.gate.unsqueeze(1) * standardized_range.unsqueeze(1) * (spline - u)).to(x.dtype)
 
 
 class FrozenTabICLHyperSpline(nn.Module):
