@@ -463,6 +463,8 @@ class DirectSplineTransform(nn.Module):
         trainable_shape: bool = True,
         trainable_range: bool = False,
         trainable_location_scale: bool = False,
+        cross_column_mixing_rank: int = 0,
+        cross_column_mixing_bound: float = 0.1,
         range_min: float = 1.0,
         range_max: float = 8.0,
         location_adjustment_bound: float = 1.0,
@@ -478,6 +480,8 @@ class DirectSplineTransform(nn.Module):
         self.eps = eps
         if not 0 < range_min < standardized_range < range_max:
             raise ValueError("range_min < standardized_range < range_max is required")
+        if cross_column_mixing_rank < 0 or cross_column_mixing_bound < 0:
+            raise ValueError("cross-column mixing rank and bound must be non-negative")
         self.trainable_shape = trainable_shape
         self.trainable_range = trainable_range
         self.trainable_location_scale = trainable_location_scale
@@ -485,6 +489,8 @@ class DirectSplineTransform(nn.Module):
         self.range_max = range_max
         self.location_adjustment_bound = location_adjustment_bound
         self.scale_adjustment_bound = scale_adjustment_bound
+        self.cross_column_mixing_rank = min(cross_column_mixing_rank, x_context.shape[2])
+        self.cross_column_mixing_bound = cross_column_mixing_bound
         statistics = summarize_context(x_context, eps=eps)
         knots = uniform_augmented_knots(n_control_points, degree)
         identity = greville_abscissae(knots, degree, n_control_points)
@@ -507,6 +513,22 @@ class DirectSplineTransform(nn.Module):
             torch.full_like(statistics.location, torch.logit(torch.tensor(initial_range_fraction))),
             requires_grad=trainable_range,
         )
+        if self.cross_column_mixing_rank:
+            # The factors have nonzero directions while the gate is exactly
+            # zero, avoiding the zero-times-zero gradient deadlock of a
+            # low-rank residual initialized directly at zero.
+            factor_shape = (x_context.shape[0], x_context.shape[2], self.cross_column_mixing_rank)
+            self.mixing_left = nn.Parameter(torch.randn(factor_shape) * 0.02)
+            self.mixing_right = nn.Parameter(torch.randn(factor_shape) * 0.02)
+            self.mixing_weight_logits = nn.Parameter(
+                torch.full((x_context.shape[0], self.cross_column_mixing_rank), torch.atanh(torch.tensor(0.5)))
+            )
+            self.mixing_gate = nn.Parameter(torch.zeros(x_context.shape[0], x_context.shape[2]))
+        else:
+            self.register_parameter("mixing_left", None)
+            self.register_parameter("mixing_right", None)
+            self.register_parameter("mixing_weight_logits", None)
+            self.register_parameter("mixing_gate", None)
 
     def _location_scale_range(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         location = self.location + self.location_adjustment_bound * torch.tanh(self.location_offsets) * self.scale
@@ -521,13 +543,43 @@ class DirectSplineTransform(nn.Module):
         location, scale, _ = self._location_scale_range()
         return HyperSplineParameters(controls, torch.sigmoid(self.gate_logits), location, scale)
 
+    def mixing_matrix(self) -> torch.Tensor | None:
+        """Return the bounded low-rank feature interaction before output gates."""
+        if self.mixing_left is None or self.mixing_right is None:
+            return None
+        # Thin orthonormal factors make the residual spectral norm at most one
+        # before the explicitly bounded per-output gate is applied.
+        left, _ = torch.linalg.qr(self.mixing_left, mode="reduced")
+        right, _ = torch.linalg.qr(self.mixing_right, mode="reduced")
+        weights = torch.tanh(self.mixing_weight_logits)
+        return torch.matmul(left * weights.unsqueeze(-2), right.transpose(-1, -2))
+
+    def effective_mixing_matrix(self) -> torch.Tensor | None:
+        mixing = self.mixing_matrix()
+        if mixing is None:
+            return None
+        return self.cross_column_mixing_bound * torch.tanh(self.mixing_gate).unsqueeze(-2) * mixing
+
+    def mixing_diagnostics(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Mean gate, max gate, and spectral norm of the gated mixing residual."""
+        if self.mixing_gate is None:
+            zero = self.location.new_zeros(())
+            return zero, zero, zero
+        effective = self.effective_mixing_matrix()
+        gate = self.cross_column_mixing_bound * torch.tanh(self.mixing_gate)
+        return gate.abs().mean(), gate.abs().max(), torch.linalg.matrix_norm(effective, ord=2).amax()
+
     def transform(self, x: torch.Tensor) -> torch.Tensor:
         params = self.parameters_for_transform()
         _, _, standardized_range = self._location_scale_range()
         z = (x.float() - params.location.unsqueeze(1)) / params.scale.unsqueeze(1)
         u = (z / standardized_range.unsqueeze(1)).clamp(-1.0, 1.0)
         spline = evaluate_bspline(u, params.control_points, self.knots, self.degree)
-        return (z + params.gate.unsqueeze(1) * standardized_range.unsqueeze(1) * (spline - u)).to(x.dtype)
+        output = z + params.gate.unsqueeze(1) * standardized_range.unsqueeze(1) * (spline - u)
+        effective_mixing = self.effective_mixing_matrix()
+        if effective_mixing is not None:
+            output = output + torch.matmul(output, effective_mixing)
+        return output.to(x.dtype)
 
 
 class FrozenTabICLHyperSpline(nn.Module):

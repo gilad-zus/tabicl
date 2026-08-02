@@ -32,6 +32,13 @@ DECOMPOSITION_VARIANTS = {
     "joint_shape_location_scale": ("--trainable-location-scale",),
 }
 
+# This asks whether a qualitatively new, bounded multivariate freedom raises
+# the DirectSpline headroom beyond the best independent-column transform.
+CROSS_COLUMN_VARIANTS = {
+    "joint_univariate": ("--trainable-location-scale",),
+    "joint_low_rank_mixing": ("--trainable-location-scale",),
+}
+
 
 def parse_csv(value: str, converter):
     values = [converter(item.strip()) for item in value.split(",") if item.strip()]
@@ -43,8 +50,8 @@ def parse_csv(value: str, converter):
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pmlb-dataset", action="append", required=True)
-    parser.add_argument("--experiment", choices=("basis", "decomposition"), default="basis",
-                        help="Run the original basis-freedom ablation or the shape-versus-affine decomposition.")
+    parser.add_argument("--experiment", choices=("basis", "decomposition", "cross_column"), default="basis",
+                        help="Run basis freedoms, shape-versus-affine decomposition, or cross-column mixing.")
     parser.add_argument("--seeds", default="0,1")
     parser.add_argument("--variants", default=None,
                         help="Comma-separated condition names; defaults depend on --experiment.")
@@ -63,6 +70,10 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=1_250)
     parser.add_argument("--lr", type=float, default=0.03)
     parser.add_argument("--transform-regularization", type=float, default=0.0)
+    parser.add_argument("--mixing-rank", type=int, default=4,
+                        help="Low rank used by the joint_low_rank_mixing condition.")
+    parser.add_argument("--mixing-bound", type=float, default=0.1,
+                        help="Maximum spectral scale of the low-rank mixing residual.")
     parser.add_argument("--interpolation-alphas", default="0,0.25,0.5,0.75,1")
     parser.add_argument("--perturbation-scales", default="0.05,0.10,0.25")
     parser.add_argument("--perturbation-repeats", type=int, default=2)
@@ -70,7 +81,11 @@ def main() -> None:
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
 
-    variant_definitions = BASIS_VARIANTS if args.experiment == "basis" else DECOMPOSITION_VARIANTS
+    variant_definitions = {
+        "basis": BASIS_VARIANTS,
+        "decomposition": DECOMPOSITION_VARIANTS,
+        "cross_column": CROSS_COLUMN_VARIANTS,
+    }[args.experiment]
     if args.variants is None:
         args.variants = ",".join(variant_definitions)
     variants = parse_csv(args.variants, str)
@@ -80,6 +95,8 @@ def main() -> None:
     control_points = parse_csv(args.control_points, int)
     if any(value <= 3 for value in control_points):
         raise ValueError("all control-point counts must exceed cubic degree 3")
+    if args.mixing_rank <= 0 or args.mixing_bound < 0:
+        raise ValueError("--mixing-rank must be positive and --mixing-bound non-negative")
     seeds = parse_csv(args.seeds, int)
     args.output_dir = args.output_dir.resolve()
     args.pmlb_cache_dir = args.pmlb_cache_dir.resolve()
@@ -114,10 +131,17 @@ def main() -> None:
             if args.resume:
                 command.append("--resume")
             command.extend(variant_definitions[variant])
+            if args.experiment == "cross_column" and variant == "joint_low_rank_mixing":
+                command.extend((
+                    "--cross-column-mixing-rank", str(args.mixing_rank),
+                    "--cross-column-mixing-bound", str(args.mixing_bound),
+                ))
             print(f"Running {variant}, K={controls}", flush=True)
             subprocess.run(command, check=True)
             completed.append({
                 "experiment": args.experiment, "variant": variant, "n_control_points": controls,
+                "mixing_rank": args.mixing_rank if args.experiment == "cross_column" else None,
+                "mixing_bound": args.mixing_bound if args.experiment == "cross_column" else None,
                 "summary": str(condition_dir / "summary.json"),
                 "margin": str(condition_dir / "margin.csv"),
             })

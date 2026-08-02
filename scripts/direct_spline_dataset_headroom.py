@@ -79,6 +79,10 @@ def parse_args() -> argparse.Namespace:
                         help="Learn bounded per-column spline ranges instead of fixed R=4.")
     parser.add_argument("--trainable-location-scale", action="store_true",
                         help="Learn bounded residual location/scale adjustments.")
+    parser.add_argument("--cross-column-mixing-rank", type=int, default=0,
+                        help="Rank of a bounded low-rank numerical mixing residual; 0 disables it.")
+    parser.add_argument("--cross-column-mixing-bound", type=float, default=0.1,
+                        help="Maximum spectral scale of the low-rank mixing residual.")
     parser.add_argument("--basis-variant", default="uniform_fixed",
                         help="Label written to outputs; use one output directory per variant.")
     parser.add_argument("--output-fold-csv", type=Path, required=True)
@@ -172,6 +176,8 @@ def make_direct_spline(x_context: torch.Tensor, args: argparse.Namespace) -> Dir
         trainable_shape=not args.freeze_spline_shape,
         trainable_range=args.trainable_range,
         trainable_location_scale=args.trainable_location_scale,
+        cross_column_mixing_rank=args.cross_column_mixing_rank,
+        cross_column_mixing_bound=args.cross_column_mixing_bound,
     )
 
 
@@ -243,6 +249,12 @@ def spline_diagnostics(spline: DirectSplineTransform) -> tuple[float, float, flo
         return float(parameters.gate.mean()), float(parameters.gate.max()), float(control_displacement)
 
 
+def mixing_diagnostics(spline: DirectSplineTransform) -> tuple[float, float, float]:
+    with torch.no_grad():
+        gate_mean, gate_max, spectral_norm = spline.mixing_diagnostics()
+        return float(gate_mean), float(gate_max), float(spectral_norm)
+
+
 def clone_with_shape(
     identity: DirectSplineTransform,
     *,
@@ -251,6 +263,10 @@ def clone_with_shape(
     location_offsets: torch.Tensor | None = None,
     log_scale_offsets: torch.Tensor | None = None,
     range_logits: torch.Tensor | None = None,
+    mixing_left: torch.Tensor | None = None,
+    mixing_right: torch.Tensor | None = None,
+    mixing_weight_logits: torch.Tensor | None = None,
+    mixing_gate: torch.Tensor | None = None,
 ) -> DirectSplineTransform:
     """Use a target bag's normalization with a complete learned spline state.
 
@@ -268,7 +284,47 @@ def clone_with_shape(
             candidate.log_scale_offsets.copy_(log_scale_offsets.to(candidate.log_scale_offsets))
         if range_logits is not None:
             candidate.range_logits.copy_(range_logits.to(candidate.range_logits))
+        if mixing_left is not None:
+            if candidate.mixing_left is None:
+                raise ValueError("cannot transplant mixing factors into a non-mixing DirectSpline")
+            candidate.mixing_left.copy_(mixing_left.to(candidate.mixing_left))
+        if mixing_right is not None:
+            if candidate.mixing_right is None:
+                raise ValueError("cannot transplant mixing factors into a non-mixing DirectSpline")
+            candidate.mixing_right.copy_(mixing_right.to(candidate.mixing_right))
+        if mixing_weight_logits is not None:
+            if candidate.mixing_weight_logits is None:
+                raise ValueError("cannot transplant mixing weights into a non-mixing DirectSpline")
+            candidate.mixing_weight_logits.copy_(mixing_weight_logits.to(candidate.mixing_weight_logits))
+        if mixing_gate is not None:
+            if candidate.mixing_gate is None:
+                raise ValueError("cannot transplant mixing gate into a non-mixing DirectSpline")
+            candidate.mixing_gate.copy_(mixing_gate.to(candidate.mixing_gate))
     return candidate
+
+
+@torch.no_grad()
+def set_mixing_from_effective_matrix(candidate: DirectSplineTransform, effective: torch.Tensor) -> None:
+    """Project a consensus residual matrix back into the candidate's rank-r family."""
+    if candidate.mixing_gate is None:
+        if effective.abs().max() > 1e-8:
+            raise ValueError("cannot set a mixing residual on a non-mixing DirectSpline")
+        return
+    singular = torch.linalg.matrix_norm(effective, ord=2).clamp_min(0.0)
+    amplitude = (singular / candidate.cross_column_mixing_bound).clamp(0.0, 1.0 - 1e-6)
+    raw_gate = torch.atanh(amplitude)
+    normalized = effective / (candidate.cross_column_mixing_bound * amplitude.clamp_min(1e-6)).view(-1, 1, 1)
+    left, _, right_t = torch.linalg.svd(normalized, full_matrices=False)
+    rank = candidate.cross_column_mixing_rank
+    candidate.mixing_left.copy_(left[..., :rank])
+    candidate.mixing_right.copy_(right_t.transpose(-1, -2)[..., :rank])
+    # QR can choose different signs from the SVD; fit the diagonal weights in
+    # the actual orthonormal factor coordinates used by the transform.
+    q_left, _ = torch.linalg.qr(candidate.mixing_left, mode="reduced")
+    q_right, _ = torch.linalg.qr(candidate.mixing_right, mode="reduced")
+    weights = torch.diagonal(q_left.transpose(-1, -2) @ normalized @ q_right, dim1=-2, dim2=-1)
+    candidate.mixing_weight_logits.copy_(torch.atanh(weights.clamp(-1.0 + 1e-6, 1.0 - 1e-6)))
+    candidate.mixing_gate.copy_(raw_gate.unsqueeze(-1).expand_as(candidate.mixing_gate))
 
 
 def interpolated_shape(identity: DirectSplineTransform, teacher: DirectSplineTransform, alpha: float) -> DirectSplineTransform:
@@ -282,6 +338,10 @@ def interpolated_shape(identity: DirectSplineTransform, teacher: DirectSplineTra
                 location_offsets=teacher.location_offsets,
                 log_scale_offsets=teacher.log_scale_offsets,
                 range_logits=teacher.range_logits,
+                mixing_left=teacher.mixing_left,
+                mixing_right=teacher.mixing_right,
+                mixing_weight_logits=teacher.mixing_weight_logits,
+                mixing_gate=teacher.mixing_gate,
             )
         teacher_parameters = teacher.parameters_for_transform()
         gate = (alpha * teacher_parameters.gate).clamp(1e-6, 1.0 - 1e-6)
@@ -292,6 +352,12 @@ def interpolated_shape(identity: DirectSplineTransform, teacher: DirectSplineTra
             location_offsets=identity.location_offsets + alpha * (teacher.location_offsets - identity.location_offsets),
             log_scale_offsets=identity.log_scale_offsets + alpha * (teacher.log_scale_offsets - identity.log_scale_offsets),
             range_logits=identity.range_logits + alpha * (teacher.range_logits - identity.range_logits),
+            mixing_left=None if teacher.mixing_left is None else identity.mixing_left + alpha * (teacher.mixing_left - identity.mixing_left),
+            mixing_right=None if teacher.mixing_right is None else identity.mixing_right + alpha * (teacher.mixing_right - identity.mixing_right),
+            mixing_weight_logits=None if teacher.mixing_weight_logits is None else identity.mixing_weight_logits + alpha * (teacher.mixing_weight_logits - identity.mixing_weight_logits),
+            mixing_gate=None if teacher.mixing_gate is None else torch.atanh(
+                (alpha * torch.tanh(teacher.mixing_gate)).clamp(-1.0 + 1e-6, 1.0 - 1e-6)
+            ),
         )
 
 
@@ -308,6 +374,10 @@ def perturb_shape(
         location_delta = teacher.location_offsets - identity.location_offsets
         log_scale_delta = teacher.log_scale_offsets - identity.log_scale_offsets
         range_delta = teacher.range_logits - identity.range_logits
+        mixing_left_delta = None if teacher.mixing_left is None else teacher.mixing_left - identity.mixing_left
+        mixing_right_delta = None if teacher.mixing_right is None else teacher.mixing_right - identity.mixing_right
+        mixing_weight_delta = None if teacher.mixing_weight_logits is None else teacher.mixing_weight_logits - identity.mixing_weight_logits
+        mixing_gate_delta = None if teacher.mixing_gate is None else teacher.mixing_gate - identity.mixing_gate
 
         def noise_like(delta: torch.Tensor) -> torch.Tensor:
             rms = delta.square().mean().sqrt().clamp_min(1e-6)
@@ -320,6 +390,10 @@ def perturb_shape(
             location_offsets=teacher.location_offsets + noise_like(location_delta),
             log_scale_offsets=teacher.log_scale_offsets + noise_like(log_scale_delta),
             range_logits=teacher.range_logits + noise_like(range_delta),
+            mixing_left=None if mixing_left_delta is None else teacher.mixing_left + noise_like(mixing_left_delta),
+            mixing_right=None if mixing_right_delta is None else teacher.mixing_right + noise_like(mixing_right_delta),
+            mixing_weight_logits=None if mixing_weight_delta is None else teacher.mixing_weight_logits + noise_like(mixing_weight_delta),
+            mixing_gate=None if mixing_gate_delta is None else teacher.mixing_gate + noise_like(mixing_gate_delta),
         )
 
 
@@ -455,6 +529,9 @@ def run_one_protocol(
         if adaptation_y.size < n_classes or np.unique(adaptation_y).size != n_classes:
             raise ValueError("fit fold could not leave a labelled adaptation query pool")
         support_x, support_y = to_device(fit_x, fit_y, support_rows, device)
+        # Low-rank factors have nonzero directions but a zero residual gate.
+        # Seed those directions per paired bag so reruns are reproducible.
+        torch.manual_seed(seed + 10_000_000 + bag)
         identity = make_direct_spline(support_x, args).to(device).eval()
         spline = copy.deepcopy(identity).train()
         optimizer = torch.optim.Adam(spline.parameters(), lr=args.lr)
@@ -543,6 +620,10 @@ def run_one_protocol(
             "teacher_location_offsets": spline.location_offsets.detach().cpu().clone(),
             "teacher_log_scale_offsets": spline.log_scale_offsets.detach().cpu().clone(),
             "teacher_range_logits": spline.range_logits.detach().cpu().clone(),
+            "teacher_mixing_left": None if spline.mixing_left is None else spline.mixing_left.detach().cpu().clone(),
+            "teacher_mixing_right": None if spline.mixing_right is None else spline.mixing_right.detach().cpu().clone(),
+            "teacher_mixing_weight_logits": None if spline.mixing_weight_logits is None else spline.mixing_weight_logits.detach().cpu().clone(),
+            "teacher_mixing_gate": None if spline.mixing_gate is None else spline.mixing_gate.detach().cpu().clone(),
             "identity_test_loss": identity_test_loss, "identity_test_accuracy": identity_test_accuracy,
             "teacher_test_loss": adapted_test_loss, "teacher_test_accuracy": adapted_test_accuracy,
         })
@@ -550,10 +631,13 @@ def run_one_protocol(
         if device.type == "cuda":
             peak_allocated_gib = torch.cuda.max_memory_allocated(device) / 2**30
             peak_reserved_gib = torch.cuda.max_memory_reserved(device) / 2**30
+        mixing_gate_mean, mixing_gate_max, mixing_spectral_norm = mixing_diagnostics(spline)
         rows.append({
             "basis_variant": args.basis_variant, "n_control_points": args.n_control_points,
             "trainable_shape": not args.freeze_spline_shape, "trainable_range": args.trainable_range,
             "trainable_location_scale": args.trainable_location_scale,
+            "cross_column_mixing_rank": spline.cross_column_mixing_rank,
+            "cross_column_mixing_bound": args.cross_column_mixing_bound,
             "dataset": dataset, "outer_seed": seed, "bag": bag,
             "fit_rows": int(fit_y.size), "support_context_rows": int(support_y.shape[1]),
             "adaptation_query_pool_rows": int(adaptation_y.size), "guard_rows": int(guard_y.size),
@@ -575,6 +659,9 @@ def run_one_protocol(
             "guard_false_negative_loss": not use_adapted and test_prefers_adapted_loss,
             "adapted_mean_gate": gate_mean, "adapted_max_gate": gate_max,
             "adapted_mean_abs_control_displacement": control_displacement,
+            "adapted_mean_abs_mixing_gate": mixing_gate_mean,
+            "adapted_max_abs_mixing_gate": mixing_gate_max,
+            "adapted_mixing_spectral_norm": mixing_spectral_norm,
             "peak_allocated_gib": peak_allocated_gib, "peak_reserved_gib": peak_reserved_gib,
         })
         print(
@@ -599,6 +686,10 @@ def run_one_protocol(
             location_offsets=target["teacher_location_offsets"],
             log_scale_offsets=target["teacher_log_scale_offsets"],
             range_logits=target["teacher_range_logits"],
+            mixing_left=target["teacher_mixing_left"],
+            mixing_right=target["teacher_mixing_right"],
+            mixing_weight_logits=target["teacher_mixing_weight_logits"],
+            mixing_gate=target["teacher_mixing_gate"],
         )
         all_sources = [source for source in bag_artifacts if source["bag"] != target["bag"]]
         transfer_sources = all_sources
@@ -612,6 +703,10 @@ def run_one_protocol(
                 location_offsets=source["teacher_location_offsets"],
                 log_scale_offsets=source["teacher_log_scale_offsets"],
                 range_logits=source["teacher_range_logits"],
+                mixing_left=source["teacher_mixing_left"],
+                mixing_right=source["teacher_mixing_right"],
+                mixing_weight_logits=source["teacher_mixing_weight_logits"],
+                mixing_gate=source["teacher_mixing_gate"],
             )
             margin_rows.append(evaluate_margin_candidate(
                 backbone, candidate, target_teacher, target_identity, target_x, target_y, x_test, y_test,
@@ -634,6 +729,20 @@ def run_one_protocol(
             location_offsets=consensus_location, log_scale_offsets=consensus_log_scale,
             range_logits=consensus_range,
         )
+        if target_identity.mixing_gate is not None:
+            effective_matrices = []
+            for source in all_sources:
+                source_mixing = clone_with_shape(
+                    target_identity,
+                    gap_logits=target_identity.gap_logits, gate_logits=target_identity.gate_logits,
+                    mixing_left=source["teacher_mixing_left"],
+                    mixing_right=source["teacher_mixing_right"],
+                    mixing_weight_logits=source["teacher_mixing_weight_logits"],
+                    mixing_gate=source["teacher_mixing_gate"],
+                )
+                effective_matrices.append(source_mixing.effective_mixing_matrix())
+                del source_mixing
+            set_mixing_from_effective_matrix(candidate, torch.stack(effective_matrices).mean(dim=0))
         margin_rows.append(evaluate_margin_candidate(
             backbone, candidate, target_teacher, target_identity, target_x, target_y, x_test, y_test,
             identity_loss=float(target["identity_test_loss"]), identity_accuracy=float(target["identity_test_accuracy"]),
@@ -656,6 +765,8 @@ def run_one_protocol(
         "basis_variant": args.basis_variant, "n_control_points": args.n_control_points,
         "trainable_shape": not args.freeze_spline_shape, "trainable_range": args.trainable_range,
         "trainable_location_scale": args.trainable_location_scale,
+        "cross_column_mixing_rank": args.cross_column_mixing_rank,
+        "cross_column_mixing_bound": args.cross_column_mixing_bound,
         "dataset": dataset, "outer_seed": seed, "outer_train_rows": int(y_train.size),
         "outer_test_rows": int(y_test.size), "n_features": int(x.shape[1]), "n_classes": int(labels.size),
         "bags": args.bags, "steps_per_bag": args.steps,
@@ -674,6 +785,8 @@ def run_one_protocol(
         "guard_false_positive_fraction_loss": float(np.mean([bool(row["guard_false_positive_loss"]) for row in rows])),
         "guard_false_negative_fraction_loss": float(np.mean([bool(row["guard_false_negative_loss"]) for row in rows])),
         "mean_adapted_gate": float(np.mean([float(row["adapted_mean_gate"]) for row in rows])),
+        "mean_adapted_abs_mixing_gate": float(np.mean([float(row["adapted_mean_abs_mixing_gate"]) for row in rows])),
+        "mean_adapted_mixing_spectral_norm": float(np.mean([float(row["adapted_mixing_spectral_norm"]) for row in rows])),
         "mean_peak_allocated_gib": float(np.mean([float(row["peak_allocated_gib"]) for row in rows])),
         "protocol": "outer_holdout + nested_bagging + fixed_support_context + resampled_train_only_episodes + external_identity_guard",
     }
@@ -723,6 +836,8 @@ def main() -> None:
         raise ValueError("invalid spline or optimization configuration")
     if args.freeze_spline_shape and not args.trainable_location_scale:
         raise ValueError("--freeze-spline-shape requires --trainable-location-scale; range alone has no effect on identity shape")
+    if args.cross_column_mixing_rank < 0 or args.cross_column_mixing_bound < 0:
+        raise ValueError("cross-column mixing rank and bound must be non-negative")
     if any(value < 0.0 or value > 1.0 for value in args.interpolation_values):
         raise ValueError("--interpolation-alphas must lie in [0, 1]")
     if any(value < 0.0 for value in args.perturbation_values) or args.perturbation_repeats <= 0:

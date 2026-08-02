@@ -132,6 +132,23 @@ def test_direct_spline_can_isolate_location_scale_from_nonlinear_shape():
     assert affine_only.log_scale_offsets.grad is not None
 
 
+def test_direct_spline_low_rank_mixing_starts_at_identity_and_is_bounded():
+    context = torch.randn(1, 9, 4)
+    baseline = DirectSplineTransform(context, n_control_points=8, trainable_location_scale=True)
+    mixed = DirectSplineTransform(
+        context, n_control_points=8, trainable_location_scale=True,
+        cross_column_mixing_rank=2, cross_column_mixing_bound=0.1,
+    )
+    assert torch.allclose(baseline.transform(context), mixed.transform(context), atol=1e-6)
+    mixed.transform(context).square().mean().backward()
+    assert mixed.mixing_gate.grad is not None
+    with torch.no_grad():
+        mixed.mixing_gate.fill_(torch.atanh(torch.tensor(0.5)))
+        _, _, spectral_norm = mixed.mixing_diagnostics()
+    assert spectral_norm <= 0.1 + 1e-6
+    assert not torch.allclose(baseline.transform(context), mixed.transform(context))
+
+
 def test_frozen_adapter_preserves_categorical_columns_and_backbone_freezing():
     class ToyBackbone(nn.Module):
         def __init__(self):
