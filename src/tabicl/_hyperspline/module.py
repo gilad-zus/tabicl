@@ -460,6 +460,7 @@ class DirectSplineTransform(nn.Module):
         standardized_range: float = 4.0,
         eps: float = 1e-6,
         *,
+        trainable_shape: bool = True,
         trainable_range: bool = False,
         trainable_location_scale: bool = False,
         range_min: float = 1.0,
@@ -477,6 +478,7 @@ class DirectSplineTransform(nn.Module):
         self.eps = eps
         if not 0 < range_min < standardized_range < range_max:
             raise ValueError("range_min < standardized_range < range_max is required")
+        self.trainable_shape = trainable_shape
         self.trainable_range = trainable_range
         self.trainable_location_scale = trainable_location_scale
         self.range_min = range_min
@@ -490,8 +492,14 @@ class DirectSplineTransform(nn.Module):
         self.register_buffer("identity_gaps", identity[1:] - identity[:-1])
         self.register_buffer("location", statistics.location)
         self.register_buffer("scale", statistics.scale)
-        self.gap_logits = nn.Parameter(torch.zeros(x_context.shape[0], x_context.shape[2], n_control_points - 1))
-        self.gate_logits = nn.Parameter(torch.full((x_context.shape[0], x_context.shape[2]), torch.logit(torch.tensor(0.01))))
+        self.gap_logits = nn.Parameter(
+            torch.zeros(x_context.shape[0], x_context.shape[2], n_control_points - 1),
+            requires_grad=trainable_shape,
+        )
+        self.gate_logits = nn.Parameter(
+            torch.full((x_context.shape[0], x_context.shape[2]), torch.logit(torch.tensor(0.01))),
+            requires_grad=trainable_shape,
+        )
         self.location_offsets = nn.Parameter(torch.zeros_like(statistics.location), requires_grad=trainable_location_scale)
         self.log_scale_offsets = nn.Parameter(torch.zeros_like(statistics.scale), requires_grad=trainable_location_scale)
         initial_range_fraction = (standardized_range - range_min) / (range_max - range_min)

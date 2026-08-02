@@ -16,11 +16,20 @@ import sys
 from pathlib import Path
 
 
-VARIANTS = {
+BASIS_VARIANTS = {
     "uniform_fixed": (),
     "uniform_learned_range": ("--trainable-range",),
     "uniform_learned_location_scale": ("--trainable-location-scale",),
     "uniform_learned_all": ("--trainable-range", "--trainable-location-scale"),
+}
+
+# This uses the basis result to ask a narrower question: which trainable
+# block is responsible for the held-out benefit?  Range is deliberately not
+# included because its earlier standalone ablation added little headroom.
+DECOMPOSITION_VARIANTS = {
+    "shape_only": (),
+    "location_scale_only": ("--freeze-spline-shape", "--trainable-location-scale"),
+    "joint_shape_location_scale": ("--trainable-location-scale",),
 }
 
 
@@ -34,8 +43,11 @@ def parse_csv(value: str, converter):
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pmlb-dataset", action="append", required=True)
+    parser.add_argument("--experiment", choices=("basis", "decomposition"), default="basis",
+                        help="Run the original basis-freedom ablation or the shape-versus-affine decomposition.")
     parser.add_argument("--seeds", default="0,1")
-    parser.add_argument("--variants", default="uniform_fixed,uniform_learned_range,uniform_learned_location_scale,uniform_learned_all")
+    parser.add_argument("--variants", default=None,
+                        help="Comma-separated condition names; defaults depend on --experiment.")
     parser.add_argument("--control-points", default="20", help="Comma-separated K values, e.g. 8,12,20,32.")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--pmlb-cache-dir", type=Path, default=Path("results/pmlb_cache"))
@@ -58,14 +70,19 @@ def main() -> None:
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
 
+    variant_definitions = BASIS_VARIANTS if args.experiment == "basis" else DECOMPOSITION_VARIANTS
+    if args.variants is None:
+        args.variants = ",".join(variant_definitions)
     variants = parse_csv(args.variants, str)
-    unknown = sorted(set(variants).difference(VARIANTS))
+    unknown = sorted(set(variants).difference(variant_definitions))
     if unknown:
-        raise ValueError(f"unknown variants {unknown}; choices are {sorted(VARIANTS)}")
+        raise ValueError(f"unknown variants {unknown}; choices are {sorted(variant_definitions)}")
     control_points = parse_csv(args.control_points, int)
     if any(value <= 3 for value in control_points):
         raise ValueError("all control-point counts must exceed cubic degree 3")
     seeds = parse_csv(args.seeds, int)
+    args.output_dir = args.output_dir.resolve()
+    args.pmlb_cache_dir = args.pmlb_cache_dir.resolve()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     runner = Path(__file__).with_name("direct_spline_dataset_headroom.py")
     completed = []
@@ -96,11 +113,11 @@ def main() -> None:
                 command.extend(("--checkpoint", args.checkpoint))
             if args.resume:
                 command.append("--resume")
-            command.extend(VARIANTS[variant])
+            command.extend(variant_definitions[variant])
             print(f"Running {variant}, K={controls}", flush=True)
             subprocess.run(command, check=True)
             completed.append({
-                "variant": variant, "n_control_points": controls,
+                "experiment": args.experiment, "variant": variant, "n_control_points": controls,
                 "summary": str(condition_dir / "summary.json"),
                 "margin": str(condition_dir / "margin.csv"),
             })

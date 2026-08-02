@@ -73,6 +73,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=0.03)
     parser.add_argument("--transform-regularization", type=float, default=0.0)
     parser.add_argument("--n-control-points", type=int, default=20)
+    parser.add_argument("--freeze-spline-shape", action="store_true",
+                        help="Keep spline controls and nonlinear gate at identity; adapt only enabled basis freedoms.")
     parser.add_argument("--trainable-range", action="store_true",
                         help="Learn bounded per-column spline ranges instead of fixed R=4.")
     parser.add_argument("--trainable-location-scale", action="store_true",
@@ -167,6 +169,7 @@ def make_direct_spline(x_context: torch.Tensor, args: argparse.Namespace) -> Dir
     return DirectSplineTransform(
         x_context,
         args.n_control_points,
+        trainable_shape=not args.freeze_spline_shape,
         trainable_range=args.trainable_range,
         trainable_location_scale=args.trainable_location_scale,
     )
@@ -245,21 +248,51 @@ def clone_with_shape(
     *,
     gap_logits: torch.Tensor,
     gate_logits: torch.Tensor,
+    location_offsets: torch.Tensor | None = None,
+    log_scale_offsets: torch.Tensor | None = None,
+    range_logits: torch.Tensor | None = None,
 ) -> DirectSplineTransform:
-    """Use a target bag's location/scale with another spline's learned shape."""
+    """Use a target bag's normalization with a complete learned spline state.
+
+    Offsets are dimensionless, so transferring them deliberately applies the
+    same bounded residual in the target bag's native location/scale units.
+    ``None`` preserves the target identity value for a non-adaptive basis.
+    """
     candidate = copy.deepcopy(identity).eval()
     with torch.no_grad():
         candidate.gap_logits.copy_(gap_logits.to(candidate.gap_logits))
         candidate.gate_logits.copy_(gate_logits.to(candidate.gate_logits))
+        if location_offsets is not None:
+            candidate.location_offsets.copy_(location_offsets.to(candidate.location_offsets))
+        if log_scale_offsets is not None:
+            candidate.log_scale_offsets.copy_(log_scale_offsets.to(candidate.log_scale_offsets))
+        if range_logits is not None:
+            candidate.range_logits.copy_(range_logits.to(candidate.range_logits))
     return candidate
 
 
 def interpolated_shape(identity: DirectSplineTransform, teacher: DirectSplineTransform, alpha: float) -> DirectSplineTransform:
-    """Exactly scale the teacher's spline residual from identity to teacher."""
+    """Interpolate every learned basis residual; endpoints reproduce both models."""
     with torch.no_grad():
+        if alpha == 0.0:
+            return copy.deepcopy(identity).eval()
+        if alpha == 1.0:
+            return clone_with_shape(
+                identity, gap_logits=teacher.gap_logits, gate_logits=teacher.gate_logits,
+                location_offsets=teacher.location_offsets,
+                log_scale_offsets=teacher.log_scale_offsets,
+                range_logits=teacher.range_logits,
+            )
         teacher_parameters = teacher.parameters_for_transform()
         gate = (alpha * teacher_parameters.gate).clamp(1e-6, 1.0 - 1e-6)
-        return clone_with_shape(identity, gap_logits=teacher.gap_logits, gate_logits=torch.logit(gate))
+        return clone_with_shape(
+            identity,
+            gap_logits=identity.gap_logits + alpha * (teacher.gap_logits - identity.gap_logits),
+            gate_logits=torch.logit(gate),
+            location_offsets=identity.location_offsets + alpha * (teacher.location_offsets - identity.location_offsets),
+            log_scale_offsets=identity.log_scale_offsets + alpha * (teacher.log_scale_offsets - identity.log_scale_offsets),
+            range_logits=identity.range_logits + alpha * (teacher.range_logits - identity.range_logits),
+        )
 
 
 def perturb_shape(
@@ -270,16 +303,23 @@ def perturb_shape(
 ) -> DirectSplineTransform:
     """Add normalized independent parameter noise around the learned teacher."""
     with torch.no_grad():
-        gap_delta = teacher.gap_logits
+        gap_delta = teacher.gap_logits - identity.gap_logits
         gate_delta = teacher.gate_logits - identity.gate_logits
-        gap_rms = gap_delta.square().mean().sqrt().clamp_min(1e-6)
-        gate_rms = gate_delta.square().mean().sqrt().clamp_min(1e-6)
-        gap_noise = torch.randn(gap_delta.shape, generator=generator, device="cpu", dtype=gap_delta.dtype).to(gap_delta) * gap_rms * scale
-        gate_noise = torch.randn(gate_delta.shape, generator=generator, device="cpu", dtype=gate_delta.dtype).to(gate_delta) * gate_rms * scale
+        location_delta = teacher.location_offsets - identity.location_offsets
+        log_scale_delta = teacher.log_scale_offsets - identity.log_scale_offsets
+        range_delta = teacher.range_logits - identity.range_logits
+
+        def noise_like(delta: torch.Tensor) -> torch.Tensor:
+            rms = delta.square().mean().sqrt().clamp_min(1e-6)
+            return torch.randn(delta.shape, generator=generator, device="cpu", dtype=delta.dtype).to(delta) * rms * scale
+
         return clone_with_shape(
             identity,
-            gap_logits=teacher.gap_logits + gap_noise,
-            gate_logits=teacher.gate_logits + gate_noise,
+            gap_logits=teacher.gap_logits + noise_like(gap_delta),
+            gate_logits=teacher.gate_logits + noise_like(gate_delta),
+            location_offsets=teacher.location_offsets + noise_like(location_delta),
+            log_scale_offsets=teacher.log_scale_offsets + noise_like(log_scale_delta),
+            range_logits=teacher.range_logits + noise_like(range_delta),
         )
 
 
@@ -287,10 +327,11 @@ def perturb_shape(
 def functional_relative_error(
     candidate: DirectSplineTransform,
     teacher: DirectSplineTransform,
+    identity: DirectSplineTransform,
     support_x: torch.Tensor,
 ) -> float:
     """RMS functional error, normalized by the teacher's non-identity deformation."""
-    identity_output = (support_x - teacher.location.unsqueeze(1)) / teacher.scale.unsqueeze(1)
+    identity_output = identity.transform(support_x)
     teacher_deformation = (teacher.transform(support_x) - identity_output).square().mean().sqrt()
     candidate_error = (candidate.transform(support_x) - teacher.transform(support_x)).square().mean().sqrt()
     return float(candidate_error / teacher_deformation.clamp_min(1e-6))
@@ -308,6 +349,7 @@ def evaluate_margin_candidate(
     backbone,
     candidate: DirectSplineTransform,
     teacher: DirectSplineTransform,
+    identity: DirectSplineTransform,
     support_x: torch.Tensor,
     support_y: torch.Tensor,
     x_test: np.ndarray,
@@ -344,7 +386,7 @@ def evaluate_margin_candidate(
         "headroom_recovery_loss": recovery,
         "identity_outer_test_accuracy": identity_accuracy, "teacher_outer_test_accuracy": teacher_accuracy,
         "candidate_outer_test_accuracy": accuracy, "candidate_minus_identity_accuracy": accuracy - identity_accuracy,
-        "functional_relative_error": functional_relative_error(candidate, teacher, support_x),
+        "functional_relative_error": functional_relative_error(candidate, teacher, identity, support_x),
         "candidate_mean_gate": gate_mean, "candidate_max_gate": gate_max,
         "candidate_mean_abs_control_displacement": displacement,
     }
@@ -467,22 +509,23 @@ def run_one_protocol(
         for alpha in args.interpolation_values:
             candidate = copy.deepcopy(identity) if alpha == 0.0 else interpolated_shape(identity, spline, alpha)
             margin_rows.append(evaluate_margin_candidate(
-                backbone, candidate, spline, support_x, support_y, x_test, y_test,
+                backbone, candidate, spline, identity, support_x, support_y, x_test, y_test,
                 identity_loss=identity_test_loss, identity_accuracy=identity_test_accuracy,
                 teacher_loss=adapted_test_loss, teacher_accuracy=adapted_test_accuracy,
                 chunk_rows=args.evaluation_query_chunk_rows, device=device,
                 dataset=dataset, seed=seed, target_bag=bag, condition="interpolation", alpha=alpha,
             ))
             del candidate
-        # Parameter noise is normalized independently for gaps and gates by
-        # each teacher's learned displacement from identity.  The recorded
-        # functional error is the meaningful common scale across columns.
+        # Parameter noise is normalized independently for every learned raw
+        # parameter block by its teacher displacement from identity.  The
+        # recorded functional error is the meaningful common scale across
+        # controls, gates, and adaptive basis parameters.
         for scale in args.perturbation_values:
             for repeat in range(args.perturbation_repeats):
                 generator = torch.Generator(device="cpu").manual_seed(seed + 1_000_000 + 10_000 * bag + 100 * repeat)
                 candidate = perturb_shape(identity, spline, scale, generator)
                 margin_rows.append(evaluate_margin_candidate(
-                    backbone, candidate, spline, support_x, support_y, x_test, y_test,
+                    backbone, candidate, spline, identity, support_x, support_y, x_test, y_test,
                     identity_loss=identity_test_loss, identity_accuracy=identity_test_accuracy,
                     teacher_loss=adapted_test_loss, teacher_accuracy=adapted_test_accuracy,
                     chunk_rows=args.evaluation_query_chunk_rows, device=device,
@@ -497,6 +540,9 @@ def run_one_protocol(
             "support_x": support_x.detach().cpu(), "support_y": support_y.detach().cpu(),
             "teacher_gap_logits": spline.gap_logits.detach().cpu().clone(),
             "teacher_gate_logits": spline.gate_logits.detach().cpu().clone(),
+            "teacher_location_offsets": spline.location_offsets.detach().cpu().clone(),
+            "teacher_log_scale_offsets": spline.log_scale_offsets.detach().cpu().clone(),
+            "teacher_range_logits": spline.range_logits.detach().cpu().clone(),
             "identity_test_loss": identity_test_loss, "identity_test_accuracy": identity_test_accuracy,
             "teacher_test_loss": adapted_test_loss, "teacher_test_accuracy": adapted_test_accuracy,
         })
@@ -506,7 +552,8 @@ def run_one_protocol(
             peak_reserved_gib = torch.cuda.max_memory_reserved(device) / 2**30
         rows.append({
             "basis_variant": args.basis_variant, "n_control_points": args.n_control_points,
-            "trainable_range": args.trainable_range, "trainable_location_scale": args.trainable_location_scale,
+            "trainable_shape": not args.freeze_spline_shape, "trainable_range": args.trainable_range,
+            "trainable_location_scale": args.trainable_location_scale,
             "dataset": dataset, "outer_seed": seed, "bag": bag,
             "fit_rows": int(fit_y.size), "support_context_rows": int(support_y.shape[1]),
             "adaptation_query_pool_rows": int(adaptation_y.size), "guard_rows": int(guard_y.size),
@@ -540,14 +587,18 @@ def run_one_protocol(
         del optimizer, spline, identity, support_x, support_y, identity_test_probability, adapted_test_probability
         release_cuda(device)
 
-    # A source teacher's controls/gates are transplanted into the target
-    # support normalization.  This tests whether its learned *shape* is stable
-    # across independent samples from the same dataset.
+    # A source teacher's complete spline state is transplanted into the target
+    # support normalization.  This tests whether its learned bounded residual
+    # policy is stable across independent samples from the same dataset.
     for target in bag_artifacts:
         target_x, target_y = target["support_x"].to(device), target["support_y"].to(device)
         target_identity = make_direct_spline(target_x, args).to(device).eval()
         target_teacher = clone_with_shape(
-            target_identity, gap_logits=target["teacher_gap_logits"], gate_logits=target["teacher_gate_logits"]
+            target_identity,
+            gap_logits=target["teacher_gap_logits"], gate_logits=target["teacher_gate_logits"],
+            location_offsets=target["teacher_location_offsets"],
+            log_scale_offsets=target["teacher_log_scale_offsets"],
+            range_logits=target["teacher_range_logits"],
         )
         all_sources = [source for source in bag_artifacts if source["bag"] != target["bag"]]
         transfer_sources = all_sources
@@ -556,10 +607,14 @@ def run_one_protocol(
             transfer_sources = [transfer_sources[index] for index in selected]
         for source in transfer_sources:
             candidate = clone_with_shape(
-                target_identity, gap_logits=source["teacher_gap_logits"], gate_logits=source["teacher_gate_logits"]
+                target_identity,
+                gap_logits=source["teacher_gap_logits"], gate_logits=source["teacher_gate_logits"],
+                location_offsets=source["teacher_location_offsets"],
+                log_scale_offsets=source["teacher_log_scale_offsets"],
+                range_logits=source["teacher_range_logits"],
             )
             margin_rows.append(evaluate_margin_candidate(
-                backbone, candidate, target_teacher, target_x, target_y, x_test, y_test,
+                backbone, candidate, target_teacher, target_identity, target_x, target_y, x_test, y_test,
                 identity_loss=float(target["identity_test_loss"]), identity_accuracy=float(target["identity_test_accuracy"]),
                 teacher_loss=float(target["teacher_test_loss"]), teacher_accuracy=float(target["teacher_test_accuracy"]),
                 chunk_rows=args.evaluation_query_chunk_rows, device=device,
@@ -571,9 +626,16 @@ def run_one_protocol(
         # is a simple, non-neural proxy for an amortized dataset-level policy.
         consensus_gap = torch.stack([source["teacher_gap_logits"] for source in all_sources]).mean(dim=0)
         consensus_gate = torch.stack([source["teacher_gate_logits"] for source in all_sources]).mean(dim=0)
-        candidate = clone_with_shape(target_identity, gap_logits=consensus_gap, gate_logits=consensus_gate)
+        consensus_location = torch.stack([source["teacher_location_offsets"] for source in all_sources]).mean(dim=0)
+        consensus_log_scale = torch.stack([source["teacher_log_scale_offsets"] for source in all_sources]).mean(dim=0)
+        consensus_range = torch.stack([source["teacher_range_logits"] for source in all_sources]).mean(dim=0)
+        candidate = clone_with_shape(
+            target_identity, gap_logits=consensus_gap, gate_logits=consensus_gate,
+            location_offsets=consensus_location, log_scale_offsets=consensus_log_scale,
+            range_logits=consensus_range,
+        )
         margin_rows.append(evaluate_margin_candidate(
-            backbone, candidate, target_teacher, target_x, target_y, x_test, y_test,
+            backbone, candidate, target_teacher, target_identity, target_x, target_y, x_test, y_test,
             identity_loss=float(target["identity_test_loss"]), identity_accuracy=float(target["identity_test_accuracy"]),
             teacher_loss=float(target["teacher_test_loss"]), teacher_accuracy=float(target["teacher_test_accuracy"]),
             chunk_rows=args.evaluation_query_chunk_rows, device=device,
@@ -592,7 +654,8 @@ def run_one_protocol(
     oracle_loss, oracle_accuracy = ensemble_metrics(oracle_probability, y_test)
     summary = {
         "basis_variant": args.basis_variant, "n_control_points": args.n_control_points,
-        "trainable_range": args.trainable_range, "trainable_location_scale": args.trainable_location_scale,
+        "trainable_shape": not args.freeze_spline_shape, "trainable_range": args.trainable_range,
+        "trainable_location_scale": args.trainable_location_scale,
         "dataset": dataset, "outer_seed": seed, "outer_train_rows": int(y_train.size),
         "outer_test_rows": int(y_test.size), "n_features": int(x.shape[1]), "n_classes": int(labels.size),
         "bags": args.bags, "steps_per_bag": args.steps,
@@ -658,6 +721,8 @@ def main() -> None:
         raise ValueError("all row budgets and steps must be positive")
     if args.n_control_points <= 3 or args.lr <= 0 or args.transform_regularization < 0:
         raise ValueError("invalid spline or optimization configuration")
+    if args.freeze_spline_shape and not args.trainable_location_scale:
+        raise ValueError("--freeze-spline-shape requires --trainable-location-scale; range alone has no effect on identity shape")
     if any(value < 0.0 or value > 1.0 for value in args.interpolation_values):
         raise ValueError("--interpolation-alphas must lie in [0, 1]")
     if any(value < 0.0 for value in args.perturbation_values) or args.perturbation_repeats <= 0:

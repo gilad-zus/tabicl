@@ -116,6 +116,22 @@ def test_direct_spline_optional_basis_freedoms_start_at_baseline_and_receive_gra
     assert adaptive.log_scale_offsets.grad is not None
 
 
+def test_direct_spline_can_isolate_location_scale_from_nonlinear_shape():
+    context = torch.randn(1, 8, 3)
+    baseline = DirectSplineTransform(context, n_control_points=8)
+    affine_only = DirectSplineTransform(
+        context, n_control_points=8, trainable_shape=False, trainable_location_scale=True
+    )
+    assert not affine_only.gap_logits.requires_grad
+    assert not affine_only.gate_logits.requires_grad
+    assert torch.allclose(baseline.transform(context), affine_only.transform(context), atol=1e-6)
+    affine_only.transform(context).square().mean().backward()
+    assert affine_only.gap_logits.grad is None
+    assert affine_only.gate_logits.grad is None
+    assert affine_only.location_offsets.grad is not None
+    assert affine_only.log_scale_offsets.grad is not None
+
+
 def test_frozen_adapter_preserves_categorical_columns_and_backbone_freezing():
     class ToyBackbone(nn.Module):
         def __init__(self):
