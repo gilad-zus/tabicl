@@ -79,6 +79,8 @@ def parse_args() -> argparse.Namespace:
                         help="Learn bounded per-column spline ranges instead of fixed R=4.")
     parser.add_argument("--trainable-location-scale", action="store_true",
                         help="Learn bounded residual location/scale adjustments.")
+    parser.add_argument("--knot-placement", choices=("uniform", "quantile", "learned"), default="uniform",
+                        help="Use shared uniform knots, fixed context-quantile knots, or learned ordered knots.")
     parser.add_argument("--cross-column-mixing-rank", type=int, default=0,
                         help="Rank of a bounded low-rank numerical mixing residual; 0 disables it.")
     parser.add_argument("--cross-column-mixing-bound", type=float, default=0.1,
@@ -176,6 +178,7 @@ def make_direct_spline(x_context: torch.Tensor, args: argparse.Namespace) -> Dir
         trainable_shape=not args.freeze_spline_shape,
         trainable_range=args.trainable_range,
         trainable_location_scale=args.trainable_location_scale,
+        knot_placement=args.knot_placement,
         cross_column_mixing_rank=args.cross_column_mixing_rank,
         cross_column_mixing_bound=args.cross_column_mixing_bound,
     )
@@ -208,7 +211,11 @@ def train_loss(
         # DirectSpline uses tanh-bounded log gap adjustments.  Penalizing their
         # magnitude is an identity-relative trust region without changing the
         # output parameterization.
-        loss = loss + regularization * (spline.gap_logits.tanh().square().mean() + spline.gate_logits.sigmoid().square().mean())
+        loss = loss + regularization * (
+            spline.gap_logits.tanh().square().mean()
+            + spline.gate_logits.sigmoid().square().mean()
+            + spline.knot_width_logits.square().mean()
+        )
     return loss
 
 
@@ -241,18 +248,35 @@ def evaluate_chunked(
     return float(loss), float(accuracy), probability
 
 
-def spline_diagnostics(spline: DirectSplineTransform) -> tuple[float, float, float]:
+def spline_diagnostics(spline: DirectSplineTransform) -> tuple[float, float, float, float, float, float]:
     with torch.no_grad():
         parameters = spline.parameters_for_transform()
         identity = torch.linspace(-1.0, 1.0, parameters.control_points.shape[-1], device=parameters.control_points.device)
         control_displacement = (parameters.control_points - identity).abs().mean()
-        return float(parameters.gate.mean()), float(parameters.gate.max()), float(control_displacement)
+        knot_displacement, knot_min_interval, knot_max_interval = spline.knot_diagnostics()
+        return (
+            float(parameters.gate.mean()), float(parameters.gate.max()), float(control_displacement),
+            float(knot_displacement), float(knot_min_interval), float(knot_max_interval),
+        )
 
 
-def mixing_diagnostics(spline: DirectSplineTransform) -> tuple[float, float, float]:
+def mixing_diagnostics(
+    spline: DirectSplineTransform, reference_x: torch.Tensor
+) -> tuple[float, float, float, float, float, str]:
     with torch.no_grad():
         gate_mean, gate_max, spectral_norm = spline.mixing_diagnostics()
-        return float(gate_mean), float(gate_max), float(spectral_norm)
+        singular_values = spline.mixing_singular_values()
+        if singular_values.shape[-1] == 0:
+            return float(gate_mean), float(gate_max), 0.0, 0.0, 0.0, "[]"
+        squared = singular_values.square()
+        effective_rank = squared.sum(dim=-1) / squared.amax(dim=-1).clamp_min(1e-12)
+        unmixed = spline.unmixed_transform(reference_x)
+        residual = torch.matmul(unmixed, spline.effective_mixing_matrix())
+        energy_ratio = residual.square().mean().sqrt() / unmixed.square().mean().sqrt().clamp_min(1e-12)
+        return (
+            float(gate_mean), float(gate_max), float(spectral_norm), float(effective_rank.mean()),
+            float(energy_ratio), json.dumps(singular_values.squeeze(0).detach().cpu().tolist()),
+        )
 
 
 def clone_with_shape(
@@ -263,6 +287,7 @@ def clone_with_shape(
     location_offsets: torch.Tensor | None = None,
     log_scale_offsets: torch.Tensor | None = None,
     range_logits: torch.Tensor | None = None,
+    knot_width_logits: torch.Tensor | None = None,
     mixing_left: torch.Tensor | None = None,
     mixing_right: torch.Tensor | None = None,
     mixing_weight_logits: torch.Tensor | None = None,
@@ -284,6 +309,8 @@ def clone_with_shape(
             candidate.log_scale_offsets.copy_(log_scale_offsets.to(candidate.log_scale_offsets))
         if range_logits is not None:
             candidate.range_logits.copy_(range_logits.to(candidate.range_logits))
+        if knot_width_logits is not None:
+            candidate.knot_width_logits.copy_(knot_width_logits.to(candidate.knot_width_logits))
         if mixing_left is not None:
             if candidate.mixing_left is None:
                 raise ValueError("cannot transplant mixing factors into a non-mixing DirectSpline")
@@ -338,6 +365,7 @@ def interpolated_shape(identity: DirectSplineTransform, teacher: DirectSplineTra
                 location_offsets=teacher.location_offsets,
                 log_scale_offsets=teacher.log_scale_offsets,
                 range_logits=teacher.range_logits,
+                knot_width_logits=teacher.knot_width_logits,
                 mixing_left=teacher.mixing_left,
                 mixing_right=teacher.mixing_right,
                 mixing_weight_logits=teacher.mixing_weight_logits,
@@ -352,6 +380,7 @@ def interpolated_shape(identity: DirectSplineTransform, teacher: DirectSplineTra
             location_offsets=identity.location_offsets + alpha * (teacher.location_offsets - identity.location_offsets),
             log_scale_offsets=identity.log_scale_offsets + alpha * (teacher.log_scale_offsets - identity.log_scale_offsets),
             range_logits=identity.range_logits + alpha * (teacher.range_logits - identity.range_logits),
+            knot_width_logits=identity.knot_width_logits + alpha * (teacher.knot_width_logits - identity.knot_width_logits),
             mixing_left=None if teacher.mixing_left is None else identity.mixing_left + alpha * (teacher.mixing_left - identity.mixing_left),
             mixing_right=None if teacher.mixing_right is None else identity.mixing_right + alpha * (teacher.mixing_right - identity.mixing_right),
             mixing_weight_logits=None if teacher.mixing_weight_logits is None else identity.mixing_weight_logits + alpha * (teacher.mixing_weight_logits - identity.mixing_weight_logits),
@@ -374,6 +403,7 @@ def perturb_shape(
         location_delta = teacher.location_offsets - identity.location_offsets
         log_scale_delta = teacher.log_scale_offsets - identity.log_scale_offsets
         range_delta = teacher.range_logits - identity.range_logits
+        knot_width_delta = teacher.knot_width_logits - identity.knot_width_logits
         mixing_left_delta = None if teacher.mixing_left is None else teacher.mixing_left - identity.mixing_left
         mixing_right_delta = None if teacher.mixing_right is None else teacher.mixing_right - identity.mixing_right
         mixing_weight_delta = None if teacher.mixing_weight_logits is None else teacher.mixing_weight_logits - identity.mixing_weight_logits
@@ -390,6 +420,7 @@ def perturb_shape(
             location_offsets=teacher.location_offsets + noise_like(location_delta),
             log_scale_offsets=teacher.log_scale_offsets + noise_like(log_scale_delta),
             range_logits=teacher.range_logits + noise_like(range_delta),
+            knot_width_logits=teacher.knot_width_logits + noise_like(knot_width_delta),
             mixing_left=None if mixing_left_delta is None else teacher.mixing_left + noise_like(mixing_left_delta),
             mixing_right=None if mixing_right_delta is None else teacher.mixing_right + noise_like(mixing_right_delta),
             mixing_weight_logits=None if mixing_weight_delta is None else teacher.mixing_weight_logits + noise_like(mixing_weight_delta),
@@ -450,7 +481,7 @@ def evaluate_margin_candidate(
     )
     available_headroom = identity_loss - teacher_loss
     recovery = float("nan") if available_headroom <= 1e-8 else (identity_loss - loss) / available_headroom
-    gate_mean, gate_max, displacement = spline_diagnostics(candidate)
+    gate_mean, gate_max, displacement, knot_displacement, knot_min_interval, knot_max_interval = spline_diagnostics(candidate)
     return {
         "dataset": dataset, "outer_seed": seed, "target_bag": target_bag,
         "source_bag": source_bag, "condition": condition, "alpha": alpha,
@@ -463,6 +494,9 @@ def evaluate_margin_candidate(
         "functional_relative_error": functional_relative_error(candidate, teacher, identity, support_x),
         "candidate_mean_gate": gate_mean, "candidate_max_gate": gate_max,
         "candidate_mean_abs_control_displacement": displacement,
+        "candidate_mean_abs_knot_displacement": knot_displacement,
+        "candidate_min_knot_interval": knot_min_interval,
+        "candidate_max_knot_interval": knot_max_interval,
     }
 
 
@@ -574,7 +608,10 @@ def run_one_protocol(
             backbone, spline, support_x, support_y, x_test, y_test,
             chunk_rows=args.evaluation_query_chunk_rows, device=device,
         )
-        gate_mean, gate_max, control_displacement = spline_diagnostics(spline)
+        (
+            gate_mean, gate_max, control_displacement,
+            knot_displacement, knot_min_interval, knot_max_interval,
+        ) = spline_diagnostics(spline)
         test_loss_delta = adapted_test_loss - identity_test_loss
         test_accuracy_delta = adapted_test_accuracy - identity_test_accuracy
         test_prefers_adapted_loss = test_loss_delta < 0.0
@@ -620,6 +657,7 @@ def run_one_protocol(
             "teacher_location_offsets": spline.location_offsets.detach().cpu().clone(),
             "teacher_log_scale_offsets": spline.log_scale_offsets.detach().cpu().clone(),
             "teacher_range_logits": spline.range_logits.detach().cpu().clone(),
+            "teacher_knot_width_logits": spline.knot_width_logits.detach().cpu().clone(),
             "teacher_mixing_left": None if spline.mixing_left is None else spline.mixing_left.detach().cpu().clone(),
             "teacher_mixing_right": None if spline.mixing_right is None else spline.mixing_right.detach().cpu().clone(),
             "teacher_mixing_weight_logits": None if spline.mixing_weight_logits is None else spline.mixing_weight_logits.detach().cpu().clone(),
@@ -631,11 +669,15 @@ def run_one_protocol(
         if device.type == "cuda":
             peak_allocated_gib = torch.cuda.max_memory_allocated(device) / 2**30
             peak_reserved_gib = torch.cuda.max_memory_reserved(device) / 2**30
-        mixing_gate_mean, mixing_gate_max, mixing_spectral_norm = mixing_diagnostics(spline)
+        (
+            mixing_gate_mean, mixing_gate_max, mixing_spectral_norm, mixing_effective_rank,
+            mixing_energy_ratio, mixing_singular_values,
+        ) = mixing_diagnostics(spline, support_x)
         rows.append({
             "basis_variant": args.basis_variant, "n_control_points": args.n_control_points,
             "trainable_shape": not args.freeze_spline_shape, "trainable_range": args.trainable_range,
             "trainable_location_scale": args.trainable_location_scale,
+            "knot_placement": args.knot_placement,
             "cross_column_mixing_rank": spline.cross_column_mixing_rank,
             "cross_column_mixing_bound": args.cross_column_mixing_bound,
             "dataset": dataset, "outer_seed": seed, "bag": bag,
@@ -659,9 +701,15 @@ def run_one_protocol(
             "guard_false_negative_loss": not use_adapted and test_prefers_adapted_loss,
             "adapted_mean_gate": gate_mean, "adapted_max_gate": gate_max,
             "adapted_mean_abs_control_displacement": control_displacement,
+            "adapted_mean_abs_knot_displacement": knot_displacement,
+            "adapted_min_knot_interval": knot_min_interval,
+            "adapted_max_knot_interval": knot_max_interval,
             "adapted_mean_abs_mixing_gate": mixing_gate_mean,
             "adapted_max_abs_mixing_gate": mixing_gate_max,
             "adapted_mixing_spectral_norm": mixing_spectral_norm,
+            "adapted_mixing_effective_rank": mixing_effective_rank,
+            "adapted_mixing_energy_ratio": mixing_energy_ratio,
+            "adapted_mixing_singular_values": mixing_singular_values,
             "peak_allocated_gib": peak_allocated_gib, "peak_reserved_gib": peak_reserved_gib,
         })
         print(
@@ -686,6 +734,7 @@ def run_one_protocol(
             location_offsets=target["teacher_location_offsets"],
             log_scale_offsets=target["teacher_log_scale_offsets"],
             range_logits=target["teacher_range_logits"],
+            knot_width_logits=target["teacher_knot_width_logits"],
             mixing_left=target["teacher_mixing_left"],
             mixing_right=target["teacher_mixing_right"],
             mixing_weight_logits=target["teacher_mixing_weight_logits"],
@@ -703,6 +752,7 @@ def run_one_protocol(
                 location_offsets=source["teacher_location_offsets"],
                 log_scale_offsets=source["teacher_log_scale_offsets"],
                 range_logits=source["teacher_range_logits"],
+                knot_width_logits=source["teacher_knot_width_logits"],
                 mixing_left=source["teacher_mixing_left"],
                 mixing_right=source["teacher_mixing_right"],
                 mixing_weight_logits=source["teacher_mixing_weight_logits"],
@@ -724,10 +774,12 @@ def run_one_protocol(
         consensus_location = torch.stack([source["teacher_location_offsets"] for source in all_sources]).mean(dim=0)
         consensus_log_scale = torch.stack([source["teacher_log_scale_offsets"] for source in all_sources]).mean(dim=0)
         consensus_range = torch.stack([source["teacher_range_logits"] for source in all_sources]).mean(dim=0)
+        consensus_knot_widths = torch.stack([source["teacher_knot_width_logits"] for source in all_sources]).mean(dim=0)
         candidate = clone_with_shape(
             target_identity, gap_logits=consensus_gap, gate_logits=consensus_gate,
             location_offsets=consensus_location, log_scale_offsets=consensus_log_scale,
             range_logits=consensus_range,
+            knot_width_logits=consensus_knot_widths,
         )
         if target_identity.mixing_gate is not None:
             effective_matrices = []
@@ -765,6 +817,7 @@ def run_one_protocol(
         "basis_variant": args.basis_variant, "n_control_points": args.n_control_points,
         "trainable_shape": not args.freeze_spline_shape, "trainable_range": args.trainable_range,
         "trainable_location_scale": args.trainable_location_scale,
+        "knot_placement": args.knot_placement,
         "cross_column_mixing_rank": args.cross_column_mixing_rank,
         "cross_column_mixing_bound": args.cross_column_mixing_bound,
         "dataset": dataset, "outer_seed": seed, "outer_train_rows": int(y_train.size),
@@ -785,8 +838,13 @@ def run_one_protocol(
         "guard_false_positive_fraction_loss": float(np.mean([bool(row["guard_false_positive_loss"]) for row in rows])),
         "guard_false_negative_fraction_loss": float(np.mean([bool(row["guard_false_negative_loss"]) for row in rows])),
         "mean_adapted_gate": float(np.mean([float(row["adapted_mean_gate"]) for row in rows])),
+        "mean_adapted_abs_knot_displacement": float(np.mean([float(row["adapted_mean_abs_knot_displacement"]) for row in rows])),
+        "mean_adapted_min_knot_interval": float(np.mean([float(row["adapted_min_knot_interval"]) for row in rows])),
+        "mean_adapted_max_knot_interval": float(np.mean([float(row["adapted_max_knot_interval"]) for row in rows])),
         "mean_adapted_abs_mixing_gate": float(np.mean([float(row["adapted_mean_abs_mixing_gate"]) for row in rows])),
         "mean_adapted_mixing_spectral_norm": float(np.mean([float(row["adapted_mixing_spectral_norm"]) for row in rows])),
+        "mean_adapted_mixing_effective_rank": float(np.mean([float(row["adapted_mixing_effective_rank"]) for row in rows])),
+        "mean_adapted_mixing_energy_ratio": float(np.mean([float(row["adapted_mixing_energy_ratio"]) for row in rows])),
         "mean_peak_allocated_gib": float(np.mean([float(row["peak_allocated_gib"]) for row in rows])),
         "protocol": "outer_holdout + nested_bagging + fixed_support_context + resampled_train_only_episodes + external_identity_guard",
     }

@@ -116,6 +116,27 @@ def test_direct_spline_optional_basis_freedoms_start_at_baseline_and_receive_gra
     assert adaptive.log_scale_offsets.grad is not None
 
 
+def test_direct_spline_knot_placement_is_ordered_identity_initialized_and_differentiable():
+    context = torch.tensor([[[0.0], [0.0], [0.1], [0.2], [4.0], [8.0], [8.0], [8.0]]])
+    uniform = DirectSplineTransform(context, n_control_points=8, knot_placement="uniform")
+    learned = DirectSplineTransform(context, n_control_points=8, knot_placement="learned")
+    quantile = DirectSplineTransform(context, n_control_points=8, knot_placement="quantile")
+
+    # Learned interval logits start at the exact shared-uniform reference.
+    assert torch.allclose(uniform.transform(context), learned.transform(context), atol=1e-6)
+    learned.transform(context).square().mean().backward()
+    assert learned.knot_width_logits.grad is not None
+
+    learned_knots = learned.knots_for_transform()
+    quantile_knots = quantile.knots_for_transform()
+    assert torch.all(learned_knots[..., 1:] > learned_knots[..., :-1] - 1e-6)
+    assert torch.all(quantile_knots[..., 1:] >= quantile_knots[..., :-1])
+    # The repeated endpoints are required by the clamped cubic construction;
+    # all non-endpoint intervals in the quantile grid remain strictly positive.
+    interior = quantile_knots[..., uniform.degree + 1 : -uniform.degree - 1]
+    assert not torch.allclose(interior, uniform.knots[uniform.degree + 1 : -uniform.degree - 1])
+
+
 def test_direct_spline_can_isolate_location_scale_from_nonlinear_shape():
     context = torch.randn(1, 8, 3)
     baseline = DirectSplineTransform(context, n_control_points=8)

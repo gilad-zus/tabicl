@@ -41,10 +41,15 @@ def _local_basis(u: torch.Tensor, knots: torch.Tensor, spans: torch.Tensor, degr
     basis = [torch.ones(shape, dtype=u.dtype, device=u.device)]
     left = [torch.zeros(shape, dtype=u.dtype, device=u.device)]
     right = [torch.zeros(shape, dtype=u.dtype, device=u.device)]
+    if knots.ndim != 2 or knots.shape[0] != u.shape[1]:
+        raise ValueError("knots must have shape (number_of_curves, knot_count)")
     eps = torch.finfo(u.dtype).eps
+    curve_indices = torch.arange(u.shape[1], device=u.device).view(1, -1)
     for j in range(1, degree + 1):
-        left.append(u - knots[(spans + 1 - j).clamp(0, knots.numel() - 1)])
-        right.append(knots[(spans + j).clamp(0, knots.numel() - 1)] - u)
+        left_indices = (spans + 1 - j).clamp(0, knots.shape[-1] - 1)
+        right_indices = (spans + j).clamp(0, knots.shape[-1] - 1)
+        left.append(u - knots[curve_indices, left_indices])
+        right.append(knots[curve_indices, right_indices] - u)
         saved = torch.zeros(shape, dtype=u.dtype, device=u.device)
         next_basis = []
         for r in range(j):
@@ -63,7 +68,9 @@ def evaluate_bspline(u: torch.Tensor, control_points: torch.Tensor, knots: torch
     Args:
         u: Coordinates ``(B, N, D)`` in the fixed knot domain.
         control_points: Scalar controls ``(B, D, K)``.
-        knots: Shared one-dimensional knot vector of length ``K + degree + 1``.
+        knots: Either a shared one-dimensional knot vector of length
+            ``K + degree + 1`` or one ordered knot vector per ``(B, D)``
+            curve with shape ``(B, D, K + degree + 1)``.
 
     Returns:
         Scalar values with shape ``(B, N, D)``.
@@ -74,16 +81,38 @@ def evaluate_bspline(u: torch.Tensor, control_points: torch.Tensor, knots: torch
     if control_points.shape[:2] != (batch, n_features):
         raise ValueError("control points must align with u batch and feature dimensions")
     n_control_points = control_points.shape[-1]
-    if knots.ndim != 1 or knots.numel() != n_control_points + degree + 1:
-        raise ValueError("invalid shared knot vector")
+    knot_count = n_control_points + degree + 1
+    if knots.ndim == 1:
+        if knots.numel() != knot_count:
+            raise ValueError("invalid shared knot vector")
+    elif knots.ndim == 3:
+        if knots.shape != (batch, n_features, knot_count):
+            raise ValueError("per-curve knots must align with u and control points")
+    elif knots.ndim == 2:
+        if knots.shape != (batch * n_features, knot_count):
+            raise ValueError("flattened per-curve knots must align with u and control points")
+    else:
+        raise ValueError("knots must be shared or per-curve")
 
     # Treat every (table, column) pair as a separate curve while retaining a
     # common row dimension.  This avoids fixed feature-count module parameters.
     flat_u = u.permute(1, 0, 2).reshape(n_rows, batch * n_features).contiguous()
     flat_controls = control_points.reshape(batch * n_features, n_control_points)
-    spans = torch.searchsorted(knots, flat_u.detach(), right=True) - 1
+    flat_knots = (
+        knots.view(batch * n_features, knot_count)
+        if knots.ndim == 3
+        else knots.expand(batch * n_features, -1)
+        if knots.ndim == 1
+        else knots
+    )
+    # ``searchsorted`` selects the active polynomial piece but does not need
+    # derivatives.  The Cox--de Boor evaluation below remains differentiable
+    # with respect to the ordered knot locations within that piece.
+    spans = torch.searchsorted(
+        flat_knots.contiguous(), flat_u.detach().transpose(0, 1).contiguous(), right=True
+    ).transpose(0, 1) - 1
     spans = spans.clamp(min=degree, max=n_control_points - 1)
-    basis = _local_basis(flat_u, knots, spans, degree)
+    basis = _local_basis(flat_u, flat_knots, spans, degree)
     offsets = torch.arange(degree + 1, device=u.device).view(1, 1, -1)
     indices = (spans.unsqueeze(-1) - degree + offsets).clamp(0, n_control_points - 1)
     curve_indices = torch.arange(batch * n_features, device=u.device).view(1, -1, 1)

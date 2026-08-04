@@ -463,6 +463,7 @@ class DirectSplineTransform(nn.Module):
         trainable_shape: bool = True,
         trainable_range: bool = False,
         trainable_location_scale: bool = False,
+        knot_placement: str = "uniform",
         cross_column_mixing_rank: int = 0,
         cross_column_mixing_bound: float = 0.1,
         range_min: float = 1.0,
@@ -475,6 +476,8 @@ class DirectSplineTransform(nn.Module):
             raise ValueError("x_context must have shape (B, N, D)")
         if degree != 3 or n_control_points <= degree:
             raise ValueError("DirectSplineTransform requires valid fixed cubic splines")
+        if knot_placement not in {"uniform", "quantile", "learned"}:
+            raise ValueError("knot_placement must be one of: uniform, quantile, learned")
         self.degree = degree
         self.standardized_range = standardized_range
         self.eps = eps
@@ -485,6 +488,7 @@ class DirectSplineTransform(nn.Module):
         self.trainable_shape = trainable_shape
         self.trainable_range = trainable_range
         self.trainable_location_scale = trainable_location_scale
+        self.knot_placement = knot_placement
         self.range_min = range_min
         self.range_max = range_max
         self.location_adjustment_bound = location_adjustment_bound
@@ -513,6 +517,25 @@ class DirectSplineTransform(nn.Module):
             torch.full_like(statistics.location, torch.logit(torch.tensor(initial_range_fraction))),
             requires_grad=trainable_range,
         )
+        self.n_internal_knots = n_control_points - degree - 1
+        self.n_knot_intervals = self.n_internal_knots + 1
+        # A small positive floor keeps the knot vector strictly ordered even
+        # when a learned interval is driven toward zero.  At the default
+        # K=20, the floor uses at most 17% of the [-1, 1] domain.
+        self.min_knot_interval = 0.01
+        if self.min_knot_interval * self.n_knot_intervals >= 2.0:
+            raise ValueError("too many spline intervals for the minimum knot interval")
+        if knot_placement == "quantile":
+            fixed_widths = self._context_quantile_widths(x_context, statistics)
+        else:
+            fixed_widths = x_context.new_full(
+                (x_context.shape[0], x_context.shape[2], self.n_knot_intervals),
+                2.0 / self.n_knot_intervals,
+            )
+        self.register_buffer("fixed_knot_widths", fixed_widths)
+        self.knot_width_logits = nn.Parameter(
+            torch.zeros_like(fixed_widths), requires_grad=knot_placement == "learned"
+        )
         if self.cross_column_mixing_rank:
             # The factors have nonzero directions while the gate is exactly
             # zero, avoiding the zero-times-zero gradient deadlock of a
@@ -535,6 +558,69 @@ class DirectSplineTransform(nn.Module):
         scale = self.scale * torch.exp(torch.log(torch.as_tensor(self.scale_adjustment_bound, device=self.scale.device)) * torch.tanh(self.log_scale_offsets))
         standardized_range = self.range_min + (self.range_max - self.range_min) * torch.sigmoid(self.range_logits)
         return location, scale, standardized_range
+
+    def _strict_knot_widths(self, widths: torch.Tensor) -> torch.Tensor:
+        """Project nonnegative relative widths to ordered, non-collapsing intervals."""
+        relative = widths.clamp_min(self.eps)
+        relative = relative / relative.sum(dim=-1, keepdim=True).clamp_min(self.eps)
+        free_width = 2.0 - self.min_knot_interval * self.n_knot_intervals
+        return self.min_knot_interval + free_width * relative
+
+    def _context_quantile_widths(
+        self, x_context: torch.Tensor, statistics: ColumnStatistics
+    ) -> torch.Tensor:
+        """Return fixed context-density-aware knot intervals in [-1, 1]."""
+        if self.n_internal_knots == 0:
+            return x_context.new_full(
+                (x_context.shape[0], x_context.shape[2], 1), 2.0
+            )
+        location = statistics.location.unsqueeze(1)
+        scale = statistics.scale.unsqueeze(1)
+        normalized = ((x_context.float() - location) / scale / self.standardized_range).clamp(-1.0, 1.0)
+        probabilities = torch.linspace(
+            0.0, 1.0, self.n_knot_intervals + 1, device=x_context.device, dtype=normalized.dtype
+        )[1:-1]
+        quantiles = torch.quantile(normalized, probabilities, dim=1).permute(1, 2, 0)
+        boundaries = torch.cat(
+            (
+                torch.full_like(quantiles[..., :1], -1.0),
+                quantiles,
+                torch.full_like(quantiles[..., :1], 1.0),
+            ),
+            dim=-1,
+        )
+        return self._strict_knot_widths(boundaries[..., 1:] - boundaries[..., :-1])
+
+    def knots_for_transform(self) -> torch.Tensor:
+        """Return shared or per-column ordered knot vectors for evaluation."""
+        if self.knot_placement == "uniform":
+            return self.knots
+        if self.knot_placement == "learned":
+            widths = self._strict_knot_widths(torch.softmax(self.knot_width_logits, dim=-1))
+        else:
+            widths = self.fixed_knot_widths
+        internal = -1.0 + widths.cumsum(dim=-1)[..., :-1]
+        head = torch.full_like(internal[..., :1], -1.0).expand(*internal.shape[:-1], self.degree + 1)
+        tail = torch.full_like(internal[..., :1], 1.0).expand(*internal.shape[:-1], self.degree + 1)
+        return torch.cat((head, internal, tail), dim=-1)
+
+    def knot_diagnostics(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Mean displacement plus smallest/largest learned or fixed knot interval."""
+        if self.knot_placement == "uniform":
+            zero = self.location.new_zeros(())
+            width = self.location.new_full((), 2.0 / self.n_knot_intervals)
+            return zero, width, width
+        widths = (
+            self._strict_knot_widths(torch.softmax(self.knot_width_logits, dim=-1))
+            if self.knot_placement == "learned"
+            else self.fixed_knot_widths
+        )
+        uniform_width = 2.0 / self.n_knot_intervals
+        return (
+            (widths - uniform_width).abs().mean(),
+            widths.amin(),
+            widths.amax(),
+        )
 
     def parameters_for_transform(self) -> HyperSplineParameters:
         gaps = self.identity_gaps * torch.exp(torch.tanh(self.gap_logits))
@@ -569,13 +655,24 @@ class DirectSplineTransform(nn.Module):
         gate = self.cross_column_mixing_bound * torch.tanh(self.mixing_gate)
         return gate.abs().mean(), gate.abs().max(), torch.linalg.matrix_norm(effective, ord=2).amax()
 
-    def transform(self, x: torch.Tensor) -> torch.Tensor:
+    def mixing_singular_values(self) -> torch.Tensor:
+        """Singular values of the effective residual, including its bounded gate."""
+        effective = self.effective_mixing_matrix()
+        if effective is None:
+            return self.location.new_zeros(self.location.shape[0], 0)
+        return torch.linalg.svdvals(effective)
+
+    def unmixed_transform(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply only the independent-column location/scale and spline branch."""
         params = self.parameters_for_transform()
         _, _, standardized_range = self._location_scale_range()
         z = (x.float() - params.location.unsqueeze(1)) / params.scale.unsqueeze(1)
         u = (z / standardized_range.unsqueeze(1)).clamp(-1.0, 1.0)
-        spline = evaluate_bspline(u, params.control_points, self.knots, self.degree)
-        output = z + params.gate.unsqueeze(1) * standardized_range.unsqueeze(1) * (spline - u)
+        spline = evaluate_bspline(u, params.control_points, self.knots_for_transform(), self.degree)
+        return z + params.gate.unsqueeze(1) * standardized_range.unsqueeze(1) * (spline - u)
+
+    def transform(self, x: torch.Tensor) -> torch.Tensor:
+        output = self.unmixed_transform(x)
         effective_mixing = self.effective_mixing_matrix()
         if effective_mixing is not None:
             output = output + torch.matmul(output, effective_mixing)
