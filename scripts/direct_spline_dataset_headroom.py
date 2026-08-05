@@ -81,6 +81,16 @@ def parse_args() -> argparse.Namespace:
                         help="Learn bounded residual location/scale adjustments.")
     parser.add_argument("--knot-placement", choices=("uniform", "quantile", "learned"), default="uniform",
                         help="Use shared uniform knots, fixed context-quantile knots, or learned ordered knots.")
+    parser.add_argument("--knot-refinement-steps", type=int, default=0,
+                        help="After the base fit, fork into a uniform or learned-knot continuation for this many steps.")
+    parser.add_argument("--knot-refinement-placement", choices=("uniform", "learned"), default="uniform",
+                        help="Knot grid used by the optional continuation branch.")
+    parser.add_argument("--knot-refinement-lr", type=float, default=0.003,
+                        help="Learning rate for learned knot-width logits during an optional refinement branch.")
+    parser.add_argument("--save-base-state-dir", type=Path, default=None,
+                        help="Save exact post-base DirectSpline states here before an optional refinement branch.")
+    parser.add_argument("--base-state-dir", type=Path, default=None,
+                        help="Load exact post-base DirectSpline states from here instead of repeating --steps.")
     parser.add_argument("--cross-column-mixing-rank", type=int, default=0,
                         help="Rank of a bounded low-rank numerical mixing residual; 0 disables it.")
     parser.add_argument("--cross-column-mixing-bound", type=float, default=0.1,
@@ -171,17 +181,138 @@ def to_device(x: np.ndarray, y: np.ndarray, rows: np.ndarray, device: torch.devi
     )
 
 
-def make_direct_spline(x_context: torch.Tensor, args: argparse.Namespace) -> DirectSplineTransform:
+def make_direct_spline(
+    x_context: torch.Tensor, args: argparse.Namespace, *, knot_placement: str | None = None
+) -> DirectSplineTransform:
     return DirectSplineTransform(
         x_context,
         args.n_control_points,
         trainable_shape=not args.freeze_spline_shape,
         trainable_range=args.trainable_range,
         trainable_location_scale=args.trainable_location_scale,
-        knot_placement=args.knot_placement,
+        knot_placement=args.knot_placement if knot_placement is None else knot_placement,
         cross_column_mixing_rank=args.cross_column_mixing_rank,
         cross_column_mixing_bound=args.cross_column_mixing_bound,
     )
+
+
+@torch.no_grad()
+def transplant_direct_spline_state(candidate: DirectSplineTransform, source: DirectSplineTransform) -> None:
+    """Copy the shared DirectSpline state into a possibly different knot-grid branch."""
+    for name in (
+        "gap_logits", "gate_logits", "location_offsets", "log_scale_offsets",
+        "range_logits", "knot_width_logits",
+    ):
+        getattr(candidate, name).copy_(getattr(source, name))
+    for name in ("mixing_left", "mixing_right", "mixing_weight_logits", "mixing_gate"):
+        source_value = getattr(source, name)
+        candidate_value = getattr(candidate, name)
+        if source_value is None:
+            if candidate_value is not None:
+                raise ValueError("cannot remove cross-column mixing while transplanting a DirectSpline")
+        elif candidate_value is None:
+            raise ValueError("cannot add cross-column mixing while transplanting a DirectSpline")
+        else:
+            candidate_value.copy_(source_value)
+
+
+def make_direct_spline_optimizer(
+    spline: DirectSplineTransform, args: argparse.Namespace, *, refinement: bool = False
+) -> torch.optim.Optimizer:
+    """Use a smaller learning rate only for newly unlocked knot locations."""
+    trainable = [parameter for parameter in spline.parameters() if parameter.requires_grad]
+    if refinement and spline.knot_placement == "learned":
+        other = [parameter for parameter in trainable if parameter is not spline.knot_width_logits]
+        return torch.optim.Adam(
+            [
+                {"params": other, "lr": args.lr},
+                {"params": [spline.knot_width_logits], "lr": args.knot_refinement_lr},
+            ]
+        )
+    return torch.optim.Adam(trainable, lr=args.lr)
+
+
+def optimize_direct_spline(
+    backbone,
+    spline: DirectSplineTransform,
+    optimizer: torch.optim.Optimizer,
+    support_x: torch.Tensor,
+    support_y: torch.Tensor,
+    adaptation_x: np.ndarray,
+    adaptation_y: np.ndarray,
+    *,
+    steps: int,
+    sample_rng: np.random.Generator,
+    args: argparse.Namespace,
+) -> tuple[float, float]:
+    """Fit one DirectSpline phase using deterministically resampled episodes."""
+    first_loss = final_loss = float("nan")
+    support_labels = support_y.squeeze(0).detach().cpu().numpy()
+    for step in range(1, steps + 1):
+        context_rows = stratified_subset(
+            support_labels, min(args.train_context_rows, support_y.shape[1]), sample_rng
+        )
+        query_rows = stratified_subset(adaptation_y, min(args.query_batch_rows, adaptation_y.size), sample_rng)
+        context_x = support_x[:, context_rows]
+        context_y = support_y[:, context_rows]
+        query_x, query_y = to_device(adaptation_x, adaptation_y, query_rows, support_x.device)
+        optimizer.zero_grad(set_to_none=True)
+        objective = train_loss(
+            backbone, spline, context_x, context_y, query_x, query_y, args.transform_regularization
+        )
+        if step == 1:
+            first_loss = float(objective.detach())
+        objective.backward()
+        torch.nn.utils.clip_grad_norm_(spline.parameters(), 1.0)
+        optimizer.step()
+        final_loss = float(objective.detach())
+        del context_x, context_y, query_x, query_y, objective
+    return first_loss, final_loss
+
+
+def final_knot_placement(args: argparse.Namespace) -> str:
+    return args.knot_refinement_placement if args.knot_refinement_steps else args.knot_placement
+
+
+def base_state_path(directory: Path, dataset: str, seed: int, bag: int) -> Path:
+    safe_dataset = dataset.replace("/", "_").replace("\\", "_")
+    return directory / f"{safe_dataset}_seed{seed}_bag{bag}.pt"
+
+
+def save_base_state(
+    directory: Path,
+    *,
+    dataset: str,
+    seed: int,
+    bag: int,
+    spline: DirectSplineTransform,
+    initial_loss: float,
+    final_loss: float,
+) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    state_dict = {name: tensor.detach().cpu() for name, tensor in spline.state_dict().items()}
+    torch.save(
+        {
+            "state_dict": state_dict,
+            "initial_train_objective": initial_loss,
+            "base_final_train_objective": final_loss,
+        },
+        base_state_path(directory, dataset, seed, bag),
+    )
+
+
+def load_base_state(
+    directory: Path, *, dataset: str, seed: int, bag: int, spline: DirectSplineTransform
+) -> tuple[float, float]:
+    path = base_state_path(directory, dataset, seed, bag)
+    if not path.is_file():
+        raise FileNotFoundError(f"missing exact base DirectSpline state: {path}")
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError:  # pragma: no cover - compatibility with older PyTorch releases
+        payload = torch.load(path, map_location="cpu")
+    spline.load_state_dict(payload["state_dict"])
+    return float(payload["initial_train_objective"]), float(payload["base_final_train_objective"])
 
 
 def transform_logits(
@@ -292,6 +423,7 @@ def clone_with_shape(
     mixing_right: torch.Tensor | None = None,
     mixing_weight_logits: torch.Tensor | None = None,
     mixing_gate: torch.Tensor | None = None,
+    knot_placement: str | None = None,
 ) -> DirectSplineTransform:
     """Use a target bag's normalization with a complete learned spline state.
 
@@ -301,6 +433,9 @@ def clone_with_shape(
     """
     candidate = copy.deepcopy(identity).eval()
     with torch.no_grad():
+        if knot_placement is not None:
+            candidate.knot_placement = knot_placement
+            candidate.knot_width_logits.requires_grad_(knot_placement == "learned")
         candidate.gap_logits.copy_(gap_logits.to(candidate.gap_logits))
         candidate.gate_logits.copy_(gate_logits.to(candidate.gate_logits))
         if location_offsets is not None:
@@ -370,6 +505,7 @@ def interpolated_shape(identity: DirectSplineTransform, teacher: DirectSplineTra
                 mixing_right=teacher.mixing_right,
                 mixing_weight_logits=teacher.mixing_weight_logits,
                 mixing_gate=teacher.mixing_gate,
+                knot_placement=teacher.knot_placement,
             )
         teacher_parameters = teacher.parameters_for_transform()
         gate = (alpha * teacher_parameters.gate).clamp(1e-6, 1.0 - 1e-6)
@@ -387,6 +523,7 @@ def interpolated_shape(identity: DirectSplineTransform, teacher: DirectSplineTra
             mixing_gate=None if teacher.mixing_gate is None else torch.atanh(
                 (alpha * torch.tanh(teacher.mixing_gate)).clamp(-1.0 + 1e-6, 1.0 - 1e-6)
             ),
+            knot_placement=teacher.knot_placement,
         )
 
 
@@ -425,6 +562,7 @@ def perturb_shape(
             mixing_right=None if mixing_right_delta is None else teacher.mixing_right + noise_like(mixing_right_delta),
             mixing_weight_logits=None if mixing_weight_delta is None else teacher.mixing_weight_logits + noise_like(mixing_weight_delta),
             mixing_gate=None if mixing_gate_delta is None else teacher.mixing_gate + noise_like(mixing_gate_delta),
+            knot_placement=teacher.knot_placement,
         )
 
 
@@ -566,30 +704,46 @@ def run_one_protocol(
         # Low-rank factors have nonzero directions but a zero residual gate.
         # Seed those directions per paired bag so reruns are reproducible.
         torch.manual_seed(seed + 10_000_000 + bag)
-        identity = make_direct_spline(support_x, args).to(device).eval()
+        # Refinement experiments always begin from the same uniform identity
+        # transform.  A learned grid is introduced only after the base spline
+        # has acquired a non-identity shape to allocate its resolution around.
+        base_knot_placement = "uniform" if args.knot_refinement_steps else args.knot_placement
+        identity = make_direct_spline(support_x, args, knot_placement=base_knot_placement).to(device).eval()
         spline = copy.deepcopy(identity).train()
-        optimizer = torch.optim.Adam(spline.parameters(), lr=args.lr)
-        sample_rng = np.random.default_rng(seed + 100_000 + bag)
-        initial_loss = final_loss = float("nan")
-        for step in range(1, args.steps + 1):
-            context_rows = stratified_subset(
-                support_y.squeeze(0).detach().cpu().numpy(), min(args.train_context_rows, support_y.shape[1]), sample_rng
+        loaded_base_state = args.base_state_dir is not None
+        if loaded_base_state:
+            initial_loss, base_final_loss = load_base_state(
+                args.base_state_dir, dataset=dataset, seed=seed, bag=bag, spline=spline
             )
-            query_rows = stratified_subset(adaptation_y, min(args.query_batch_rows, adaptation_y.size), sample_rng)
-            context_x = support_x[:, context_rows]
-            context_y = support_y[:, context_rows]
-            query_x, query_y = to_device(adaptation_x, adaptation_y, query_rows, device)
-            optimizer.zero_grad(set_to_none=True)
-            objective = train_loss(
-                backbone, spline, context_x, context_y, query_x, query_y, args.transform_regularization
+        else:
+            optimizer = make_direct_spline_optimizer(spline, args)
+            sample_rng = np.random.default_rng(seed + 100_000 + bag)
+            initial_loss, base_final_loss = optimize_direct_spline(
+                backbone, spline, optimizer, support_x, support_y, adaptation_x, adaptation_y,
+                steps=args.steps, sample_rng=sample_rng, args=args,
             )
-            if step == 1:
-                initial_loss = float(objective.detach())
-            objective.backward()
-            torch.nn.utils.clip_grad_norm_(spline.parameters(), 1.0)
-            optimizer.step()
-            final_loss = float(objective.detach())
-            del context_x, context_y, query_x, query_y, objective
+            if args.save_base_state_dir is not None:
+                save_base_state(
+                    args.save_base_state_dir, dataset=dataset, seed=seed, bag=bag, spline=spline,
+                    initial_loss=initial_loss, final_loss=base_final_loss,
+                )
+        refinement_initial_loss = refinement_final_loss = float("nan")
+        if args.knot_refinement_steps:
+            refined = make_direct_spline(
+                support_x, args, knot_placement=args.knot_refinement_placement
+            ).to(device).train()
+            transplant_direct_spline_state(refined, spline)
+            if not loaded_base_state:
+                del optimizer
+            del spline
+            spline = refined
+            optimizer = make_direct_spline_optimizer(spline, args, refinement=True)
+            refinement_rng = np.random.default_rng(seed + 200_000 + bag)
+            refinement_initial_loss, refinement_final_loss = optimize_direct_spline(
+                backbone, spline, optimizer, support_x, support_y, adaptation_x, adaptation_y,
+                steps=args.knot_refinement_steps, sample_rng=refinement_rng, args=args,
+            )
+        final_loss = refinement_final_loss if args.knot_refinement_steps else base_final_loss
         spline.eval()
         identity_guard_loss, identity_guard_accuracy, _ = evaluate_chunked(
             backbone, identity, support_x, support_y, guard_x, guard_y,
@@ -677,7 +831,11 @@ def run_one_protocol(
             "basis_variant": args.basis_variant, "n_control_points": args.n_control_points,
             "trainable_shape": not args.freeze_spline_shape, "trainable_range": args.trainable_range,
             "trainable_location_scale": args.trainable_location_scale,
-            "knot_placement": args.knot_placement,
+            "base_knot_placement": base_knot_placement,
+            "knot_placement": spline.knot_placement,
+            "knot_refinement_steps": args.knot_refinement_steps,
+            "knot_refinement_placement": args.knot_refinement_placement if args.knot_refinement_steps else None,
+            "base_state_source": "loaded" if loaded_base_state else "trained",
             "cross_column_mixing_rank": spline.cross_column_mixing_rank,
             "cross_column_mixing_bound": args.cross_column_mixing_bound,
             "dataset": dataset, "outer_seed": seed, "bag": bag,
@@ -685,7 +843,11 @@ def run_one_protocol(
             "adaptation_query_pool_rows": int(adaptation_y.size), "guard_rows": int(guard_y.size),
             "outer_test_rows": int(y_test.size), "train_context_rows_per_step": min(args.train_context_rows, support_y.shape[1]),
             "query_batch_rows_per_step": min(args.query_batch_rows, adaptation_y.size),
-            "initial_train_objective": initial_loss, "final_train_objective": final_loss,
+            "initial_train_objective": initial_loss,
+            "base_final_train_objective": base_final_loss,
+            "refinement_initial_train_objective": refinement_initial_loss,
+            "refinement_final_train_objective": refinement_final_loss,
+            "final_train_objective": final_loss,
             "identity_guard_loss": identity_guard_loss, "adapted_guard_loss": adapted_guard_loss,
             "identity_guard_accuracy": identity_guard_accuracy, "adapted_guard_accuracy": adapted_guard_accuracy,
             "guard_loss_delta": adapted_guard_loss - identity_guard_loss,
@@ -713,7 +875,8 @@ def run_one_protocol(
             "peak_allocated_gib": peak_allocated_gib, "peak_reserved_gib": peak_reserved_gib,
         })
         print(
-            f"[{dataset} seed={seed} bag={bag}] train={initial_loss:.4f}->{final_loss:.4f}; "
+            f"[{dataset} seed={seed} bag={bag}] train={initial_loss:.4f}->{base_final_loss:.4f}"
+            f"->{final_loss:.4f}; "
             f"guard identity={identity_guard_loss:.4f}, adapted={adapted_guard_loss:.4f}; "
             f"test_delta={test_loss_delta:+.5f}; selected={'adapted' if use_adapted else 'identity'}; "
             f"peak={peak_allocated_gib:.2f} GiB",
@@ -727,7 +890,9 @@ def run_one_protocol(
     # policy is stable across independent samples from the same dataset.
     for target in bag_artifacts:
         target_x, target_y = target["support_x"].to(device), target["support_y"].to(device)
-        target_identity = make_direct_spline(target_x, args).to(device).eval()
+        target_identity = make_direct_spline(
+            target_x, args, knot_placement=final_knot_placement(args)
+        ).to(device).eval()
         target_teacher = clone_with_shape(
             target_identity,
             gap_logits=target["teacher_gap_logits"], gate_logits=target["teacher_gate_logits"],
@@ -817,12 +982,18 @@ def run_one_protocol(
         "basis_variant": args.basis_variant, "n_control_points": args.n_control_points,
         "trainable_shape": not args.freeze_spline_shape, "trainable_range": args.trainable_range,
         "trainable_location_scale": args.trainable_location_scale,
-        "knot_placement": args.knot_placement,
+        "base_knot_placement": "uniform" if args.knot_refinement_steps else args.knot_placement,
+        "knot_placement": final_knot_placement(args),
+        "knot_refinement_steps": args.knot_refinement_steps,
+        "knot_refinement_placement": args.knot_refinement_placement if args.knot_refinement_steps else None,
+        "base_state_source": "loaded" if args.base_state_dir is not None else "trained",
         "cross_column_mixing_rank": args.cross_column_mixing_rank,
         "cross_column_mixing_bound": args.cross_column_mixing_bound,
         "dataset": dataset, "outer_seed": seed, "outer_train_rows": int(y_train.size),
         "outer_test_rows": int(y_test.size), "n_features": int(x.shape[1]), "n_classes": int(labels.size),
-        "bags": args.bags, "steps_per_bag": args.steps,
+        "bags": args.bags, "base_steps_per_bag": args.steps,
+        "knot_refinement_steps_per_bag": args.knot_refinement_steps,
+        "steps_per_bag": args.steps + args.knot_refinement_steps,
         "identity_outer_test_loss": identity_loss, "identity_outer_test_accuracy": identity_accuracy,
         "adapted_outer_test_loss": adapted_loss, "adapted_outer_test_accuracy": adapted_accuracy,
         "guarded_outer_test_loss": guarded_loss, "guarded_outer_test_accuracy": guarded_accuracy,
@@ -889,13 +1060,23 @@ def main() -> None:
         raise ValueError("outer-test-size must lie in (0, 1) and bags must be at least two")
     if min(args.max_context_rows, args.train_context_rows, args.query_batch_rows,
            args.evaluation_query_chunk_rows, args.steps) <= 0:
-        raise ValueError("all row budgets and steps must be positive")
+        raise ValueError("all row budgets and --steps must be positive")
+    if args.knot_refinement_steps < 0:
+        raise ValueError("--knot-refinement-steps must be non-negative")
     if args.n_control_points <= 3 or args.lr <= 0 or args.transform_regularization < 0:
         raise ValueError("invalid spline or optimization configuration")
     if args.freeze_spline_shape and not args.trainable_location_scale:
         raise ValueError("--freeze-spline-shape requires --trainable-location-scale; range alone has no effect on identity shape")
     if args.cross_column_mixing_rank < 0 or args.cross_column_mixing_bound < 0:
         raise ValueError("cross-column mixing rank and bound must be non-negative")
+    if args.knot_refinement_steps and args.knot_placement != "uniform":
+        raise ValueError("knot refinement starts from a uniform base; set --knot-placement uniform")
+    if args.knot_refinement_lr <= 0:
+        raise ValueError("--knot-refinement-lr must be positive")
+    if args.base_state_dir is not None and not args.knot_refinement_steps:
+        raise ValueError("--base-state-dir requires --knot-refinement-steps")
+    if args.base_state_dir is not None and args.save_base_state_dir is not None:
+        raise ValueError("load or save base states in one run, not both")
     if any(value < 0.0 or value > 1.0 for value in args.interpolation_values):
         raise ValueError("--interpolation-alphas must lie in [0, 1]")
     if any(value < 0.0 for value in args.perturbation_values) or args.perturbation_repeats <= 0:
@@ -903,6 +1084,10 @@ def main() -> None:
     if len(set(args.pmlb_dataset)) != len(args.pmlb_dataset) or len(set(args.seeds)) != len(args.seeds):
         raise ValueError("datasets and seeds must be unique")
     device = torch.device(args.device)
+    if args.base_state_dir is not None:
+        args.base_state_dir = args.base_state_dir.resolve()
+    if args.save_base_state_dir is not None:
+        args.save_base_state_dir = args.save_base_state_dir.resolve()
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")
     backbone, _ = load_backbone(args, device)

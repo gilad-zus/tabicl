@@ -26,9 +26,16 @@ def uniform_augmented_knots(n_control_points: int, degree: int, *, dtype: torch.
 
 def greville_abscissae(knots: torch.Tensor, degree: int, n_control_points: int) -> torch.Tensor:
     """Return control points that represent the identity curve exactly."""
+    if knots.ndim not in {1, 3}:
+        raise ValueError("knots must be shared or have one vector per (B, D) curve")
+    if knots.shape[-1] != n_control_points + degree + 1:
+        raise ValueError("knots do not match the requested spline shape")
     if degree == 0:
-        return knots[:n_control_points]
-    return torch.stack([knots[i + 1 : i + degree + 1].mean() for i in range(n_control_points)])
+        return knots[..., :n_control_points]
+    return torch.stack(
+        [knots[..., i + 1 : i + degree + 1].mean(dim=-1) for i in range(n_control_points)],
+        dim=-1,
+    )
 
 
 def _local_basis(u: torch.Tensor, knots: torch.Tensor, spans: torch.Tensor, degree: int) -> torch.Tensor:

@@ -25,6 +25,7 @@ from scripts.hyperspline_real_task_bank import (
     parse_names,
 )
 from scripts.hyperspline_real_meta_train import stratified_context_subset
+from scripts.direct_spline_dataset_headroom import load_base_state, save_base_state
 
 
 def test_shapes_identity_and_feature_permutation():
@@ -122,10 +123,18 @@ def test_direct_spline_knot_placement_is_ordered_identity_initialized_and_differ
     learned = DirectSplineTransform(context, n_control_points=8, knot_placement="learned")
     quantile = DirectSplineTransform(context, n_control_points=8, knot_placement="quantile")
 
-    # Learned interval logits start at the exact shared-uniform reference.
+    # Every initial grid represents the exact same identity transform.  Knot
+    # placement only determines where later shape residuals can bend.
     assert torch.allclose(uniform.transform(context), learned.transform(context), atol=1e-6)
+    assert torch.allclose(uniform.transform(context), quantile.transform(context), atol=1e-6)
+    with torch.no_grad():
+        learned.knot_width_logits[0, 0] = torch.tensor([2.0, -1.0, 0.5, -2.0, 1.0])
+    assert torch.allclose(uniform.transform(context), learned.transform(context), atol=1e-6)
+    with torch.no_grad():
+        learned.gap_logits[..., 2].fill_(0.5)
     learned.transform(context).square().mean().backward()
     assert learned.knot_width_logits.grad is not None
+    assert learned.knot_width_logits.grad.abs().sum() > 0
 
     learned_knots = learned.knots_for_transform()
     quantile_knots = quantile.knots_for_transform()
@@ -135,6 +144,29 @@ def test_direct_spline_knot_placement_is_ordered_identity_initialized_and_differ
     # all non-endpoint intervals in the quantile grid remain strictly positive.
     interior = quantile_knots[..., uniform.degree + 1 : -uniform.degree - 1]
     assert not torch.allclose(interior, uniform.knots[uniform.degree + 1 : -uniform.degree - 1])
+
+
+def test_direct_spline_base_state_round_trip_preserves_the_exact_uniform_teacher(tmp_path):
+    context = torch.randn(1, 8, 2)
+    source = DirectSplineTransform(context, n_control_points=8, trainable_location_scale=True)
+    with torch.no_grad():
+        source.gap_logits.add_(0.3)
+        source.gate_logits.add_(0.2)
+        source.location_offsets.add_(0.1)
+    save_base_state(
+        tmp_path, dataset="toy", seed=7, bag=2, spline=source,
+        initial_loss=0.5, final_loss=0.25,
+    )
+    restored = DirectSplineTransform(context, n_control_points=8, trainable_location_scale=True)
+    initial_loss, final_loss = load_base_state(
+        tmp_path, dataset="toy", seed=7, bag=2, spline=restored
+    )
+    assert initial_loss == 0.5
+    assert final_loss == 0.25
+    assert torch.equal(source.gap_logits, restored.gap_logits)
+    assert torch.equal(source.gate_logits, restored.gate_logits)
+    assert torch.equal(source.location_offsets, restored.location_offsets)
+    assert torch.equal(source.transform(context), restored.transform(context))
 
 
 def test_direct_spline_can_isolate_location_scale_from_nonlinear_shape():

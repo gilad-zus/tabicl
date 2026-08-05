@@ -623,7 +623,16 @@ class DirectSplineTransform(nn.Module):
         )
 
     def parameters_for_transform(self) -> HyperSplineParameters:
-        gaps = self.identity_gaps * torch.exp(torch.tanh(self.gap_logits))
+        # For movable knots, the identity control values must move with the
+        # knot grid.  Otherwise a zero shape residual would itself warp the
+        # feature, entangling knot placement with curve shape.  Greville
+        # abscissae make the zero-residual spline exactly x -> x for every
+        # valid ordered knot vector.
+        identity_controls = greville_abscissae(
+            self.knots_for_transform(), self.degree, self.gap_logits.shape[-1] + 1
+        )
+        identity_gaps = identity_controls[..., 1:] - identity_controls[..., :-1]
+        gaps = identity_gaps * torch.exp(torch.tanh(self.gap_logits))
         gaps = 2.0 * gaps / gaps.sum(dim=-1, keepdim=True).clamp_min(self.eps)
         controls = torch.cat((torch.full_like(gaps[..., :1], -1.0), -1.0 + gaps.cumsum(dim=-1)), dim=-1)
         location, scale, _ = self._location_scale_range()
