@@ -393,7 +393,17 @@ def load_base_state(
         payload = torch.load(path, map_location="cpu", weights_only=True)
     except TypeError:  # pragma: no cover - compatibility with older PyTorch releases
         payload = torch.load(path, map_location="cpu")
-    spline.load_state_dict(payload["state_dict"])
+    # Base states created before the free-control ablation do not contain its
+    # identity-initialized residual/buffer.  Accept precisely that schema
+    # upgrade, while retaining strict validation for every actual teacher
+    # parameter so paired refinement cannot silently load an incompatible run.
+    incompatible = spline.load_state_dict(payload["state_dict"], strict=False)
+    allowed_missing = {"free_control_residual", "free_reference_control_points"}
+    if set(incompatible.missing_keys).difference(allowed_missing) or incompatible.unexpected_keys:
+        raise RuntimeError(
+            "incompatible DirectSpline base state: "
+            f"missing={incompatible.missing_keys}, unexpected={incompatible.unexpected_keys}"
+        )
     return float(payload["initial_train_objective"]), float(payload["base_final_train_objective"])
 
 

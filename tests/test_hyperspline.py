@@ -189,6 +189,21 @@ def test_direct_spline_base_state_round_trip_preserves_the_exact_uniform_teacher
     assert torch.equal(source.transform(context), restored.transform(context))
 
 
+def test_direct_spline_loads_pre_free_control_base_state(tmp_path):
+    context = torch.randn(1, 8, 2)
+    source = DirectSplineTransform(context, n_control_points=8)
+    save_base_state(tmp_path, dataset="old", seed=1, bag=0, spline=source, initial_loss=0.5, final_loss=0.25)
+    path = tmp_path / "old_seed1_bag0.pt"
+    payload = torch.load(path, weights_only=True)
+    payload["state_dict"].pop("free_control_residual")
+    payload["state_dict"].pop("free_reference_control_points")
+    torch.save(payload, path)
+    restored = DirectSplineTransform(context, n_control_points=8)
+    initial_loss, final_loss = load_base_state(tmp_path, dataset="old", seed=1, bag=0, spline=restored)
+    assert (initial_loss, final_loss) == (0.5, 0.25)
+    assert torch.equal(source.transform(context), restored.transform(context))
+
+
 def test_quantile_knot_projection_preserves_a_trained_uniform_spline_function():
     class ProjectionArgs:
         knot_projection_grid_points = 129
