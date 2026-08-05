@@ -79,6 +79,14 @@ def parse_args() -> argparse.Namespace:
                         help="Learn bounded per-column spline ranges instead of fixed R=4.")
     parser.add_argument("--trainable-location-scale", action="store_true",
                         help="Learn bounded residual location/scale adjustments.")
+    parser.add_argument("--control-mode", choices=("monotone", "free"), default="monotone",
+                        help="Ordered controls (default) or bounded free interior controls for the DirectSpline ablation.")
+    parser.add_argument("--free-control-bound", type=float, default=1.0,
+                        help="Maximum standardized displacement of each free interior control from identity.")
+    parser.add_argument("--free-control-curvature-regularization", type=float, default=0.0,
+                        help="Second-difference penalty on free controls.")
+    parser.add_argument("--free-control-reference-regularization", type=float, default=0.0,
+                        help="Function-space trust-region penalty from the free-control refinement start.")
     parser.add_argument("--knot-placement", choices=("uniform", "quantile", "learned"), default="uniform",
                         help="Use shared uniform knots, fixed context-quantile knots, or learned ordered knots.")
     parser.add_argument("--knot-refinement-steps", type=int, default=0,
@@ -114,6 +122,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--perturbation-repeats", type=int, default=2)
     parser.add_argument("--cross-bag-max-sources", type=int, default=3,
                         help="Maximum other teachers evaluated on each target bag; 0 evaluates all.")
+    parser.add_argument("--skip-margin-diagnostics", action="store_true",
+                        help="Skip interpolation/perturbation/cross-bag diagnostics (useful for incompatible experimental parameterizations).")
     parser.add_argument("--resume", action="store_true",
                         help="Skip completed dataset/seed runs found in the summary JSON.")
     return parser.parse_args()
@@ -188,7 +198,8 @@ def to_device(x: np.ndarray, y: np.ndarray, rows: np.ndarray, device: torch.devi
 
 
 def make_direct_spline(
-    x_context: torch.Tensor, args: argparse.Namespace, *, knot_placement: str | None = None
+    x_context: torch.Tensor, args: argparse.Namespace, *, knot_placement: str | None = None,
+    control_mode: str | None = None,
 ) -> DirectSplineTransform:
     return DirectSplineTransform(
         x_context,
@@ -196,6 +207,8 @@ def make_direct_spline(
         trainable_shape=not args.freeze_spline_shape,
         trainable_range=args.trainable_range,
         trainable_location_scale=args.trainable_location_scale,
+        control_mode=args.control_mode if control_mode is None else control_mode,
+        free_control_bound=args.free_control_bound,
         knot_placement=args.knot_placement if knot_placement is None else knot_placement,
         cross_column_mixing_rank=args.cross_column_mixing_rank,
         cross_column_mixing_bound=args.cross_column_mixing_bound,
@@ -220,6 +233,8 @@ def transplant_direct_spline_state(candidate: DirectSplineTransform, source: Dir
             raise ValueError("cannot add cross-column mixing while transplanting a DirectSpline")
         else:
             candidate_value.copy_(source_value)
+    if candidate.control_mode == "free":
+        candidate.set_free_control_points(source.parameters_for_transform().control_points)
 
 
 @torch.no_grad()
@@ -414,6 +429,13 @@ def train_loss(
             + spline.gate_logits.sigmoid().square().mean()
             + spline.knot_width_logits.square().mean()
         )
+    if spline.control_mode == "free" and args.free_control_curvature_regularization:
+        controls = spline.parameters_for_transform().control_points
+        loss = loss + args.free_control_curvature_regularization * (
+            controls[..., 2:] - 2.0 * controls[..., 1:-1] + controls[..., :-2]
+        ).square().mean()
+    if spline.control_mode == "free" and args.free_control_reference_regularization:
+        loss = loss + args.free_control_reference_regularization * spline.free_control_reference_error()
     return loss
 
 
@@ -775,7 +797,10 @@ def run_one_protocol(
         # transform.  A learned grid is introduced only after the base spline
         # has acquired a non-identity shape to allocate its resolution around.
         base_knot_placement = "uniform" if args.knot_refinement_steps else args.knot_placement
-        identity = make_direct_spline(support_x, args, knot_placement=base_knot_placement).to(device).eval()
+        base_control_mode = "monotone" if args.knot_refinement_steps else args.control_mode
+        identity = make_direct_spline(
+            support_x, args, knot_placement=base_knot_placement, control_mode=base_control_mode
+        ).to(device).eval()
         spline = copy.deepcopy(identity).train()
         loaded_base_state = args.base_state_dir is not None
         if loaded_base_state:
@@ -798,7 +823,7 @@ def run_one_protocol(
         knot_projection_initial_rmse = knot_projection_final_rmse = float("nan")
         if args.knot_refinement_steps:
             refined = make_direct_spline(
-                support_x, args, knot_placement=args.knot_refinement_placement
+                support_x, args, knot_placement=args.knot_refinement_placement, control_mode=args.control_mode
             ).to(device).train()
             if args.knot_refinement_placement == "quantile":
                 knot_projection_initial_rmse, knot_projection_final_rmse = project_uniform_spline_to_quantile_basis(
@@ -839,6 +864,19 @@ def run_one_protocol(
             gate_mean, gate_max, control_displacement,
             knot_displacement, knot_min_interval, knot_max_interval,
         ) = spline_diagnostics(spline)
+        if spline.control_mode == "free":
+            negative_fraction, turning_points, residual_rms = spline.free_control_diagnostics()
+            free_negative_fraction = float(negative_fraction.mean())
+            free_turning_points = float(turning_points.float().mean())
+            free_residual_rms = float(residual_rms.mean())
+            free_per_column_diagnostics = json.dumps({
+                "negative_derivative_fraction": negative_fraction.squeeze(0).detach().cpu().tolist(),
+                "turning_points": turning_points.squeeze(0).detach().cpu().tolist(),
+                "residual_rms": residual_rms.squeeze(0).detach().cpu().tolist(),
+            })
+        else:
+            free_negative_fraction = free_turning_points = free_residual_rms = 0.0
+            free_per_column_diagnostics = "[]"
         test_loss_delta = adapted_test_loss - identity_test_loss
         test_accuracy_delta = adapted_test_accuracy - identity_test_accuracy
         test_prefers_adapted_loss = test_loss_delta < 0.0
@@ -847,7 +885,7 @@ def run_one_protocol(
         guarded_probabilities.append(adapted_test_probability if use_adapted else identity_test_probability)
         # Interpolation asks whether a student merely needs the correct
         # direction/magnitude, rather than an exact reproduction of controls.
-        for alpha in args.interpolation_values:
+        for alpha in ([] if args.skip_margin_diagnostics else args.interpolation_values):
             candidate = copy.deepcopy(identity) if alpha == 0.0 else interpolated_shape(identity, spline, alpha)
             margin_rows.append(evaluate_margin_candidate(
                 backbone, candidate, spline, identity, support_x, support_y, x_test, y_test,
@@ -861,7 +899,7 @@ def run_one_protocol(
         # parameter block by its teacher displacement from identity.  The
         # recorded functional error is the meaningful common scale across
         # controls, gates, and adaptive basis parameters.
-        for scale in args.perturbation_values:
+        for scale in ([] if args.skip_margin_diagnostics else args.perturbation_values):
             for repeat in range(args.perturbation_repeats):
                 generator = torch.Generator(device="cpu").manual_seed(seed + 1_000_000 + 10_000 * bag + 100 * repeat)
                 candidate = perturb_shape(identity, spline, scale, generator)
@@ -892,6 +930,8 @@ def run_one_protocol(
             "identity_test_loss": identity_test_loss, "identity_test_accuracy": identity_test_accuracy,
             "teacher_test_loss": adapted_test_loss, "teacher_test_accuracy": adapted_test_accuracy,
         })
+        if args.skip_margin_diagnostics:
+            bag_artifacts.clear()
         peak_allocated_gib = peak_reserved_gib = 0.0
         if device.type == "cuda":
             peak_allocated_gib = torch.cuda.max_memory_allocated(device) / 2**30
@@ -904,6 +944,9 @@ def run_one_protocol(
             "basis_variant": args.basis_variant, "n_control_points": args.n_control_points,
             "trainable_shape": not args.freeze_spline_shape, "trainable_range": args.trainable_range,
             "trainable_location_scale": args.trainable_location_scale,
+            "control_mode": spline.control_mode, "free_control_bound": args.free_control_bound,
+            "free_control_curvature_regularization": args.free_control_curvature_regularization,
+            "free_control_reference_regularization": args.free_control_reference_regularization,
             "base_knot_placement": base_knot_placement,
             "knot_placement": spline.knot_placement,
             "knot_refinement_steps": args.knot_refinement_steps,
@@ -938,6 +981,10 @@ def run_one_protocol(
             "guard_false_negative_loss": not use_adapted and test_prefers_adapted_loss,
             "adapted_mean_gate": gate_mean, "adapted_max_gate": gate_max,
             "adapted_mean_abs_control_displacement": control_displacement,
+            "adapted_mean_negative_derivative_fraction": free_negative_fraction,
+            "adapted_mean_turning_points": free_turning_points,
+            "adapted_mean_free_residual_rms": free_residual_rms,
+            "adapted_per_column_free_control_diagnostics": free_per_column_diagnostics,
             "adapted_mean_abs_knot_displacement": knot_displacement,
             "adapted_min_knot_interval": knot_min_interval,
             "adapted_max_knot_interval": knot_max_interval,
@@ -1061,6 +1108,9 @@ def run_one_protocol(
         "basis_variant": args.basis_variant, "n_control_points": args.n_control_points,
         "trainable_shape": not args.freeze_spline_shape, "trainable_range": args.trainable_range,
         "trainable_location_scale": args.trainable_location_scale,
+        "control_mode": args.control_mode, "free_control_bound": args.free_control_bound,
+        "free_control_curvature_regularization": args.free_control_curvature_regularization,
+        "free_control_reference_regularization": args.free_control_reference_regularization,
         "base_knot_placement": "uniform" if args.knot_refinement_steps else args.knot_placement,
         "knot_placement": final_knot_placement(args),
         "knot_refinement_steps": args.knot_refinement_steps,
@@ -1088,6 +1138,9 @@ def run_one_protocol(
         "guard_false_positive_fraction_loss": float(np.mean([bool(row["guard_false_positive_loss"]) for row in rows])),
         "guard_false_negative_fraction_loss": float(np.mean([bool(row["guard_false_negative_loss"]) for row in rows])),
         "mean_adapted_gate": float(np.mean([float(row["adapted_mean_gate"]) for row in rows])),
+        "mean_adapted_negative_derivative_fraction": float(np.mean([float(row["adapted_mean_negative_derivative_fraction"]) for row in rows])),
+        "mean_adapted_turning_points": float(np.mean([float(row["adapted_mean_turning_points"]) for row in rows])),
+        "mean_adapted_free_residual_rms": float(np.mean([float(row["adapted_mean_free_residual_rms"]) for row in rows])),
         "mean_adapted_abs_knot_displacement": float(np.mean([float(row["adapted_mean_abs_knot_displacement"]) for row in rows])),
         "mean_adapted_min_knot_interval": float(np.mean([float(row["adapted_min_knot_interval"]) for row in rows])),
         "mean_adapted_max_knot_interval": float(np.mean([float(row["adapted_max_knot_interval"]) for row in rows])),
@@ -1146,6 +1199,9 @@ def main() -> None:
         raise ValueError("--knot-refinement-steps must be non-negative")
     if args.n_control_points <= 3 or args.lr <= 0 or args.transform_regularization < 0:
         raise ValueError("invalid spline or optimization configuration")
+    if (args.free_control_bound <= 0 or args.free_control_curvature_regularization < 0
+            or args.free_control_reference_regularization < 0):
+        raise ValueError("free-control bound must be positive and regularization weights non-negative")
     if args.freeze_spline_shape and not args.trainable_location_scale:
         raise ValueError("--freeze-spline-shape requires --trainable-location-scale; range alone has no effect on identity shape")
     if args.cross_column_mixing_rank < 0 or args.cross_column_mixing_bound < 0:

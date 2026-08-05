@@ -30,6 +30,7 @@ from scripts.direct_spline_dataset_headroom import (
     load_base_state,
     project_uniform_spline_to_quantile_basis,
     save_base_state,
+    transplant_direct_spline_state,
 )
 
 
@@ -120,6 +121,20 @@ def test_direct_spline_optional_basis_freedoms_start_at_baseline_and_receive_gra
     assert adaptive.range_logits.grad is not None
     assert adaptive.location_offsets.grad is not None
     assert adaptive.log_scale_offsets.grad is not None
+
+
+def test_direct_spline_free_controls_start_at_identity_and_can_copy_a_monotone_teacher():
+    context = torch.randn(1, 12, 3)
+    monotone = DirectSplineTransform(context, n_control_points=8)
+    free = DirectSplineTransform(context, n_control_points=8, control_mode="free")
+    assert torch.allclose(monotone.transform(context), free.transform(context), atol=1e-6)
+    with torch.no_grad():
+        monotone.gap_logits.normal_(std=0.4)
+        monotone.gate_logits.fill_(torch.logit(torch.tensor(0.3)))
+    transplant_direct_spline_state(free, monotone)
+    assert torch.allclose(monotone.transform(context), free.transform(context), atol=2e-5, rtol=2e-5)
+    free.transform(context).square().mean().backward()
+    assert free.free_control_residual.grad is not None
 
 
 def test_direct_spline_knot_placement_is_ordered_identity_initialized_and_differentiable():

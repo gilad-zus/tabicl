@@ -464,6 +464,8 @@ class DirectSplineTransform(nn.Module):
         trainable_range: bool = False,
         trainable_location_scale: bool = False,
         knot_placement: str = "uniform",
+        control_mode: str = "monotone",
+        free_control_bound: float = 1.0,
         cross_column_mixing_rank: int = 0,
         cross_column_mixing_bound: float = 0.1,
         range_min: float = 1.0,
@@ -478,6 +480,10 @@ class DirectSplineTransform(nn.Module):
             raise ValueError("DirectSplineTransform requires valid fixed cubic splines")
         if knot_placement not in {"uniform", "quantile", "learned"}:
             raise ValueError("knot_placement must be one of: uniform, quantile, learned")
+        if control_mode not in {"monotone", "free"}:
+            raise ValueError("control_mode must be one of: monotone, free")
+        if free_control_bound <= 0:
+            raise ValueError("free_control_bound must be positive")
         self.degree = degree
         self.standardized_range = standardized_range
         self.eps = eps
@@ -489,6 +495,8 @@ class DirectSplineTransform(nn.Module):
         self.trainable_range = trainable_range
         self.trainable_location_scale = trainable_location_scale
         self.knot_placement = knot_placement
+        self.control_mode = control_mode
+        self.free_control_bound = free_control_bound
         self.range_min = range_min
         self.range_max = range_max
         self.location_adjustment_bound = location_adjustment_bound
@@ -500,6 +508,10 @@ class DirectSplineTransform(nn.Module):
         identity = greville_abscissae(knots, degree, n_control_points)
         self.register_buffer("knots", knots)
         self.register_buffer("identity_gaps", identity[1:] - identity[:-1])
+        self.register_buffer(
+            "free_reference_control_points",
+            identity.view(1, 1, -1).expand(x_context.shape[0], x_context.shape[2], -1).clone(),
+        )
         self.register_buffer("location", statistics.location)
         self.register_buffer("scale", statistics.scale)
         self.gap_logits = nn.Parameter(
@@ -509,6 +521,13 @@ class DirectSplineTransform(nn.Module):
         self.gate_logits = nn.Parameter(
             torch.full((x_context.shape[0], x_context.shape[2]), torch.logit(torch.tensor(0.01))),
             requires_grad=trainable_shape,
+        )
+        # Free controls are an experimental DirectSpline-only freedom.  Their
+        # endpoints remain fixed, so values outside the context-derived spline
+        # domain use the identity continuation even when interior controls fold.
+        self.free_control_residual = nn.Parameter(
+            torch.zeros(x_context.shape[0], x_context.shape[2], n_control_points - 2),
+            requires_grad=trainable_shape and control_mode == "free",
         )
         self.location_offsets = nn.Parameter(torch.zeros_like(statistics.location), requires_grad=trainable_location_scale)
         self.log_scale_offsets = nn.Parameter(torch.zeros_like(statistics.scale), requires_grad=trainable_location_scale)
@@ -631,12 +650,58 @@ class DirectSplineTransform(nn.Module):
         identity_controls = greville_abscissae(
             self.knots_for_transform(), self.degree, self.gap_logits.shape[-1] + 1
         )
-        identity_gaps = identity_controls[..., 1:] - identity_controls[..., :-1]
-        gaps = identity_gaps * torch.exp(torch.tanh(self.gap_logits))
-        gaps = 2.0 * gaps / gaps.sum(dim=-1, keepdim=True).clamp_min(self.eps)
-        controls = torch.cat((torch.full_like(gaps[..., :1], -1.0), -1.0 + gaps.cumsum(dim=-1)), dim=-1)
+        if self.control_mode == "free":
+            interior = identity_controls[..., 1:-1] + self.free_control_bound * torch.tanh(self.free_control_residual)
+            controls = torch.cat((
+                torch.full_like(interior[..., :1], -1.0), interior,
+                torch.full_like(interior[..., :1], 1.0),
+            ), dim=-1)
+        else:
+            identity_gaps = identity_controls[..., 1:] - identity_controls[..., :-1]
+            gaps = identity_gaps * torch.exp(torch.tanh(self.gap_logits))
+            gaps = 2.0 * gaps / gaps.sum(dim=-1, keepdim=True).clamp_min(self.eps)
+            controls = torch.cat((torch.full_like(gaps[..., :1], -1.0), -1.0 + gaps.cumsum(dim=-1)), dim=-1)
         location, scale, _ = self._location_scale_range()
         return HyperSplineParameters(controls, torch.sigmoid(self.gate_logits), location, scale)
+
+    @torch.no_grad()
+    def set_free_control_points(self, controls: torch.Tensor) -> None:
+        """Initialize a free-control spline from a same-grid spline function."""
+        if self.control_mode != "free":
+            raise ValueError("set_free_control_points requires control_mode='free'")
+        identity = greville_abscissae(self.knots_for_transform(), self.degree, controls.shape[-1])
+        residual = ((controls[..., 1:-1] - identity[..., 1:-1]) / self.free_control_bound).clamp(
+            -1.0 + self.eps, 1.0 - self.eps
+        )
+        self.free_control_residual.copy_(torch.atanh(residual))
+        self.free_reference_control_points.copy_(controls)
+
+    def free_control_reference_error(self, grid_points: int = 65) -> torch.Tensor:
+        """Mean squared spline-function departure from the refinement start."""
+        if self.control_mode != "free":
+            return self.gap_logits.new_zeros(())
+        controls = self.parameters_for_transform().control_points
+        grid = torch.linspace(-1.0, 1.0, grid_points, device=controls.device, dtype=controls.dtype)
+        u = grid.view(1, -1, 1).expand(controls.shape[0], -1, controls.shape[1])
+        current = evaluate_bspline(u, controls, self.knots_for_transform(), self.degree)
+        reference = evaluate_bspline(u, self.free_reference_control_points, self.knots_for_transform(), self.degree)
+        return (current - reference).square().mean()
+
+    def free_control_diagnostics(self, grid_points: int = 129) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return per-column folded-domain fraction, turning points, and residual RMS."""
+        parameters = self.parameters_for_transform()
+        grid = torch.linspace(-1.0, 1.0, grid_points, device=parameters.control_points.device)
+        values = evaluate_bspline(
+            grid.view(1, -1, 1).expand(parameters.control_points.shape[0], -1, parameters.control_points.shape[1]),
+            parameters.control_points, self.knots_for_transform(), self.degree,
+        )
+        slopes = values[:, 1:] - values[:, :-1]
+        negative_fraction = (slopes < 0).float().mean(dim=1)
+        signs = torch.sign(slopes).masked_fill(slopes.abs() < self.eps, 0.0)
+        turning_points = ((signs[:, 1:] * signs[:, :-1]) < 0).sum(dim=1)
+        identity = grid.view(1, -1, 1)
+        residual_rms = (values - identity).square().mean(dim=1).sqrt()
+        return negative_fraction, turning_points, residual_rms
 
     def mixing_matrix(self) -> torch.Tensor | None:
         """Return the bounded low-rank feature interaction before output gates."""
