@@ -82,11 +82,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--knot-placement", choices=("uniform", "quantile", "learned"), default="uniform",
                         help="Use shared uniform knots, fixed context-quantile knots, or learned ordered knots.")
     parser.add_argument("--knot-refinement-steps", type=int, default=0,
-                        help="After the base fit, fork into a uniform or learned-knot continuation for this many steps.")
-    parser.add_argument("--knot-refinement-placement", choices=("uniform", "learned"), default="uniform",
+                        help="After the uniform base fit, fork into a continuation for this many steps.")
+    parser.add_argument("--knot-refinement-placement", choices=("uniform", "quantile", "learned"), default="uniform",
                         help="Knot grid used by the optional continuation branch.")
     parser.add_argument("--knot-refinement-lr", type=float, default=0.003,
                         help="Learning rate for learned knot-width logits during an optional refinement branch.")
+    parser.add_argument("--knot-projection-steps", type=int, default=250,
+                        help="Steps used to function-match a uniform teacher in a quantile knot basis before refinement.")
+    parser.add_argument("--knot-projection-lr", type=float, default=0.10,
+                        help="Learning rate for the cheap function-preserving quantile-basis projection.")
+    parser.add_argument("--knot-projection-grid-points", type=int, default=257,
+                        help="Standardized grid size used to verify/project a uniform curve into quantile knots.")
     parser.add_argument("--save-base-state-dir", type=Path, default=None,
                         help="Save exact post-base DirectSpline states here before an optional refinement branch.")
     parser.add_argument("--base-state-dir", type=Path, default=None,
@@ -214,6 +220,67 @@ def transplant_direct_spline_state(candidate: DirectSplineTransform, source: Dir
             raise ValueError("cannot add cross-column mixing while transplanting a DirectSpline")
         else:
             candidate_value.copy_(source_value)
+
+
+@torch.no_grad()
+def direct_spline_function_rmse(
+    source: DirectSplineTransform, candidate: DirectSplineTransform, *, grid_points: int
+) -> float:
+    """Measure a pair of spline transforms on a deterministic native-value grid."""
+    if grid_points < 3:
+        raise ValueError("projection grid needs at least three points")
+    location, scale, standardized_range = source._location_scale_range()
+    grid = torch.linspace(-1.0, 1.0, grid_points, device=location.device, dtype=location.dtype)
+    raw = (location.unsqueeze(1) + scale.unsqueeze(1) * standardized_range.unsqueeze(1) * grid.view(1, -1, 1)).detach()
+    return float((candidate.transform(raw) - source.transform(raw)).square().mean().sqrt())
+
+
+def project_uniform_spline_to_quantile_basis(
+    candidate: DirectSplineTransform,
+    source: DirectSplineTransform,
+    args: argparse.Namespace,
+) -> tuple[float, float]:
+    """Fit target-basis shape/gate logits to match a uniform teacher's function.
+
+    A raw state transplant is not function preserving when the Greville identity
+    controls change with the knot grid.  This small deterministic projection is
+    deliberately independent of labels and TabICL: it makes the two refinement
+    arms begin as functionally close as the bounded monotone parameterization
+    permits, then lets their paired task updates reveal whether knot geometry
+    itself is useful.  The returned before/after errors are mandatory output
+    diagnostics rather than an assumption of exact equivalence.
+    """
+    if source.knot_placement != "uniform" or candidate.knot_placement != "quantile":
+        raise ValueError("quantile projection requires a uniform source and quantile candidate")
+    transplant_direct_spline_state(candidate, source)
+    before = direct_spline_function_rmse(source, candidate, grid_points=args.knot_projection_grid_points)
+    location, scale, standardized_range = source._location_scale_range()
+    grid = torch.linspace(
+        -1.0, 1.0, args.knot_projection_grid_points,
+        device=location.device, dtype=location.dtype,
+    )
+    raw = (location.unsqueeze(1) + scale.unsqueeze(1) * standardized_range.unsqueeze(1) * grid.view(1, -1, 1)).detach()
+    with torch.no_grad():
+        target = source.transform(raw).detach()
+    original_requires_grad = {name: parameter.requires_grad for name, parameter in candidate.named_parameters()}
+    for parameter in candidate.parameters():
+        parameter.requires_grad_(False)
+    # The grid changes the scale of a control-point residual.  Let the
+    # per-column output gate compensate jointly with its shape; otherwise an
+    # equivalent curve can be needlessly excluded by the bounded gap-logit
+    # parameterization.
+    candidate.gap_logits.requires_grad_(True)
+    candidate.gate_logits.requires_grad_(True)
+    optimizer = torch.optim.Adam((candidate.gap_logits, candidate.gate_logits), lr=args.knot_projection_lr)
+    for _ in range(args.knot_projection_steps):
+        optimizer.zero_grad(set_to_none=True)
+        error = (candidate.transform(raw) - target).square().mean()
+        error.backward()
+        optimizer.step()
+    for name, parameter in candidate.named_parameters():
+        parameter.requires_grad_(original_requires_grad[name])
+    after = direct_spline_function_rmse(source, candidate, grid_points=args.knot_projection_grid_points)
+    return before, after
 
 
 def make_direct_spline_optimizer(
@@ -728,11 +795,17 @@ def run_one_protocol(
                     initial_loss=initial_loss, final_loss=base_final_loss,
                 )
         refinement_initial_loss = refinement_final_loss = float("nan")
+        knot_projection_initial_rmse = knot_projection_final_rmse = float("nan")
         if args.knot_refinement_steps:
             refined = make_direct_spline(
                 support_x, args, knot_placement=args.knot_refinement_placement
             ).to(device).train()
-            transplant_direct_spline_state(refined, spline)
+            if args.knot_refinement_placement == "quantile":
+                knot_projection_initial_rmse, knot_projection_final_rmse = project_uniform_spline_to_quantile_basis(
+                    refined, spline, args
+                )
+            else:
+                transplant_direct_spline_state(refined, spline)
             if not loaded_base_state:
                 del optimizer
             del spline
@@ -835,6 +908,8 @@ def run_one_protocol(
             "knot_placement": spline.knot_placement,
             "knot_refinement_steps": args.knot_refinement_steps,
             "knot_refinement_placement": args.knot_refinement_placement if args.knot_refinement_steps else None,
+            "knot_projection_initial_rmse": knot_projection_initial_rmse,
+            "knot_projection_final_rmse": knot_projection_final_rmse,
             "base_state_source": "loaded" if loaded_base_state else "trained",
             "cross_column_mixing_rank": spline.cross_column_mixing_rank,
             "cross_column_mixing_bound": args.cross_column_mixing_bound,
@@ -978,6 +1053,10 @@ def run_one_protocol(
         for index, row in enumerate(rows)
     ]
     oracle_loss, oracle_accuracy = ensemble_metrics(oracle_probability, y_test)
+    projection_initial_values = [float(row["knot_projection_initial_rmse"]) for row in rows
+                                 if np.isfinite(float(row["knot_projection_initial_rmse"]))]
+    projection_final_values = [float(row["knot_projection_final_rmse"]) for row in rows
+                               if np.isfinite(float(row["knot_projection_final_rmse"]))]
     summary = {
         "basis_variant": args.basis_variant, "n_control_points": args.n_control_points,
         "trainable_shape": not args.freeze_spline_shape, "trainable_range": args.trainable_range,
@@ -1017,6 +1096,8 @@ def run_one_protocol(
         "mean_adapted_mixing_effective_rank": float(np.mean([float(row["adapted_mixing_effective_rank"]) for row in rows])),
         "mean_adapted_mixing_energy_ratio": float(np.mean([float(row["adapted_mixing_energy_ratio"]) for row in rows])),
         "mean_peak_allocated_gib": float(np.mean([float(row["peak_allocated_gib"]) for row in rows])),
+        "mean_knot_projection_initial_rmse": float(np.mean(projection_initial_values)) if projection_initial_values else None,
+        "mean_knot_projection_final_rmse": float(np.mean(projection_final_values)) if projection_final_values else None,
         "protocol": "outer_holdout + nested_bagging + fixed_support_context + resampled_train_only_episodes + external_identity_guard",
     }
     del identity_probabilities, adapted_probabilities, guarded_probabilities, oracle_probability
@@ -1073,6 +1154,8 @@ def main() -> None:
         raise ValueError("knot refinement starts from a uniform base; set --knot-placement uniform")
     if args.knot_refinement_lr <= 0:
         raise ValueError("--knot-refinement-lr must be positive")
+    if args.knot_projection_steps <= 0 or args.knot_projection_lr <= 0 or args.knot_projection_grid_points < 3:
+        raise ValueError("quantile projection steps/lr must be positive and its grid needs at least three points")
     if args.base_state_dir is not None and not args.knot_refinement_steps:
         raise ValueError("--base-state-dir requires --knot-refinement-steps")
     if args.base_state_dir is not None and args.save_base_state_dir is not None:

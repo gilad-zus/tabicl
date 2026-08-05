@@ -25,7 +25,12 @@ from scripts.hyperspline_real_task_bank import (
     parse_names,
 )
 from scripts.hyperspline_real_meta_train import stratified_context_subset
-from scripts.direct_spline_dataset_headroom import load_base_state, save_base_state
+from scripts.direct_spline_dataset_headroom import (
+    direct_spline_function_rmse,
+    load_base_state,
+    project_uniform_spline_to_quantile_basis,
+    save_base_state,
+)
 
 
 def test_shapes_identity_and_feature_permutation():
@@ -167,6 +172,27 @@ def test_direct_spline_base_state_round_trip_preserves_the_exact_uniform_teacher
     assert torch.equal(source.gate_logits, restored.gate_logits)
     assert torch.equal(source.location_offsets, restored.location_offsets)
     assert torch.equal(source.transform(context), restored.transform(context))
+
+
+def test_quantile_knot_projection_preserves_a_trained_uniform_spline_function():
+    class ProjectionArgs:
+        knot_projection_grid_points = 129
+        knot_projection_steps = 300
+        knot_projection_lr = 0.10
+
+    torch.manual_seed(3)
+    context = torch.randn(1, 24, 3)
+    source = DirectSplineTransform(context, n_control_points=8, trainable_location_scale=True)
+    with torch.no_grad():
+        source.gap_logits.normal_(std=0.45)
+        source.gate_logits.fill_(torch.logit(torch.tensor(0.35)))
+        source.location_offsets.normal_(std=0.15)
+        source.log_scale_offsets.normal_(std=0.10)
+    quantile = DirectSplineTransform(context, n_control_points=8, trainable_location_scale=True, knot_placement="quantile")
+    before, after = project_uniform_spline_to_quantile_basis(quantile, source, ProjectionArgs())
+    assert before > 1e-3
+    assert after < before * 0.25
+    assert direct_spline_function_rmse(source, quantile, grid_points=129) == pytest.approx(after)
 
 
 def test_direct_spline_can_isolate_location_scale_from_nonlinear_shape():
