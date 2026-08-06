@@ -314,6 +314,29 @@ class HyperSplineTransform(nn.Module):
         y_context: Optional[torch.Tensor] = None,
         context_missing: Optional[torch.Tensor] = None,
     ) -> HyperSplineParameters:
+        raw, residual_gate = self.generate_raw(
+            statistics,
+            x_context=x_context,
+            y_context=y_context,
+            context_missing=context_missing,
+        )
+        return self._parameters_from_raw(raw, statistics, residual_gate)
+
+    def generate_raw(
+        self,
+        statistics: ColumnStatistics,
+        *,
+        x_context: Optional[torch.Tensor] = None,
+        y_context: Optional[torch.Tensor] = None,
+        context_missing: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Return conditioner output logits before interpreting a spline basis.
+
+        ``generate_parameters`` remains the standard monotone B-spline path.
+        Exposing these logits permits an experiment to reuse the same
+        context-only, permutation-safe conditioner with another bounded
+        numerical-function representation.
+        """
         if self.has_supervised_residual:
             # The frozen marginal policy always receives exactly the summary it
             # saw during marginal training: its 23 distributional entries plus
@@ -340,7 +363,7 @@ class HyperSplineTransform(nn.Module):
         else:
             raw = self.mlp(statistics.summary)
             residual_gate = None
-        return self._parameters_from_raw(raw, statistics, residual_gate)
+        return raw, residual_gate
 
     def generate_marginal_parameters(self, statistics: ColumnStatistics) -> HyperSplineParameters:
         """Generate the frozen marginal reference used by residual stabilizers."""

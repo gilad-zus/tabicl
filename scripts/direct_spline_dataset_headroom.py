@@ -326,6 +326,8 @@ def optimize_direct_spline(
     steps: int,
     sample_rng: np.random.Generator,
     args: argparse.Namespace,
+    log_every: int = 0,
+    log_prefix: str = "",
 ) -> tuple[float, float]:
     """Fit one DirectSpline phase using deterministically resampled episodes."""
     first_loss = final_loss = float("nan")
@@ -340,7 +342,9 @@ def optimize_direct_spline(
         query_x, query_y = to_device(adaptation_x, adaptation_y, query_rows, support_x.device)
         optimizer.zero_grad(set_to_none=True)
         objective = train_loss(
-            backbone, spline, context_x, context_y, query_x, query_y, args.transform_regularization
+            backbone, spline, context_x, context_y, query_x, query_y, args.transform_regularization,
+            free_control_curvature_regularization=args.free_control_curvature_regularization,
+            free_control_reference_regularization=args.free_control_reference_regularization,
         )
         if step == 1:
             first_loss = float(objective.detach())
@@ -348,6 +352,8 @@ def optimize_direct_spline(
         torch.nn.utils.clip_grad_norm_(spline.parameters(), 1.0)
         optimizer.step()
         final_loss = float(objective.detach())
+        if log_every and (step == 1 or step % log_every == 0 or step == steps):
+            print(f"{log_prefix} step={step}/{steps} objective={final_loss:.6f}", flush=True)
         del context_x, context_y, query_x, query_y, objective
     return first_loss, final_loss
 
@@ -427,6 +433,9 @@ def train_loss(
     x_query: torch.Tensor,
     y_query: torch.Tensor,
     regularization: float,
+    *,
+    free_control_curvature_regularization: float = 0.0,
+    free_control_reference_regularization: float = 0.0,
 ) -> torch.Tensor:
     logits = transform_logits(backbone, spline, x_context, y_context, x_query)
     loss = F.cross_entropy(logits.flatten(0, 1), y_query.long().flatten())
@@ -439,13 +448,13 @@ def train_loss(
             + spline.gate_logits.sigmoid().square().mean()
             + spline.knot_width_logits.square().mean()
         )
-    if spline.control_mode == "free" and args.free_control_curvature_regularization:
+    if spline.control_mode == "free" and free_control_curvature_regularization:
         controls = spline.parameters_for_transform().control_points
-        loss = loss + args.free_control_curvature_regularization * (
+        loss = loss + free_control_curvature_regularization * (
             controls[..., 2:] - 2.0 * controls[..., 1:-1] + controls[..., :-2]
         ).square().mean()
-    if spline.control_mode == "free" and args.free_control_reference_regularization:
-        loss = loss + args.free_control_reference_regularization * spline.free_control_reference_error()
+    if spline.control_mode == "free" and free_control_reference_regularization:
+        loss = loss + free_control_reference_regularization * spline.free_control_reference_error()
     return loss
 
 

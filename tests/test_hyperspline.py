@@ -31,7 +31,47 @@ from scripts.direct_spline_dataset_headroom import (
     project_uniform_spline_to_quantile_basis,
     save_base_state,
     transplant_direct_spline_state,
+    train_loss,
 )
+from scripts.direct_spline_column_sparsity import masked_transform
+from scripts.direct_spline_function_basis import fit_pca, reconstruct_curves
+from scripts.direct_spline_teacher_stability import pair_metrics
+from scripts.direct_spline_conditioner_sufficiency import descriptors_for_bag
+
+
+def test_function_space_pca_reconstructs_teacher_curves_at_full_rank():
+    curves = torch.tensor(
+        [[0.0, 0.5, 1.0, 0.5], [1.0, 0.5, 0.0, -0.5], [-0.5, 0.0, 0.5, 1.0]],
+        dtype=torch.float32,
+    )
+    mean, components, explained_variance = fit_pca(curves)
+    reconstructed = reconstruct_curves(curves, mean, components, rank=components.shape[0])
+    assert torch.allclose(reconstructed, curves, atol=1e-5)
+    assert torch.allclose(reconstruct_curves(curves, mean, components, rank=0), mean.expand_as(curves))
+    assert torch.isclose(explained_variance.sum(), torch.tensor(1.0))
+
+
+def test_teacher_cache_functional_diagnostics_align_columns():
+    from scripts.direct_spline_function_basis import TeacherBag
+
+    common = dict(
+        dataset="toy", seed=0, support_x=torch.tensor([[[0.0, 1.0], [1.0, 2.0], [2.0, 3.0], [3.0, 4.0]]]),
+        support_y=torch.tensor([[0.0, 0.0, 1.0, 1.0]]), identity_state={},
+        guard_x=np.zeros((2, 2), dtype=np.float32), guard_y=np.array([0, 1]),
+        test_x=np.zeros((2, 2), dtype=np.float32), test_y=np.array([0, 1]),
+        teacher_initial_train_loss=1.0, teacher_final_train_loss=0.5,
+    )
+    first = TeacherBag(bag=0, curves=torch.tensor([[0.0, 0.1, 0.0], [0.0, -0.1, 0.0]]),
+                       teacher_state={"gate_logits": torch.zeros(1, 2)}, **common)
+    second = TeacherBag(bag=1, curves=first.curves + 0.01,
+                        teacher_state={"gate_logits": torch.zeros(1, 2)}, **common)
+    pair, columns = pair_metrics(first, second)
+    assert pair["mean_curve_rmse"] > 0
+    assert len(columns) == 2
+    descriptors = descriptors_for_bag(first)
+    assert descriptors["marginal"].shape == (2, 23)
+    assert descriptors["supervised"].shape == (2, 31)
+    assert descriptors["pooled_cross_column"].shape == (2, 93)
 
 
 def test_shapes_identity_and_feature_permutation():
@@ -135,6 +175,41 @@ def test_direct_spline_free_controls_start_at_identity_and_can_copy_a_monotone_t
     assert torch.allclose(monotone.transform(context), free.transform(context), atol=2e-5, rtol=2e-5)
     free.transform(context).square().mean().backward()
     assert free.free_control_residual.grad is not None
+
+
+def test_sparse_teacher_mask_interpolates_in_function_space():
+    context = torch.randn(1, 10, 2)
+    identity = DirectSplineTransform(context, n_control_points=8)
+    teacher = DirectSplineTransform(context, n_control_points=8)
+    with torch.no_grad():
+        teacher.gap_logits.normal_(std=0.3)
+        teacher.gate_logits.fill_(torch.logit(torch.tensor(0.4)))
+    zero = masked_transform(identity, teacher, context, torch.zeros(2))
+    one = masked_transform(identity, teacher, context, torch.ones(2))
+    assert torch.allclose(zero, identity.transform(context))
+    assert torch.allclose(one, teacher.transform(context))
+
+
+def test_free_control_train_loss_accepts_stabilizer_weights():
+    class ToyBackbone(nn.Module):
+        def clear_cache(self):
+            pass
+
+        def forward(self, x, y_context):
+            value = x[:, y_context.shape[1] :].sum(dim=-1)
+            return torch.stack((value, -value), dim=-1)
+
+    context, query = torch.randn(1, 8, 2), torch.randn(1, 4, 2)
+    labels, query_labels = torch.zeros(1, 8), torch.tensor([[0, 1, 0, 1]])
+    spline = DirectSplineTransform(context, n_control_points=8, control_mode="free")
+    loss = train_loss(
+        ToyBackbone(), spline, context, labels, query, query_labels, 0.0,
+        free_control_curvature_regularization=1e-3,
+        free_control_reference_regularization=1e-3,
+    )
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert spline.free_control_residual.grad is not None
 
 
 def test_direct_spline_knot_placement_is_ordered_identity_initialized_and_differentiable():
