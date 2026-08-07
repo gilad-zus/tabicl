@@ -37,6 +37,58 @@ from scripts.direct_spline_column_sparsity import masked_transform
 from scripts.direct_spline_function_basis import fit_pca, reconstruct_curves
 from scripts.direct_spline_teacher_stability import pair_metrics
 from scripts.direct_spline_conditioner_sufficiency import descriptors_for_bag
+from scripts.hyperspline_rank_basis_single_dataset import RankBasisSpline
+from scripts.hyperspline_rank_basis_zero_shot import FactorizedRankBasisSpline
+
+
+def test_rank_basis_regularizer_is_differentiable():
+    model = RankBasisSpline(
+        torch.tensor(
+            [[0.0, 0.2, -0.1, 0.0, 0.0], [0.1, 0.0, -0.1, 0.0, 0.1], [0.0, -0.1, 0.0, 0.1, 0.0]],
+            dtype=torch.float32,
+        ),
+        hidden_dim=8,
+        coefficient_bound=1.0,
+        branch="shape",
+    )
+    with torch.no_grad():
+        model.encoder.mlp[-1].bias[0] = 0.1
+    context = torch.randn(1, 12, 3)
+    labels = torch.tensor([0, 1] * 6)
+    penalty = model.deformation_penalty(context, labels)
+    assert penalty.requires_grad
+    penalty.backward()
+    assert any(
+        parameter.grad is not None and torch.isfinite(parameter.grad).all() and parameter.grad.abs().sum() > 0
+        for parameter in model.parameters()
+    )
+
+
+def test_factorized_rank_basis_has_independent_bounded_gates_and_gradients():
+    model = FactorizedRankBasisSpline(
+        torch.tensor([0.0, 0.1, -0.1, 0.0, 0.0]),
+        torch.tensor([[0.0, 0.2, -0.2, 0.0, 0.0], [0.1, -0.1, 0.1, -0.1, 0.0], [0.0, 0.1, 0.0, -0.1, 0.0]]),
+        branch="joint",
+        hidden_dim=8,
+        coefficient_bound=1.5,
+        location_bound=0.5,
+        log_scale_bound=0.25,
+        target_aware=True,
+        raw_context=True,
+        gate_initial_probability=0.01,
+    )
+    context = torch.randn(1, 12, 4)
+    query = torch.randn(1, 5, 4)
+    labels = torch.tensor([0, 1] * 6)
+    transformed, parameters = model(context, labels, query)
+    assert transformed.shape == (1, 17, 4)
+    assert model.shape_encoder is not model.normalization_encoder
+    assert parameters["shape_gate"].min() >= 0 and parameters["shape_gate"].max() <= 1
+    assert parameters["normalization_gate"].min() >= 0 and parameters["normalization_gate"].max() <= 1
+    objective = transformed.square().mean() + model.trust_region(parameters)
+    objective.backward()
+    assert any(parameter.grad is not None for parameter in model.shape_encoder.parameters())
+    assert any(parameter.grad is not None for parameter in model.normalization_encoder.parameters())
 
 
 def test_function_space_pca_reconstructs_teacher_curves_at_full_rank():
