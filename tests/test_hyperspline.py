@@ -40,6 +40,11 @@ from scripts.direct_spline_teacher_stability import pair_metrics
 from scripts.direct_spline_conditioner_sufficiency import descriptors_for_bag
 from scripts.hyperspline_rank_basis_single_dataset import RankBasisSpline
 from scripts.hyperspline_rank_basis_zero_shot import FactorizedRankBasisSpline
+from scripts.hyperspline_rank_basis_stability import (
+    DirectEffectiveRankBasisSpline,
+    UniformControlSpline,
+    run_one as run_stability_one,
+)
 from scripts.hyperspline_rank_basis_seen_bags import (
     fit_training_basis,
     macro_dataset_mean,
@@ -254,6 +259,96 @@ def test_factorized_rank_basis_has_independent_bounded_gates_and_gradients():
     objective.backward()
     assert any(parameter.grad is not None for parameter in model.shape_encoder.parameters())
     assert any(parameter.grad is not None for parameter in model.normalization_encoder.parameters())
+
+
+def test_direct_effective_rank_basis_starts_at_exact_identity_without_a_shape_gate():
+    model = DirectEffectiveRankBasisSpline(
+        torch.tensor([0.0, 0.2, -0.1, 0.0, 0.0]),
+        torch.tensor([
+            [0.0, 0.2, -0.2, 0.0, 0.0],
+            [0.1, -0.1, 0.1, -0.1, 0.0],
+            [0.0, 0.1, 0.0, -0.1, 0.0],
+        ]),
+        hidden_dim=8,
+        coefficient_bound=1.5,
+        mean_bound=1.0,
+        target_aware=False,
+        raw_context=False,
+    )
+    context = torch.randn(1, 12, 4)
+    query = torch.randn(1, 5, 4)
+    labels = torch.tensor([0, 1] * 6)
+    transformed, parameters = model(context, labels, query)
+    assert transformed.shape == (1, 17, 4)
+    assert torch.allclose(parameters["values"], model.grid.view(1, 1, -1), atol=2e-6, rtol=2e-6)
+    assert torch.equal(parameters["coefficients"], torch.zeros_like(parameters["coefficients"]))
+    assert torch.equal(parameters["shape_gate"], torch.ones_like(parameters["shape_gate"]))
+    assert model.trust_region(parameters).item() == pytest.approx(0.0, abs=1e-8)
+    (transformed.square().mean() + model.trust_region(parameters)).backward()
+    assert any(parameter.grad is not None for parameter in model.parameters())
+
+
+def test_teacher_free_uniform_control_spline_starts_identity_and_stays_monotone():
+    model = UniformControlSpline(
+        n_control_points=6,
+        hidden_dim=8,
+        gap_adjustment_bound=2.0,
+        target_aware=False,
+        raw_context=False,
+    )
+    context = torch.randn(1, 12, 3)
+    query = torch.randn(1, 5, 3)
+    labels = torch.tensor([0, 1] * 6)
+    transformed, parameters = model(context, labels, query)
+    assert transformed.shape == (1, 17, 3)
+    assert torch.allclose(parameters["values"], model.grid.view(1, 1, -1), atol=2e-5, rtol=2e-5)
+    assert torch.all(torch.diff(parameters["values"], dim=-1) > 0)
+    assert parameters["control_points"].shape == (1, 3, 6)
+    (transformed.square().mean() + model.trust_region(parameters)).backward()
+    assert any(parameter.grad is not None for parameter in model.parameters())
+
+
+def test_stability_runner_uses_balanced_meta_batch_and_writes_outputs(tmp_path):
+    class TinyBackbone(nn.Module):
+        def clear_cache(self):
+            return None
+
+        def forward(self, x, y_context):
+            query = x[:, y_context.shape[1] :]
+            score = query.mean(-1)
+            return torch.stack((-score, score), dim=-1)
+
+    bags = [
+        _toy_seen_bag(dataset, 0, bag, curve_value=0.01 * bag)
+        for dataset in ("alpha", "beta")
+        for bag in range(8)
+    ]
+    args = Namespace(
+        train_bags=list(range(6)), validation_bags=[6], test_bags=[7],
+        outer_validation_fraction=0.4, evaluation_context_fraction=0.5,
+        max_evaluation_context_rows=32, evaluation_episodes_per_dataset=1,
+        episode_split_seed=99, rank=3, arm="direct_rank", hidden_dim=8,
+        coefficient_bound=1.0, mean_coefficient_bound=1.0,
+        uniform_control_points=6, gap_adjustment_bound=2.0,
+        target_aware=True, raw_context=False, gate_initial_probability=0.01,
+        lr=1e-3, steps=1, episodes_per_dataset_per_step=2,
+        log_every=1, validate_every=1, regularization=1e-3,
+        gradient_clip=1.0, gradient_diagnostics_every=0, patience_validations=0,
+    )
+    summary, paired = run_stability_one(
+        args, TinyBackbone(), bags, {"alpha", "beta"}, outer_seed=0,
+        model_seed=0, device=torch.device("cpu"), run_dir=tmp_path,
+    )
+    assert summary["datasets"] == ["alpha", "beta"]
+    assert len(paired) == 2
+    training = np.genfromtxt(tmp_path / "training.csv", delimiter=",", names=True, dtype=None, encoding="utf8")
+    assert int(np.atleast_1d(training["meta_batch_episodes"])[0]) == 4
+    for name in (
+        "manifest.json", "training.csv", "evaluations.csv", "paired_test.csv",
+        "parameter_consistency.csv", "selected_parameter_columns.csv",
+        "selected_parameters.pt", "summary.json", "best.pt",
+    ):
+        assert (tmp_path / name).is_file()
 
 
 def test_function_space_pca_reconstructs_teacher_curves_at_full_rank():
