@@ -75,7 +75,7 @@ class FactorizedRankBasisSpline(nn.Module):
     def _raw(self, encoder: HyperSplineTransform, x: torch.Tensor, y: torch.Tensor, stats):
         return encoder.generate_raw(stats, x_context=x, y_context=self._labels(y, encoder.target_aware))[0]
 
-    def parameters(self, x: torch.Tensor, y: torch.Tensor) -> dict[str, torch.Tensor]:
+    def generated_parameters(self, x: torch.Tensor, y: torch.Tensor) -> dict[str, torch.Tensor]:
         enabled = bool((self.shape_encoder or self.normalization_encoder).target_aware)
         stats = summarize_context(x, y_context=self._labels(y, enabled))
         batch, _, columns = x.shape
@@ -122,7 +122,7 @@ class FactorizedRankBasisSpline(nn.Module):
         return low + fraction * (high - low) + z - clipped
 
     def forward(self, context_x: torch.Tensor, context_y: torch.Tensor, query_x: torch.Tensor):
-        p = self.parameters(context_x, context_y)
+        p = self.generated_parameters(context_x, context_y)
         return torch.cat((self.transform(context_x, p), self.transform(query_x, p)), 1), p
 
     def trust_region(self, p: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -242,7 +242,12 @@ def main() -> None:
         hidden_dim=args.hidden_dim,coefficient_bound=args.coefficient_bound,location_bound=args.location_bound,
         log_scale_bound=args.log_scale_bound,target_aware=args.target_aware,raw_context=args.raw_context,
         gate_initial_probability=args.gate_initial_probability).to(device)
-    optimizer=torch.optim.AdamW(model.parameters(),lr=args.lr)
+    # Call nn.Module.parameters explicitly.  Besides being unambiguous, this
+    # keeps optimizer construction safe when loading/running alongside older
+    # experiment copies that used ``parameters(x, y)`` for generated spline
+    # parameters and accidentally shadowed the standard PyTorch method.
+    trainable_parameters = list(nn.Module.parameters(model))
+    optimizer=torch.optim.AdamW(trainable_parameters,lr=args.lr)
     rng=np.random.default_rng(args.seed); training_rows=[]; evaluation_rows=[]
     identity_val=evaluate(backbone,model,val_bags,"guard",device,"identity_validation",0)
     identity_test=evaluate(backbone,model,test_bags,"test",device,"identity_test",0)
@@ -255,7 +260,7 @@ def main() -> None:
         task_loss=F.cross_entropy(logits.flatten(0,1),y.flatten())
         penalty=model.trust_region(params); objective=task_loss+args.regularization*penalty
         optimizer.zero_grad(set_to_none=True); objective.backward()
-        pre_clip=float(torch.nn.utils.clip_grad_norm_(model.parameters(),args.gradient_clip)); optimizer.step()
+        pre_clip=float(torch.nn.utils.clip_grad_norm_(trainable_parameters,args.gradient_clip)); optimizer.step()
         if step==1 or step%args.log_every==0:
             row={"step":step,"dataset":bag.dataset,"task_loss":float(task_loss),"objective":float(objective),
                  "trust_region":float(penalty),"weighted_regularization":float(args.regularization*penalty),

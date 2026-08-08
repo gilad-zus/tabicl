@@ -1,4 +1,5 @@
 import inspect
+from argparse import Namespace
 
 import numpy as np
 import pytest
@@ -39,6 +40,166 @@ from scripts.direct_spline_teacher_stability import pair_metrics
 from scripts.direct_spline_conditioner_sufficiency import descriptors_for_bag
 from scripts.hyperspline_rank_basis_single_dataset import RankBasisSpline
 from scripts.hyperspline_rank_basis_zero_shot import FactorizedRankBasisSpline
+from scripts.hyperspline_rank_basis_seen_bags import (
+    fit_training_basis,
+    macro_dataset_mean,
+    make_outer_holdout_episodes,
+    run_one,
+    split_seen_bags,
+)
+
+
+def _toy_seen_bag(dataset: str, seed: int, bag: int, curve_value: float = 0.0):
+    from scripts.direct_spline_function_basis import TeacherBag
+
+    test_rows = np.arange(80, dtype=np.float32)
+    test_x = np.column_stack((test_rows, test_rows % 7))
+    test_y = np.asarray([0, 1] * 40)
+    return TeacherBag(
+        dataset=dataset,
+        seed=seed,
+        bag=bag,
+        support_x=torch.arange(48, dtype=torch.float32).reshape(1, 24, 2),
+        support_y=torch.tensor([[0.0, 1.0] * 12]),
+        identity_state={},
+        teacher_state={},
+        curves=torch.full((2, 5), curve_value),
+        guard_x=np.zeros((8, 2), dtype=np.float32),
+        guard_y=np.asarray([0, 1] * 4),
+        test_x=test_x,
+        test_y=test_y,
+        teacher_initial_train_loss=1.0,
+        teacher_final_train_loss=0.5,
+    )
+
+
+def test_seen_bag_split_is_deterministic_balanced_and_disjoint():
+    bags = [
+        _toy_seen_bag(dataset, seed, bag)
+        for dataset in ("alpha", "beta")
+        for seed in (0, 1)
+        for bag in range(8)
+    ]
+    shuffled = list(reversed(bags))
+    split = split_seen_bags(
+        shuffled,
+        datasets={"alpha", "beta"},
+        outer_seed=1,
+        train_bag_ids=set(range(6)),
+        validation_bag_ids={6},
+        test_bag_ids={7},
+    )
+    repeated = split_seen_bags(
+        bags,
+        datasets={"alpha", "beta"},
+        outer_seed=1,
+        train_bag_ids=set(range(6)),
+        validation_bag_ids={6},
+        test_bag_ids={7},
+    )
+    assert [[(item.dataset, item.seed, item.bag) for item in part] for part in split] == [
+        [(item.dataset, item.seed, item.bag) for item in part] for part in repeated
+    ]
+    train, validation, test = split
+    assert len(train) == 12 and len(validation) == 2 and len(test) == 2
+    keys = [set((item.dataset, item.seed, item.bag) for item in part) for part in split]
+    assert not keys[0].intersection(keys[1])
+    assert not keys[0].intersection(keys[2])
+    assert not keys[1].intersection(keys[2])
+    assert {item.seed for part in split for item in part} == {1}
+
+
+def test_seen_bag_basis_uses_training_curves_only():
+    train = [_toy_seen_bag("alpha", 0, bag, curve_value=float(bag)) for bag in range(4)]
+    leaked = [_toy_seen_bag("alpha", 0, 6, curve_value=10_000.0)]
+    mean, components, explained, digest = fit_training_basis(train, rank=3)
+    expected = torch.cat([bag.curves for bag in train]).mean(0)
+    assert torch.allclose(mean, expected)
+    assert not torch.allclose(mean, torch.cat([bag.curves for bag in train + leaked]).mean(0))
+    changed_leak = [_toy_seen_bag("alpha", 0, 6, curve_value=-10_000.0)]
+    repeated_mean, repeated_components, repeated_explained, repeated_digest = fit_training_basis(train, rank=3)
+    assert torch.equal(mean, repeated_mean)
+    assert torch.allclose(components.T @ components, repeated_components.T @ repeated_components)
+    assert torch.equal(explained, repeated_explained)
+    assert digest == repeated_digest
+    assert leaked[0].curves.mean() != changed_leak[0].curves.mean()
+
+
+def test_seen_bag_checkpoint_score_is_dataset_macro_not_bag_micro():
+    candidate_a = [{"dataset": "a", "loss": 0.0}] + [{"dataset": "b", "loss": 0.6}] * 9
+    candidate_b = [{"dataset": "a", "loss": 0.4}] + [{"dataset": "b", "loss": 0.4}] * 9
+    assert macro_dataset_mean(candidate_a) == pytest.approx(0.3)
+    assert macro_dataset_mean(candidate_b) == pytest.approx(0.4)
+    assert np.mean([row["loss"] for row in candidate_a]) > np.mean([row["loss"] for row in candidate_b])
+    assert macro_dataset_mean(candidate_a + [{"dataset": "a", "loss": 0.0}] * 20) == pytest.approx(0.3)
+
+
+def test_outer_holdout_validation_and_test_episodes_are_row_disjoint():
+    bags = [_toy_seen_bag("alpha", 0, bag) for bag in range(8)]
+    validation, test, manifest = make_outer_holdout_episodes(
+        bags,
+        datasets={"alpha"},
+        outer_seed=0,
+        validation_fraction=0.4,
+        context_fraction=0.5,
+        max_context_rows=512,
+        split_seed=123,
+    )
+    validation_rows = set(validation[0].support_x[0, :, 0].tolist()) | set(validation[0].guard_x[:, 0].tolist())
+    test_rows = set(test[0].support_x[0, :, 0].tolist()) | set(test[0].test_x[:, 0].tolist())
+    assert validation_rows.isdisjoint(test_rows)
+    assert validation_rows | test_rows == set(np.arange(80, dtype=np.float32).tolist())
+    assert set(validation[0].support_y.flatten().tolist()) == {0.0, 1.0}
+    assert set(test[0].support_y.flatten().tolist()) == {0.0, 1.0}
+    assert manifest[0]["validation_pool_rows"] + manifest[0]["test_pool_rows"] == 80
+
+
+def test_seen_bag_runner_smoke_test_is_end_to_end_and_writes_diagnostics(tmp_path):
+    class TinyBackbone(nn.Module):
+        def clear_cache(self):
+            return None
+
+        def forward(self, x, y_context):
+            query = x[:, y_context.shape[1] :]
+            score = query.mean(-1)
+            return torch.stack((-score, score), dim=-1)
+
+    bags = [
+        _toy_seen_bag(dataset, 0, bag, curve_value=0.01 * bag)
+        for dataset in ("alpha", "beta")
+        for bag in range(8)
+    ]
+    args = Namespace(
+        train_bags=list(range(6)), validation_bags=[6], test_bags=[7],
+        outer_validation_fraction=0.4, evaluation_context_fraction=0.5,
+        max_evaluation_context_rows=32, episode_split_seed=99, rank=3,
+        branch="normalization", hidden_dim=8, coefficient_bound=1.0,
+        location_bound=1.0, log_scale_bound=1.0, target_aware=True,
+        raw_context=True, gate_initial_probability=0.01, lr=1e-3,
+        steps=1, log_every=1, validate_every=1, regularization=1e-4,
+        gradient_clip=1.0, patience_validations=0,
+        historical_single_dataset_root=None,
+    )
+    summary, paired, per_dataset, consistency = run_one(
+        args,
+        TinyBackbone(),
+        bags,
+        {"alpha", "beta"},
+        outer_seed=0,
+        model_seed=0,
+        device=torch.device("cpu"),
+        run_dir=tmp_path,
+    )
+    assert summary["datasets"] == ["alpha", "beta"]
+    assert len(paired) == 2
+    assert len(per_dataset) == 2
+    assert len(consistency) == 2
+    for name in (
+        "manifest.json", "training.csv", "evaluations.csv", "paired_test.csv",
+        "parameter_consistency.csv", "selected_parameter_columns.csv",
+        "selected_parameters.pt", "summary.json", "best.pt",
+    ):
+        assert (tmp_path / name).is_file()
 
 
 def test_rank_basis_regularizer_is_differentiable():
@@ -85,6 +246,10 @@ def test_factorized_rank_basis_has_independent_bounded_gates_and_gradients():
     assert model.shape_encoder is not model.normalization_encoder
     assert parameters["shape_gate"].min() >= 0 and parameters["shape_gate"].max() <= 1
     assert parameters["normalization_gate"].min() >= 0 and parameters["normalization_gate"].max() <= 1
+    # The context-conditioned output method must not shadow nn.Module.parameters,
+    # which optimizers call without arguments.
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    assert optimizer.param_groups[0]["params"]
     objective = transformed.square().mean() + model.trust_region(parameters)
     objective.backward()
     assert any(parameter.grad is not None for parameter in model.shape_encoder.parameters())
