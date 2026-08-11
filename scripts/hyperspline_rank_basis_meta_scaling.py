@@ -595,7 +595,9 @@ def run_model_seed(
             batches = make_compatible_batches(
                 selected_real, source="real_meta", max_batch_size=working_backbone_batch_size
             ) + make_compatible_batches(
-                selected_synthetic, source="synthetic_native_prior", max_batch_size=working_backbone_batch_size
+                selected_synthetic,
+                source=f"synthetic_{args.synthetic_observation_mode}",
+                max_batch_size=working_backbone_batch_size,
             )
             if sum(batch.batch_size for batch in batches) != args.meta_batch_episodes:
                 raise AssertionError("meta-batch assembly lost an episode")
@@ -915,6 +917,12 @@ def add_synthetic_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--prior-type", choices=("mlp_scm", "tree_scm", "mix_scm", "graph_scm", "dummy"), default="mix_scm")
     parser.add_argument("--synthetic-sequence-length", type=int, default=512)
     parser.add_argument("--context-fraction", type=float, default=0.70)
+    parser.add_argument(
+        "--synthetic-observation-mode",
+        choices=("native", "coverage_expanded"),
+        default="native",
+        help="Keep native as the control, or apply the deterministic expanded observation model to synthetic columns.",
+    )
     parser.add_argument("--min-features", type=int, default=5)
     parser.add_argument("--max-features", type=int, default=100)
     parser.add_argument("--max-classes", type=int, default=10)

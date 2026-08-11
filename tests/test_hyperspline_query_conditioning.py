@@ -51,6 +51,13 @@ def test_capacity_matched_query_arms_have_identical_input_width():
     summaries = [model.conditioning_summary(context_stats, query_stats) for model in models]
     assert {summary.shape[-1] for summary in summaries} == {102}
     assert {model.mlp[1].weight.shape for model in models} == {torch.Size((8, 102))}
+    # Exercise the real forward paths as well.  In particular, context mode
+    # historically called generate_parameters directly rather than
+    # conditioning_summary, so capacity padding must also happen there.
+    for model in models:
+        transformed_context, transformed_query = model(context, query, y_context=labels)
+        assert transformed_context.shape == context.shape
+        assert transformed_query.shape == query.shape
 
 
 def test_query_conditioning_runner_smoke_test_uses_only_task_nll(tmp_path):

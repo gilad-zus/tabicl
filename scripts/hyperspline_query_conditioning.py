@@ -121,7 +121,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-every", type=int, default=25)
     parser.add_argument("--patience-validations", type=int, default=20)
     parser.add_argument("--evaluation-batch-size", type=int, default=2)
-    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--output-dir", type=Path, default=None,
+        help="Required for training/evaluation; not needed with --prepare-banks-only.",
+    )
     parser.add_argument("--resume", action="store_true")
     return parser.parse_args()
 
@@ -730,6 +733,8 @@ def main() -> None:
     if args.prepare_banks_only:
         print("Prepared row-disjoint pools and fixed validation/test episode banks; no model was trained.", flush=True)
         return
+    if args.output_dir is None:
+        raise ValueError("--output-dir is required unless --prepare-banks-only is set")
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")

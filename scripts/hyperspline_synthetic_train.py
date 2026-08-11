@@ -11,9 +11,9 @@ from __future__ import annotations
 import argparse
 import csv
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Sequence
 
 import numpy as np
 import torch
@@ -45,6 +45,99 @@ class SyntheticEpisode:
     y_context: torch.Tensor  # (1, N_C), float for TabICL
     y_query: torch.Tensor  # (N_Q,), long for CE
     n_classes: int
+    # ``native`` is exactly the historical TabICL prior output.  The expanded
+    # mode is an opt-in, deterministic *observation model* applied to feature
+    # values before the ICL split; it never accesses labels.
+    observation_mode: str = "native"
+
+
+SYNTHETIC_OBSERVATION_MODES = ("native", "coverage_expanded")
+
+
+def apply_synthetic_observation(
+    x: torch.Tensor,
+    *,
+    observation_mode: str,
+    seed: int,
+) -> torch.Tensor:
+    """Apply a deterministic, label-free observation model to synthetic columns.
+
+    The native TabICL prior standardises and clips numerical columns before it
+    returns them.  ``coverage_expanded`` deliberately keeps the *underlying
+    task and labels* fixed but restores a wider family of realistic observed
+    column shapes: skewed and heavy/light-tailed monotone responses, bounded
+    sensors, censoring, rounded measurements, and near-zero resolution floors.
+    Every operation is non-decreasing per column, so it does not fabricate a
+    feature--target relationship by reordering values.  It is applied before
+    the context/query split, avoiding a synthetic covariate shift by design.
+
+    Missingness is intentionally not injected here.  TabICL's current numeric
+    episode path has no missing-value mask; adding NaNs would only test an
+    accidental imputation path.  Missingness needs a separate mask-aware
+    episode protocol rather than arbitrary corruption.
+    """
+    if observation_mode not in SYNTHETIC_OBSERVATION_MODES:
+        raise ValueError(f"unknown synthetic observation mode {observation_mode!r}")
+    if observation_mode == "native":
+        return x
+    if x.ndim != 2:
+        raise ValueError("synthetic observation model expects one task shaped (N, D)")
+
+    # The prior itself generates on CPU.  Keeping this small, deterministic
+    # augmentation on CPU makes fixed banks bitwise reproducible regardless of
+    # the GPU used for later HyperSpline training.
+    original_device, original_dtype = x.device, x.dtype
+    values = x.detach().to(device="cpu", dtype=torch.float32).clone()
+    generator = torch.Generator(device="cpu").manual_seed(int(seed) % (2**63 - 1))
+    n_features = values.shape[1]
+    primary = torch.randint(0, 7, (n_features,), generator=generator)
+
+    def uniform(low: float, high: float) -> float:
+        return float(torch.empty((), dtype=values.dtype).uniform_(low, high, generator=generator))
+
+    for column in range(n_features):
+        z = values[:, column].clamp(-12.0, 12.0)
+        family = int(primary[column])
+        if family == 0:
+            # Concave/convex signed powers vary concentration and tail weight.
+            exponent = uniform(0.35, 0.80) if bool(torch.randint(0, 2, (), generator=generator)) else uniform(1.35, 2.40)
+            z = z.sign() * z.abs().pow(exponent)
+        elif family == 1:
+            # Smooth asymmetric exponential sensor response (and its mirror).
+            strength, direction = uniform(0.18, 0.70), -1.0 if bool(torch.randint(0, 2, (), generator=generator)) else 1.0
+            z = direction * torch.expm1(direction * strength * z) / strength
+        elif family == 2:
+            # Bounded/saturating measurement scale.
+            bound, strength = uniform(0.8, 2.5), uniform(0.35, 1.20)
+            z = bound * torch.tanh(strength * z)
+        elif family == 3:
+            # Symmetric log compression creates lighter tails without a bound.
+            strength = uniform(0.25, 1.25)
+            z = z.sign() * torch.log1p(strength * z.abs()) / strength
+        elif family == 4:
+            # Asymmetric tail response: a simple monotone piecewise sensor.
+            positive, negative = uniform(1.0, 3.5), uniform(0.35, 1.0)
+            z = torch.where(z >= 0, positive * z, negative * z)
+        elif family == 5:
+            # Censored instrument with a random lower/upper reporting range.
+            low, high = uniform(-2.5, -0.25), uniform(0.25, 2.5)
+            z = z.clamp(low, high)
+        else:
+            # Outlier-prone response: only far tails are stretched.
+            threshold, stretch = uniform(0.6, 1.8), uniform(1.5, 4.0)
+            z = z.sign() * torch.where(z.abs() <= threshold, z.abs(), threshold + stretch * (z.abs() - threshold))
+
+        # Measurement resolution and a near-zero dead zone are each optional.
+        # Both remain non-decreasing, so any lost information is realistic
+        # coarsening rather than a label-dependent perturbation.
+        if bool(torch.randint(0, 2, (), generator=generator)):
+            step = uniform(0.04, 0.35) * z.detach().std().clamp_min(0.25).item()
+            z = torch.round(z / step) * step
+        if bool(torch.randint(0, 2, (), generator=generator)):
+            dead_zone = uniform(0.02, 0.35) * z.detach().std().clamp_min(0.25).item()
+            z = torch.where(z.abs() < dead_zone, torch.zeros_like(z), z)
+        values[:, column] = torch.nan_to_num(z, nan=0.0, posinf=100.0, neginf=-100.0).clamp(-100.0, 100.0)
+    return values.to(device=original_device, dtype=original_dtype)
 
 
 def seed_generator(seed: int) -> None:
@@ -67,13 +160,21 @@ def prepare_episode(
     task_id: int,
     source_seed: int,
     device: torch.device,
+    observation_mode: str = "native",
 ) -> SyntheticEpisode:
     n_rows = int(sequence_lengths[index])
     n_context = int(context_sizes[index])
     n_features = int(active_features[index])
     if not 0 < n_context < n_rows:
         raise ValueError(f"synthetic task {task_id} has invalid split {n_context}/{n_rows}")
-    x = x_batch[index, :n_rows, :n_features].to(device=device, dtype=torch.float32)
+    native_x = x_batch[index, :n_rows, :n_features]
+    x = apply_synthetic_observation(
+        native_x,
+        observation_mode=observation_mode,
+        # Distinct, reproducible column draws for every prior task, including
+        # streaming training tasks whose task_id is monotonically increasing.
+        seed=int(source_seed) + 1_000_003 * int(task_id),
+    ).to(device=device, dtype=torch.float32)
     # The generator labels are made contiguous once over the complete task, not
     # separately for context/query, so query classes retain their true index.
     classes, y = torch.unique(y_batch[index, :n_rows].to(torch.long), sorted=True, return_inverse=True)
@@ -85,6 +186,7 @@ def prepare_episode(
         y_context=y[:n_context].to(device=device, dtype=torch.float32).unsqueeze(0),
         y_query=y[n_context:].to(device=device, dtype=torch.long),
         n_classes=int(classes.numel()),
+        observation_mode=observation_mode,
     )
 
 
@@ -99,6 +201,9 @@ def generate_episodes(
     """Generate ``count`` tasks; a seed is used only for fixed evaluation banks."""
     if source_seed is not None:
         seed_generator(source_seed)
+    observation_mode = getattr(args, "synthetic_observation_mode", "native")
+    if observation_mode not in SYNTHETIC_OBSERVATION_MODES:
+        raise ValueError(f"unknown synthetic observation mode {observation_mode!r}")
     prior_args = argparse.Namespace(**vars(args), tasks=count)
     prior = make_prior(prior_args)
     x_batch, y_batch, active_features, sequence_lengths, context_sizes = prior.get_batch()
@@ -113,18 +218,77 @@ def generate_episodes(
             task_id=task_offset + index,
             source_seed=source_seed if source_seed is not None else args.train_seed,
             device=device,
+            observation_mode=observation_mode,
         )
         for index in range(count)
     ]
     return episodes
 
 
+def generate_scheduled_episodes(
+    args: argparse.Namespace,
+    count: int,
+    *,
+    source_seed: int,
+    task_offset: int,
+    device: torch.device,
+    sequence_lengths: Sequence[int],
+    context_fractions: Sequence[float],
+    observation_mode: str,
+) -> list[SyntheticEpisode]:
+    """Generate a balanced fixed bank across row counts and context fractions.
+
+    This helper is intentionally for diagnostics/bank construction, where
+    variable task shapes are welcome.  Existing streaming training remains
+    unchanged and therefore retains uniform shapes and batching behavior.
+    Calling this with ``native`` and ``coverage_expanded`` uses identical
+    schedules, prior seeds, labels, sizes, and feature counts; only observed
+    numerical values differ.
+    """
+    if count <= 0:
+        return []
+    if observation_mode not in SYNTHETIC_OBSERVATION_MODES:
+        raise ValueError(f"unknown synthetic observation mode {observation_mode!r}")
+    lengths = tuple(sorted({int(value) for value in sequence_lengths}))
+    fractions = tuple(sorted({float(value) for value in context_fractions}))
+    if not lengths or min(lengths) < 4 or not fractions or not all(0.0 < value < 1.0 for value in fractions):
+        raise ValueError("scheduled synthetic lengths must be >=4 and context fractions must lie in (0, 1)")
+    choices = [(length, fraction) for length in lengths for fraction in fractions]
+    # Cycle a shuffled copy of the full Cartesian schedule.  This ensures every
+    # requested size/split receives almost exactly equal coverage.
+    selector = np.random.default_rng(int(source_seed) + 73_991)
+    order = np.asarray([choices[index % len(choices)] for index in range(count)], dtype=object)
+    selector.shuffle(order)
+    grouped: dict[tuple[int, float], list[int]] = {}
+    for index, (length, fraction) in enumerate(order.tolist()):
+        grouped.setdefault((int(length), float(fraction)), []).append(index)
+    result: list[SyntheticEpisode | None] = [None] * count
+    for group_index, ((length, fraction), indices) in enumerate(sorted(grouped.items())):
+        group_args = argparse.Namespace(**vars(args))
+        group_args.sequence_length = length
+        group_args.context_fraction = fraction
+        group_args.synthetic_observation_mode = observation_mode
+        generated = generate_episodes(
+            group_args,
+            len(indices),
+            source_seed=int(source_seed) + 10_000_019 * (group_index + 1),
+            task_offset=0,
+            device=device,
+        )
+        for local_index, output_index in enumerate(indices):
+            result[output_index] = replace(generated[local_index], task_id=task_offset + output_index)
+    if any(episode is None for episode in result):  # Defensive: a schedule bug should never silently drop a task.
+        raise AssertionError("scheduled synthetic generation did not fill every task")
+    return [episode for episode in result if episode is not None]
+
+
 def save_episode_bank(path: Path, episodes: list[SyntheticEpisode], *, source_seed: int) -> None:
     """Persist a fixed synthetic bank so every ablation consumes identical tensors."""
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "format_version": 1,
+        "format_version": 2,
         "source_seed": source_seed,
+        "observation_mode": episodes[0].observation_mode if episodes else "native",
         "episodes": [
             {
                 "task_id": episode.task_id,
@@ -134,6 +298,7 @@ def save_episode_bank(path: Path, episodes: list[SyntheticEpisode], *, source_se
                 "y_context": episode.y_context.cpu(),
                 "y_query": episode.y_query.cpu(),
                 "n_classes": episode.n_classes,
+                "observation_mode": episode.observation_mode,
             }
             for episode in episodes
         ],
@@ -142,14 +307,26 @@ def save_episode_bank(path: Path, episodes: list[SyntheticEpisode], *, source_se
     print(f"Saved fixed synthetic bank with {len(episodes)} episodes to {path}", flush=True)
 
 
-def load_episode_bank(path: Path, *, expected_seed: int, expected_count: int, device: torch.device) -> list[SyntheticEpisode]:
+def load_episode_bank(
+    path: Path,
+    *,
+    expected_seed: int,
+    expected_count: int,
+    device: torch.device,
+    expected_observation_mode: str = "native",
+) -> list[SyntheticEpisode]:
     """Load and validate a fixed synthetic bank created by :func:`save_episode_bank`."""
     payload = torch.load(path, map_location="cpu", weights_only=True)
-    if payload.get("format_version") != 1:
+    if payload.get("format_version") not in {1, 2}:
         raise ValueError(f"unsupported synthetic bank format: {path}")
     if payload.get("source_seed") != expected_seed:
         raise ValueError(f"synthetic bank {path} has source seed {payload.get('source_seed')}, expected {expected_seed}")
     stored = payload.get("episodes", [])
+    stored_mode = payload.get("observation_mode", "native")
+    if stored_mode != expected_observation_mode:
+        raise ValueError(
+            f"synthetic bank {path} has observation mode {stored_mode!r}, expected {expected_observation_mode!r}"
+        )
     if len(stored) != expected_count:
         raise ValueError(f"synthetic bank {path} has {len(stored)} episodes, expected {expected_count}")
     episodes = [
@@ -161,10 +338,13 @@ def load_episode_bank(path: Path, *, expected_seed: int, expected_count: int, de
             y_context=item["y_context"].to(device=device),
             y_query=item["y_query"].to(device=device),
             n_classes=int(item["n_classes"]),
+            observation_mode=str(item.get("observation_mode", stored_mode)),
         )
         for item in stored
     ]
-    print(f"Loaded fixed synthetic bank with {len(episodes)} episodes from {path}", flush=True)
+    print(
+        f"Loaded fixed synthetic bank with {len(episodes)} episodes ({stored_mode}) from {path}", flush=True
+    )
     return episodes
 
 
@@ -178,7 +358,13 @@ def get_fixed_episode_bank(
     device: torch.device,
 ) -> list[SyntheticEpisode]:
     if path is not None and path.is_file():
-        return load_episode_bank(path, expected_seed=source_seed, expected_count=count, device=device)
+        return load_episode_bank(
+            path,
+            expected_seed=source_seed,
+            expected_count=count,
+            device=device,
+            expected_observation_mode=getattr(args, "synthetic_observation_mode", "native"),
+        )
     episodes = generate_episodes(args, count, source_seed=source_seed, task_offset=task_offset, device=device)
     if path is not None:
         save_episode_bank(path, episodes, source_seed=source_seed)
@@ -333,6 +519,15 @@ def main() -> None:
     parser.add_argument("--prior-type", choices=("mlp_scm", "tree_scm", "mix_scm", "graph_scm", "dummy"), default="mix_scm")
     parser.add_argument("--sequence-length", type=int, default=256)
     parser.add_argument("--context-fraction", type=float, default=0.70)
+    parser.add_argument(
+        "--synthetic-observation-mode",
+        choices=SYNTHETIC_OBSERVATION_MODES,
+        default="native",
+        help=(
+            "Observed numerical-column family after native prior generation. "
+            "native preserves historical experiments exactly; coverage_expanded is opt-in."
+        ),
+    )
     parser.add_argument("--min-features", type=int, default=5)
     parser.add_argument("--max-features", type=int, default=100)
     parser.add_argument("--max-classes", type=int, default=10)

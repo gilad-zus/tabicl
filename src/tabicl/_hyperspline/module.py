@@ -380,7 +380,7 @@ class HyperSplineTransform(nn.Module):
                 ),
                 dim=-1,
             )
-            raw = self.mlp(marginal_summary)
+            raw = self.mlp(self._capacity_match_conditioning(marginal_summary))
             if self.raw_context_residual:
                 if x_context is None or y_context is None:
                     raise ValueError("raw_context_residual requires x_context and y_context")
@@ -393,14 +393,16 @@ class HyperSplineTransform(nn.Module):
                 )
             raw = raw + residual_raw
         else:
-            raw = self.mlp(statistics.summary)
+            raw = self.mlp(self._capacity_match_conditioning(statistics.summary))
             residual_gate = None
         return raw, residual_gate
 
     def generate_marginal_parameters(self, statistics: ColumnStatistics) -> HyperSplineParameters:
         """Generate the frozen marginal reference used by residual stabilizers."""
         if not self.has_supervised_residual:
-            return self._parameters_from_raw(self.mlp(statistics.summary), statistics, None)
+            return self._parameters_from_raw(
+                self.mlp(self._capacity_match_conditioning(statistics.summary)), statistics, None
+            )
         marginal_summary = torch.cat(
             (
                 statistics.summary[..., :UNSUPERVISED_SUMMARY_DIM],
@@ -408,7 +410,9 @@ class HyperSplineTransform(nn.Module):
             ),
             dim=-1,
         )
-        return self._parameters_from_raw(self.mlp(marginal_summary), statistics, None)
+        return self._parameters_from_raw(
+            self.mlp(self._capacity_match_conditioning(marginal_summary)), statistics, None
+        )
 
     def _parameters_from_raw(
         self,
