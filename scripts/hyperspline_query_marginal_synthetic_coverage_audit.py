@@ -504,6 +504,18 @@ def main() -> None:
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("--device requested CUDA but CUDA is unavailable")
+    if device.type == "cuda":
+        if device.index is not None:
+            torch.cuda.set_device(device)
+        current = torch.cuda.current_device()
+        expected = current if device.index is None else device.index
+        if current != expected:
+            raise RuntimeError(f"failed to activate requested --device {device}; current CUDA device is cuda:{current}")
+        print(
+            f"CUDA routing: descriptor batches={device}; process-current=cuda:{current}; "
+            "synthetic and real banks remain on CPU between batches.",
+            flush=True,
+        )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     # Do not materialize the entire audit corpus on CUDA.  ``extract_points``
     # transfers one homogeneous mini-batch at a time; optional DirectSpline

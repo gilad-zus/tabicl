@@ -54,6 +54,20 @@ class SyntheticEpisode:
 SYNTHETIC_OBSERVATION_MODES = ("native", "coverage_expanded")
 
 
+def activate_episode_device(device: torch.device | str) -> torch.device:
+    """Return the requested device after making a CUDA index process-current.
+
+    Synthetic prior generation itself is CPU-only, but generated episode
+    tensors are later moved to this device.  Activating ``cuda:N`` here makes
+    any unqualified CUDA allocation made by a downstream dependency use the
+    same GPU instead of the process default (normally cuda:0).
+    """
+    resolved = torch.device(device)
+    if resolved.type == "cuda" and resolved.index is not None:
+        torch.cuda.set_device(resolved)
+    return resolved
+
+
 def apply_synthetic_observation(
     x: torch.Tensor,
     *,
@@ -199,6 +213,7 @@ def generate_episodes(
     device: torch.device,
 ) -> list[SyntheticEpisode]:
     """Generate ``count`` tasks; a seed is used only for fixed evaluation banks."""
+    device = activate_episode_device(device)
     if source_seed is not None:
         seed_generator(source_seed)
     observation_mode = getattr(args, "synthetic_observation_mode", "native")
@@ -628,8 +643,14 @@ def main() -> None:
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but torch.cuda.is_available() is False")
     if device.type == "cuda":
+        if device.index is not None:
+            torch.cuda.set_device(device)
+        current = torch.cuda.current_device()
+        expected = current if device.index is None else device.index
+        if current != expected:
+            raise RuntimeError(f"failed to activate requested --device {device}; current CUDA device is cuda:{current}")
         torch.cuda.manual_seed_all(args.train_seed)
-        print(f"Running on CUDA device: {torch.cuda.get_device_name(device)}", flush=True)
+        print(f"Running on CUDA device: {device} ({torch.cuda.get_device_name(device)})", flush=True)
     backbone, _ = load_backbone(args, device)
     if args.max_classes > backbone.max_classes:
         raise ValueError(f"--max-classes exceeds frozen backbone maximum {backbone.max_classes}")

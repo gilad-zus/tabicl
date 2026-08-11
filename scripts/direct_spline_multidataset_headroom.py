@@ -48,6 +48,20 @@ def parse_csv(value: str, converter: Callable[[str], object]) -> list:
 
 
 def load_backbone(args: argparse.Namespace, device: torch.device) -> tuple[TabICL, Path]:
+    # ``tensor.to(cuda:N)`` is explicit, but some internal/third-party CUDA
+    # allocations use PyTorch's process-current device.  Pin it before model
+    # construction so a caller's --device cuda:N is never silently split with
+    # generic ``cuda`` allocations on GPU 0.
+    device = torch.device(device)
+    if device.type == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError(f"requested CUDA device {device}, but CUDA is unavailable")
+        if device.index is not None:
+            torch.cuda.set_device(device)
+        current = torch.cuda.current_device()
+        expected = current if device.index is None else device.index
+        if current != expected:
+            raise RuntimeError(f"failed to activate requested CUDA device {device}; current device is cuda:{current}")
     if args.checkpoint is None:
         print(
             f"No checkpoint provided; resolving {args.checkpoint_version!r} from jingang/TabICL.",

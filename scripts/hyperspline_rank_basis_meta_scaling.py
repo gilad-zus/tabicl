@@ -1021,7 +1021,13 @@ def main() -> None:
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but unavailable")
     if device.type == "cuda":
-        print(f"Running on CUDA device: {torch.cuda.get_device_name(device)}", flush=True)
+        if device.index is not None:
+            torch.cuda.set_device(device)
+        current = torch.cuda.current_device()
+        expected = current if device.index is None else device.index
+        if current != expected:
+            raise RuntimeError(f"failed to activate requested --device {device}; current CUDA device is cuda:{current}")
+        print(f"Running on CUDA device: {device} ({torch.cuda.get_device_name(device)})", flush=True)
     backbone, _ = load_backbone(args, device)
     if args.max_classes > backbone.max_classes:
         raise ValueError(f"--max-classes={args.max_classes} exceeds frozen backbone maximum {backbone.max_classes}")

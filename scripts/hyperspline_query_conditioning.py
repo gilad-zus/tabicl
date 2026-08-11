@@ -738,6 +738,13 @@ def main() -> None:
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")
+    if device.type == "cuda":
+        if device.index is not None:
+            torch.cuda.set_device(device)
+        current = torch.cuda.current_device()
+        expected = current if device.index is None else device.index
+        if current != expected:
+            raise RuntimeError(f"failed to activate requested --device {device}; current CUDA device is cuda:{current}")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     backbone, _ = load_backbone(args, device)
     # TabICL's ``train`` path is the frozen differentiable forward used by
