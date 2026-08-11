@@ -189,6 +189,21 @@ def build_episode_from_pmlb(
     x_context, x_query, y_context, y_query = train_test_split(
         x, target, test_size=test_size, random_state=seed, stratify=target
     )
+    # PMLB TSVs occasionally encode missing values as NaN.  Fit the imputer on
+    # the context rows only, mirroring the final real-data preprocessing and
+    # keeping query-feature values out of the context representation.
+    context_finite = np.isfinite(x_context)
+    query_finite = np.isfinite(x_query)
+    context_for_median = np.where(context_finite, x_context, np.nan)
+    medians = np.nanmedian(context_for_median, axis=0)
+    if not np.isfinite(medians).all():
+        bad_columns = np.flatnonzero(~np.isfinite(medians)).tolist()
+        raise ValueError(f"PMLB {source_name} has no finite context value in columns {bad_columns}")
+    repaired = int((~context_finite).sum() + (~query_finite).sum())
+    x_context = np.where(context_finite, x_context, medians).astype(np.float32, copy=False)
+    x_query = np.where(query_finite, x_query, medians).astype(np.float32, copy=False)
+    if repaired:
+        print(f"[PMLB={name} seed={seed}] context-median-imputed {repaired} non-finite feature values", flush=True)
     return RealEpisode(
         dataset=f"pmlb_{name}",
         dataset_group="real_meta",

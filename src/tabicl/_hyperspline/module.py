@@ -53,6 +53,7 @@ class HyperSplineTransform(nn.Module):
         raw_context_num_heads: int = 4,
         raw_context_residual_bound: float = 0.5,
         raw_context_gate_initial_probability: float = 0.5,
+        conditioning_mode: str = "context",
         eps: float = 1e-6,
     ) -> None:
         super().__init__()
@@ -67,6 +68,15 @@ class HyperSplineTransform(nn.Module):
             raise ValueError("supervised residuals require target_aware=True")
         if residual_variants > 1:
             raise ValueError("supervised residual variants are mutually exclusive")
+        if conditioning_mode not in {"context", "query_marginal", "context_query_shift"}:
+            raise ValueError(
+                "conditioning_mode must be one of: context, query_marginal, context_query_shift"
+            )
+        if conditioning_mode != "context" and residual_variants:
+            raise ValueError(
+                "query-aware conditioning is currently the simple shared-MLP path; "
+                "disable supervised/cross-column/raw-context residual variants"
+            )
         if not 0 < supervised_residual_gate_initial_probability < 1:
             raise ValueError("supervised_residual_gate_initial_probability must be in (0, 1)")
         if cross_column_num_heads <= 0 or hidden_dim % cross_column_num_heads:
@@ -95,6 +105,7 @@ class HyperSplineTransform(nn.Module):
         self.cross_column_residual_bound = cross_column_residual_bound
         self.raw_context_residual = raw_context_residual
         self.raw_context_residual_bound = raw_context_residual_bound
+        self.conditioning_mode = conditioning_mode
         self.eps = eps
         knots = uniform_augmented_knots(n_control_points, degree)
         identity = greville_abscissae(knots, degree, n_control_points)
@@ -102,9 +113,21 @@ class HyperSplineTransform(nn.Module):
         self.register_buffer("identity_control_points", identity)
         self.register_buffer("identity_gaps", identity[1:] - identity[:-1])
         output_dim = (n_control_points - 1) + 3
+        conditioning_dim = SUMMARY_DIM
+        if conditioning_mode == "query_marginal":
+            # The query's standardized shape statistics alone deliberately
+            # discard its native mean/scale.  Preserve its alignment to the
+            # context coordinate system explicitly.
+            conditioning_dim += 2
+        elif conditioning_mode == "context_query_shift":
+            # Full context statistics (including the eight label-aware terms),
+            # followed by query marginal statistics and signed/absolute
+            # per-statistic shift features.  Query labels never enter here.
+            conditioning_dim += 3 * UNSUPERVISED_SUMMARY_DIM + 2
+        self.conditioning_dim = conditioning_dim
         self.mlp = nn.Sequential(
-            nn.LayerNorm(SUMMARY_DIM),
-            nn.Linear(SUMMARY_DIM, hidden_dim),
+            nn.LayerNorm(conditioning_dim),
+            nn.Linear(conditioning_dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
@@ -440,6 +463,36 @@ class HyperSplineTransform(nn.Module):
             transformed = transformed.masked_fill(missing, 0.0)
         return transformed.to(original_dtype)
 
+    def conditioning_summary(
+        self,
+        context_statistics: ColumnStatistics,
+        query_statistics: Optional[ColumnStatistics] = None,
+    ) -> torch.Tensor:
+        """Return the per-column feature vector consumed by the shared MLP.
+
+        ``context`` retains the original architecture exactly.  The two
+        transductive modes keep all label-aware entries context-only; the
+        query contributes only marginal feature statistics.  A single set of
+        generated parameters is still applied to both context and query rows.
+        """
+        if self.conditioning_mode == "context":
+            return context_statistics.summary
+        if query_statistics is None:
+            raise ValueError(f"conditioning_mode={self.conditioning_mode!r} requires x_query statistics")
+        query_marginal = query_statistics.summary[..., :UNSUPERVISED_SUMMARY_DIM]
+        relative_location = (query_statistics.location - context_statistics.location) / context_statistics.scale
+        log_scale_ratio = (query_statistics.scale / context_statistics.scale).clamp_min(self.eps).log()
+        alignment = torch.stack((relative_location, log_scale_ratio), dim=-1)
+        if self.conditioning_mode == "query_marginal":
+            return torch.cat(
+                (query_marginal, context_statistics.summary[..., -SUPERVISED_SUMMARY_DIM:], alignment), dim=-1
+            )
+        context_marginal = context_statistics.summary[..., :UNSUPERVISED_SUMMARY_DIM]
+        shift = query_marginal - context_marginal
+        return torch.cat(
+            (context_statistics.summary, query_marginal, shift, shift.abs(), alignment), dim=-1
+        )
+
     def forward(
         self,
         x_context: torch.Tensor,
@@ -453,12 +506,20 @@ class HyperSplineTransform(nn.Module):
         statistics = summarize_context(
             x_context, context_missing, y_context if self.target_aware else None, eps=self.eps
         )
-        parameters = self.generate_parameters(
-            statistics,
-            x_context=x_context,
-            y_context=y_context if self.target_aware else None,
-            context_missing=context_missing,
-        )
+        if self.conditioning_mode == "context":
+            parameters = self.generate_parameters(
+                statistics,
+                x_context=x_context,
+                y_context=y_context if self.target_aware else None,
+                context_missing=context_missing,
+            )
+        else:
+            # Do not route y_query through this path.  The context
+            # statistics still provide class-invariant label-aware terms;
+            # query features contribute only their marginal distribution.
+            query_statistics = summarize_context(x_query, query_missing, eps=self.eps)
+            raw = self.mlp(self.conditioning_summary(statistics, query_statistics))
+            parameters = self._parameters_from_raw(raw, statistics, None)
         context_out = self.apply_transform(x_context, parameters, context_missing)
         query_out = self.apply_transform(x_query, parameters, query_missing)
         if return_parameters:
