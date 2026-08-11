@@ -37,12 +37,33 @@ def test_query_marginal_mode_rejects_complex_residual_variants():
         )
 
 
+def test_capacity_matched_query_arms_have_identical_input_width():
+    context = torch.randn(1, 8, 3)
+    query = torch.randn(1, 5, 3)
+    labels = torch.tensor([[0.0, 1.0] * 4])
+    context_stats = summarize_context(context, y_context=labels)
+    query_stats = summarize_context(query)
+    models = [
+        HyperSplineTransform(n_control_points=6, hidden_dim=8, target_aware=True,
+                             conditioning_mode=mode, capacity_matched_conditioning=True)
+        for mode in ("context", "query_marginal", "context_query_shift")
+    ]
+    summaries = [model.conditioning_summary(context_stats, query_stats) for model in models]
+    assert {summary.shape[-1] for summary in summaries} == {102}
+    assert {model.mlp[1].weight.shape for model in models} == {torch.Size((8, 102))}
+
+
 def test_query_conditioning_runner_smoke_test_uses_only_task_nll(tmp_path):
     class TinyBackbone(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
         def clear_cache(self):
             return None
 
         def forward(self, x, y_context):
+            self.calls += 1
             query = x[:, y_context.shape[1] :]
             score = query.mean(-1)
             return torch.stack((-score, score), dim=-1)
@@ -62,15 +83,20 @@ def test_query_conditioning_runner_smoke_test_uses_only_task_nll(tmp_path):
     args = Namespace(
         output_dir=tmp_path, resume=False, arm="context_query_shift", n_control_points=6, hidden_dim=8,
         generate_location=False, generate_scale=False, gate_initial_probability=0.01, target_aware=True,
-        lr=1e-3, train_seed=19, tasks_per_step=1, max_backbone_batch_size=1, steps=1,
+        lr=1e-3, train_seed=19, tasks_per_step=2, max_backbone_batch_size=1, steps=1,
         context_rows=12, query_rows=8, log_every=1, gradient_clip=1.0, validate_every=1,
         patience_validations=0, evaluation_batch_size=1,
     )
+    backbone = TinyBackbone()
     summary = run_model_seed(
-        args, backbone=TinyBackbone(), pools=pools, validation=validation, test=test,
+        args, backbone=backbone, pools=pools, validation=validation, test=test,
         model_seed=0, device=torch.device("cpu"),
     )
     assert summary["status"] == "complete"
     assert summary["protocol"].endswith("TabICL query NLL only")
+    # 2 identity-validation + 2 identity-test + 2 training microbatches +
+    # 2 validation + 2 selected-validation + 2 selected-test calls.  The
+    # old implementation silently used one task here despite tasks_per_step=2.
+    assert backbone.calls == 12
     for name in ("manifest.json", "training.csv", "evaluations.csv", "paired_test.csv", "per_dataset.csv", "best.pt", "summary.json"):
         assert (tmp_path / "model_seed_0" / name).is_file()

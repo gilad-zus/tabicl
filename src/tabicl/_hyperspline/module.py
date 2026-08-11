@@ -54,6 +54,7 @@ class HyperSplineTransform(nn.Module):
         raw_context_residual_bound: float = 0.5,
         raw_context_gate_initial_probability: float = 0.5,
         conditioning_mode: str = "context",
+        capacity_matched_conditioning: bool = False,
         eps: float = 1e-6,
     ) -> None:
         super().__init__()
@@ -106,6 +107,7 @@ class HyperSplineTransform(nn.Module):
         self.raw_context_residual = raw_context_residual
         self.raw_context_residual_bound = raw_context_residual_bound
         self.conditioning_mode = conditioning_mode
+        self.capacity_matched_conditioning = capacity_matched_conditioning
         self.eps = eps
         knots = uniform_augmented_knots(n_control_points, degree)
         identity = greville_abscissae(knots, degree, n_control_points)
@@ -113,6 +115,11 @@ class HyperSplineTransform(nn.Module):
         self.register_buffer("identity_control_points", identity)
         self.register_buffer("identity_gaps", identity[1:] - identity[:-1])
         output_dim = (n_control_points - 1) + 3
+        # Keep the original context-only parameterisation by default.  The
+        # query-conditioning ablation can opt into the largest input width for
+        # every arm, with unavailable feature groups represented by zeros.  It
+        # therefore isolates information content from first-layer capacity.
+        max_query_conditioning_dim = SUMMARY_DIM + 3 * UNSUPERVISED_SUMMARY_DIM + 2
         conditioning_dim = SUMMARY_DIM
         if conditioning_mode == "query_marginal":
             # The query's standardized shape statistics alone deliberately
@@ -124,6 +131,8 @@ class HyperSplineTransform(nn.Module):
             # followed by query marginal statistics and signed/absolute
             # per-statistic shift features.  Query labels never enter here.
             conditioning_dim += 3 * UNSUPERVISED_SUMMARY_DIM + 2
+        if capacity_matched_conditioning:
+            conditioning_dim = max_query_conditioning_dim
         self.conditioning_dim = conditioning_dim
         self.mlp = nn.Sequential(
             nn.LayerNorm(conditioning_dim),
@@ -476,7 +485,8 @@ class HyperSplineTransform(nn.Module):
         generated parameters is still applied to both context and query rows.
         """
         if self.conditioning_mode == "context":
-            return context_statistics.summary
+            summary = context_statistics.summary
+            return self._capacity_match_conditioning(summary)
         if query_statistics is None:
             raise ValueError(f"conditioning_mode={self.conditioning_mode!r} requires x_query statistics")
         query_marginal = query_statistics.summary[..., :UNSUPERVISED_SUMMARY_DIM]
@@ -484,14 +494,26 @@ class HyperSplineTransform(nn.Module):
         log_scale_ratio = (query_statistics.scale / context_statistics.scale).clamp_min(self.eps).log()
         alignment = torch.stack((relative_location, log_scale_ratio), dim=-1)
         if self.conditioning_mode == "query_marginal":
-            return torch.cat(
+            summary = torch.cat(
                 (query_marginal, context_statistics.summary[..., -SUPERVISED_SUMMARY_DIM:], alignment), dim=-1
             )
+            return self._capacity_match_conditioning(summary)
         context_marginal = context_statistics.summary[..., :UNSUPERVISED_SUMMARY_DIM]
         shift = query_marginal - context_marginal
-        return torch.cat(
+        summary = torch.cat(
             (context_statistics.summary, query_marginal, shift, shift.abs(), alignment), dim=-1
         )
+        return self._capacity_match_conditioning(summary)
+
+    def _capacity_match_conditioning(self, summary: torch.Tensor) -> torch.Tensor:
+        """Right-pad ablation inputs to the common query-conditioning width."""
+        if not self.capacity_matched_conditioning:
+            return summary
+        if summary.shape[-1] > self.conditioning_dim:
+            raise RuntimeError("conditioning summary exceeds the configured common width")
+        if summary.shape[-1] == self.conditioning_dim:
+            return summary
+        return torch.nn.functional.pad(summary, (0, self.conditioning_dim - summary.shape[-1]))
 
     def forward(
         self,

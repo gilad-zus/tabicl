@@ -16,7 +16,7 @@ The three paired arms differ *only* in the per-column conditioner input:
     Context statistics, query marginal statistics, and signed/absolute
     context-to-query marginal shifts, plus label-aware context statistics.
 
-Every arm has the same small shared MLP, direct bounded monotone spline
+Every arm has the same capacity-matched small shared MLP, direct bounded monotone spline
 output, identity initialization, frozen TabICL backbone, row pools, episodes,
 seeds, optimizer, and the sole training objective: TabICL query NLL.  Query
 labels never enter parameter generation.
@@ -28,6 +28,7 @@ import argparse
 import copy
 import csv
 import gc
+import hashlib
 import json
 import time
 from collections import defaultdict
@@ -55,7 +56,7 @@ except ModuleNotFoundError:  # pragma: no cover - direct script invocation.
 
 
 DEFAULT_DATASETS = ("magic", "phoneme", "spambase", "pendigits")
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -164,12 +165,39 @@ def save_pools(path: Path, pools: Sequence[RowPool], *, datasets: Sequence[str],
     print(f"Saved permanent row pools for {len(datasets)} datasets to {path}", flush=True)
 
 
-def load_pools(path: Path, *, datasets: Sequence[str]) -> list[RowPool]:
+def _fractions(args: argparse.Namespace) -> dict[str, float]:
+    return {
+        "train": args.train_row_fraction,
+        "validation": args.validation_row_fraction,
+        "test": args.test_row_fraction,
+    }
+
+
+def pool_signature(pools: Sequence[RowPool]) -> str:
+    """Stable identity for the exact rows backing a fixed episode bank."""
+    digest = hashlib.sha256()
+    for pool in sorted(pools, key=lambda item: (item.dataset, item.split)):
+        digest.update(pool.dataset.encode("utf8"))
+        digest.update(pool.split.encode("utf8"))
+        for array in (pool.x, pool.y):
+            contiguous = np.ascontiguousarray(array)
+            digest.update(str(contiguous.dtype).encode("ascii"))
+            digest.update(np.asarray(contiguous.shape, dtype=np.int64).tobytes())
+            digest.update(contiguous.tobytes())
+    return digest.hexdigest()
+
+
+def load_pools(path: Path, *, datasets: Sequence[str], args: argparse.Namespace) -> list[RowPool]:
     payload = torch.load(path, map_location="cpu", weights_only=True)
     if payload.get("format_version") != FORMAT_VERSION:
         raise ValueError(f"unsupported row-pool bank format: {path}")
     if tuple(payload.get("datasets", ())) != tuple(datasets):
         raise ValueError(f"row-pool bank datasets differ from requested datasets: {path}")
+    if payload.get("pool_seed") != args.pool_seed or payload.get("fractions") != _fractions(args):
+        raise ValueError(
+            f"row-pool bank settings differ from the requested pool seed/fractions: {path}. "
+            "Use matching arguments or regenerate all fixed banks."
+        )
     pools = [
         RowPool(
             dataset=str(item["dataset"]), split=str(item["split"]),
@@ -267,11 +295,18 @@ def make_episode(pool: RowPool, *, stage: str, episode_id: int, source_seed: int
     )
 
 
-def save_episode_bank(path: Path, episodes: Sequence[Episode], *, stage: str, datasets: Sequence[str], seed: int) -> None:
+def save_episode_bank(
+    path: Path, episodes: Sequence[Episode], *, stage: str, datasets: Sequence[str], seed: int,
+    episodes_per_dataset: int, pools: Sequence[RowPool], args: argparse.Namespace,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
             "format_version": FORMAT_VERSION, "stage": stage, "datasets": list(datasets), "seed": seed,
+            "episodes_per_dataset": episodes_per_dataset,
+            "context_rows": args.context_rows,
+            "query_rows": args.query_rows,
+            "pool_signature": pool_signature(pools),
             "episodes": [
                 {
                     "dataset": episode.dataset, "stage": episode.stage, "episode_id": episode.episode_id,
@@ -285,12 +320,28 @@ def save_episode_bank(path: Path, episodes: Sequence[Episode], *, stage: str, da
     print(f"Saved {stage} episode bank with {len(episodes)} episodes to {path}", flush=True)
 
 
-def load_episode_bank(path: Path, *, stage: str, datasets: Sequence[str]) -> list[Episode]:
+def load_episode_bank(
+    path: Path, *, stage: str, datasets: Sequence[str], seed: int, episodes_per_dataset: int,
+    pools: Sequence[RowPool], args: argparse.Namespace,
+) -> list[Episode]:
     payload = torch.load(path, map_location="cpu", weights_only=True)
     if payload.get("format_version") != FORMAT_VERSION or payload.get("stage") != stage:
         raise ValueError(f"unsupported or wrong-stage episode bank: {path}")
     if tuple(payload.get("datasets", ())) != tuple(datasets):
         raise ValueError(f"episode bank datasets differ from requested datasets: {path}")
+    expected = {
+        "seed": seed,
+        "episodes_per_dataset": episodes_per_dataset,
+        "context_rows": args.context_rows,
+        "query_rows": args.query_rows,
+        "pool_signature": pool_signature(pools),
+    }
+    actual = {key: payload.get(key) for key in expected}
+    if actual != expected:
+        raise ValueError(
+            f"episode bank settings or source rows differ from this run: {path}. "
+            "Use matching arguments or regenerate all fixed banks."
+        )
     return [Episode(**item) for item in payload["episodes"]]
 
 
@@ -309,25 +360,37 @@ def make_fixed_episodes(
 
 
 def get_banks(args: argparse.Namespace, datasets: Sequence[str]) -> tuple[list[RowPool], list[Episode], list[Episode]]:
-    pools = load_pools(args.pool_bank, datasets=datasets) if args.pool_bank.is_file() else make_pools(args, datasets)
+    pools = load_pools(args.pool_bank, datasets=datasets, args=args) if args.pool_bank.is_file() else make_pools(args, datasets)
     if not args.pool_bank.is_file():
         save_pools(args.pool_bank, pools, datasets=datasets, args=args)
     if args.validation_bank.is_file():
-        validation = load_episode_bank(args.validation_bank, stage="validation", datasets=datasets)
+        validation = load_episode_bank(
+            args.validation_bank, stage="validation", datasets=datasets, seed=args.validation_seed,
+            episodes_per_dataset=args.validation_episodes_per_dataset, pools=pools, args=args,
+        )
     else:
         validation = make_fixed_episodes(
             pools, split="validation", stage="validation", episodes_per_dataset=args.validation_episodes_per_dataset,
             seed=args.validation_seed, args=args,
         )
-        save_episode_bank(args.validation_bank, validation, stage="validation", datasets=datasets, seed=args.validation_seed)
+        save_episode_bank(
+            args.validation_bank, validation, stage="validation", datasets=datasets, seed=args.validation_seed,
+            episodes_per_dataset=args.validation_episodes_per_dataset, pools=pools, args=args,
+        )
     if args.test_bank.is_file():
-        test = load_episode_bank(args.test_bank, stage="test", datasets=datasets)
+        test = load_episode_bank(
+            args.test_bank, stage="test", datasets=datasets, seed=args.test_seed,
+            episodes_per_dataset=args.test_episodes_per_dataset, pools=pools, args=args,
+        )
     else:
         test = make_fixed_episodes(
             pools, split="test", stage="test", episodes_per_dataset=args.test_episodes_per_dataset,
             seed=args.test_seed, args=args,
         )
-        save_episode_bank(args.test_bank, test, stage="test", datasets=datasets, seed=args.test_seed)
+        save_episode_bank(
+            args.test_bank, test, stage="test", datasets=datasets, seed=args.test_seed,
+            episodes_per_dataset=args.test_episodes_per_dataset, pools=pools, args=args,
+        )
     return pools, validation, test
 
 
@@ -438,6 +501,36 @@ def train_batch(
     return F.cross_entropy(logits.flatten(0, 1), y_query.flatten()), parameters
 
 
+def accumulated_train_step(
+    backbone, model: HyperSplineTransform, optimizer: torch.optim.Optimizer, episodes: Sequence[Episode], *,
+    device: torch.device, max_microbatch_size: int, trainable: Sequence[torch.Tensor], gradient_clip: float,
+) -> tuple[float, dict[str, float], float]:
+    """Take one optimizer step over all episodes, using bounded microbatches.
+
+    The weighting is by query rows, so this is equivalent to one cross-entropy
+    over the complete logical meta-batch even when CUDA requires batch size one.
+    """
+    if not episodes:
+        raise ValueError("cannot train on an empty logical meta-batch")
+    total_query_rows = sum(int(episode.y_query.numel()) for episode in episodes)
+    optimizer.zero_grad(set_to_none=True)
+    weighted_loss = 0.0
+    weighted_diagnostics: dict[str, float] = defaultdict(float)
+    for start in range(0, len(episodes), max_microbatch_size):
+        microbatch = episodes[start : start + max_microbatch_size]
+        loss, parameters = train_batch(backbone, model, microbatch, device=device)
+        rows = sum(int(episode.y_query.numel()) for episode in microbatch)
+        weight = rows / total_query_rows
+        (weight * loss).backward()
+        weighted_loss += weight * float(loss.detach())
+        for key, value in parameter_diagnostics(parameters).items():
+            weighted_diagnostics[key] += weight * value
+        del loss, parameters
+    gradient_norm = float(torch.nn.utils.clip_grad_norm_(trainable, gradient_clip))
+    optimizer.step()
+    return weighted_loss, dict(weighted_diagnostics), gradient_norm
+
+
 def _is_cuda_oom(error: RuntimeError) -> bool:
     return "out of memory" in str(error).lower()
 
@@ -463,7 +556,7 @@ def run_model_seed(
         n_control_points=args.n_control_points, hidden_dim=args.hidden_dim,
         generate_location=args.generate_location, generate_scale=args.generate_scale,
         gate_initial_probability=args.gate_initial_probability, target_aware=args.target_aware,
-        conditioning_mode=args.arm,
+        conditioning_mode=args.arm, capacity_matched_conditioning=True,
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.0)
     trainable = list(model.parameters())
@@ -476,6 +569,7 @@ def run_model_seed(
         "query_labels_enter_parameter_generation": False,
         "train_objective": "TabICL query cross entropy only",
         "conditioning": args.arm, "output": "direct bounded monotone cubic spline controls per numerical column",
+        "conditioning_capacity_matched": True,
         "shared_weights_across_columns": True, "same_transform_applied_to_context_and_query": True,
         "args": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
     }
@@ -492,43 +586,47 @@ def run_model_seed(
     identity_validation_loss = macro_dataset_mean(identity_validation)
     best_loss, best_step, best_state, stale = identity_validation_loss, 0, copy.deepcopy(model.state_dict()), 0
     training_rows: list[dict] = []
-    safe_batch = min(args.tasks_per_step, args.max_backbone_batch_size)
+    safe_microbatch = min(args.tasks_per_step, args.max_backbone_batch_size)
     started = time.time()
     print(
         f"[{args.arm} seed={model_seed}] shared direct HyperSpline: datasets={list(datasets)}, "
-        f"conditioning_dim={model.conditioning_dim}, tasks/step={args.tasks_per_step}, initial_max_batch={safe_batch}; "
+        f"conditioning_dim={model.conditioning_dim}, tasks/optimizer_step={args.tasks_per_step}, "
+        f"initial_max_microbatch={safe_microbatch}; "
         f"reference validation macro NLL={identity_validation_loss:.6f}", flush=True,
     )
     for step in range(1, args.steps + 1):
         dataset = datasets[(step - 1) % len(datasets)]
-        attempt_batch = safe_batch
+        episodes = [make_episode(
+            train_pools[dataset], stage="train", episode_id=(step - 1) * args.tasks_per_step + offset,
+            source_seed=args.train_seed + 10_000_000 * model_seed + 100_000 * datasets.index(dataset) + (step - 1) * args.tasks_per_step + offset,
+            args=args,
+        ) for offset in range(args.tasks_per_step)]
+        attempt_microbatch = safe_microbatch
         while True:
-            episodes = [make_episode(
-                train_pools[dataset], stage="train", episode_id=(step - 1) * args.tasks_per_step + offset,
-                source_seed=args.train_seed + 10_000_000 * model_seed + 100_000 * datasets.index(dataset) + (step - 1) * args.tasks_per_step + offset,
-                args=args,
-            ) for offset in range(attempt_batch)]
-            optimizer.zero_grad(set_to_none=True)
             try:
-                loss, parameters = train_batch(backbone, model, episodes, device=device)
-                loss.backward()
-                gradient_norm = float(torch.nn.utils.clip_grad_norm_(trainable, args.gradient_clip))
-                optimizer.step()
+                task_loss, diagnostics, gradient_norm = accumulated_train_step(
+                    backbone, model, optimizer, episodes, device=device, max_microbatch_size=attempt_microbatch,
+                    trainable=trainable, gradient_clip=args.gradient_clip,
+                )
                 break
             except RuntimeError as error:
                 optimizer.zero_grad(set_to_none=True)
-                del episodes
-                if not (device.type == "cuda" and attempt_batch > 1 and _is_cuda_oom(error)):
+                if not (device.type == "cuda" and attempt_microbatch > 1 and _is_cuda_oom(error)):
                     raise
-                next_batch = max(1, attempt_batch // 2)
-                print(f"[{args.arm} seed={model_seed}] CUDA OOM at step={step}; retrying batch {attempt_batch}->{next_batch}", flush=True)
-                attempt_batch = safe_batch = next_batch
+                next_microbatch = max(1, attempt_microbatch // 2)
+                print(
+                    f"[{args.arm} seed={model_seed}] CUDA OOM at step={step}; retrying microbatch "
+                    f"{attempt_microbatch}->{next_microbatch} while retaining all {args.tasks_per_step} tasks",
+                    flush=True,
+                )
+                attempt_microbatch = safe_microbatch = next_microbatch
                 gc.collect(); torch.cuda.empty_cache()
         if step == 1 or step % args.log_every == 0:
             row = {
-                **run_fields, "step": step, "dataset": dataset, "backbone_batch_size": attempt_batch,
-                "task_loss": float(loss.detach()), "pre_clip_gradient_norm": gradient_norm,
-                "elapsed_seconds": time.time() - started, **parameter_diagnostics(parameters),
+                **run_fields, "step": step, "dataset": dataset,
+                "tasks_per_optimizer_step": args.tasks_per_step, "backbone_microbatch_size": attempt_microbatch,
+                "task_loss": task_loss, "pre_clip_gradient_norm": gradient_norm,
+                "elapsed_seconds": time.time() - started, **diagnostics,
             }
             if device.type == "cuda":
                 row.update({
@@ -540,10 +638,11 @@ def run_model_seed(
             write_csv(run_dir / "training.csv", training_rows)
             print(
                 f"[{args.arm} seed={model_seed} train] step={step}/{args.steps} dataset={dataset} "
-                f"loss={row['task_loss']:.6f} grad={gradient_norm:.5g} batch={attempt_batch} gate={row['mean_gate']:.4f}",
+                f"loss={row['task_loss']:.6f} grad={gradient_norm:.5g} tasks={args.tasks_per_step} "
+                f"microbatch={attempt_microbatch} gate={row['mean_gate']:.4f}",
                 flush=True,
             )
-        del episodes, loss, parameters
+        del episodes
         if step % args.validate_every == 0 or step == args.steps:
             current = evaluate(
                 backbone, model, validation, stage="validation", step=step, device=device,
@@ -597,11 +696,12 @@ def run_model_seed(
         "status": "complete", **run_fields, "datasets": list(datasets), "best_step": best_step,
         "identity_validation_macro_nll": identity_validation_loss, "selected_validation_macro_nll": best_loss,
         "validation_nll_delta": best_loss - identity_validation_loss,
-        "test_episodes": len(paired), "macro_test_nll_delta": float(np.mean([row["loss_delta"] for row in paired])),
-        "macro_test_accuracy_delta": float(np.mean([row["accuracy_delta"] for row in paired])),
+        "test_episodes": len(paired),
+        "macro_test_nll_delta": float(np.mean([row["loss_delta"] for row in per_dataset])),
+        "macro_test_accuracy_delta": float(np.mean([row["accuracy_delta"] for row in per_dataset])),
         "test_dataset_win_fraction_nll": float(np.mean([row["loss_delta"] < 0.0 for row in per_dataset])),
         "test_episode_win_fraction_nll": float(np.mean([row["loss_delta"] < 0.0 for row in paired])),
-        "max_backbone_batch_size_final": safe_batch,
+        "max_backbone_microbatch_size_final": safe_microbatch,
         "protocol": "permanent row-disjoint pools + teacher-free shared per-column HyperSpline + TabICL query NLL only",
     }
     torch.save({"state_dict": best_state, "best_step": best_step, "summary": summary, "manifest": manifest}, run_dir / "best.pt")
@@ -635,7 +735,13 @@ def main() -> None:
         raise RuntimeError("CUDA was requested but is unavailable")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     backbone, _ = load_backbone(args, device)
-    backbone.eval()
+    # TabICL's ``train`` path is the frozen differentiable forward used by
+    # every DirectSpline/HyperSpline optimisation script.  Its ``eval`` path
+    # dispatches to a separate inference manager, which is not suitable for
+    # backpropagation and can allocate a much larger internal cache even for
+    # a single episode.  The checkpoint loader disables dropout; only the
+    # HyperSpline parameters remain trainable below.
+    backbone.train()
     for parameter in backbone.parameters():
         parameter.requires_grad_(False)
     summaries = [run_model_seed(
