@@ -417,6 +417,10 @@ class TabICL(nn.Module):
 
         if inference_config is None:
             inference_config = InferenceConfig()
+        # Inference managers own their own execution devices.  Bind any
+        # unspecified manager to this model's actual parameter device instead
+        # of letting it silently resolve generic ``cuda`` (GPU 0).
+        inference_config = inference_config.with_default_device(next(self.parameters()).device)
 
         # Column-wise embedding -> Row-wise interaction
         representations = self.row_interactor(
@@ -713,6 +717,7 @@ class TabICL(nn.Module):
 
         if inference_config is None:
             inference_config = InferenceConfig()
+        inference_config = inference_config.with_default_device(next(self.parameters()).device)
 
         # Auto-detect cache mode from cache contents
         if use_cache and self._cache is not None and self._cache.cache_type == "repr":

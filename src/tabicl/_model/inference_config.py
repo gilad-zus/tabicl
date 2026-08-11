@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, Union
 
 import torch
 
@@ -369,3 +369,26 @@ class InferenceConfig:
                 raise KeyError(f"Invalid config key: {key}. Allowed keys: {allowed_keys}")
 
             getattr(self, key).update(config_dict[key])
+
+    def with_default_device(self, device: Union[str, torch.device]) -> "InferenceConfig":
+        """Return a copy whose unspecified manager devices use ``device``.
+
+        ``device=None`` historically meant the current default CUDA device,
+        which is normally ``cuda:0``.  That is wrong when a TabICL model was
+        moved to another GPU: the inference manager could probe/clear GPU 0
+        while model parameters and tensors lived on (say) GPU 2.  Copying is
+        important because callers can safely reuse a user-supplied config for
+        models on different devices.
+        """
+        resolved = torch.device(device)
+
+        def bind(config: MgrConfig) -> MgrConfig:
+            values = dict(config.items())
+            values["device"] = resolved if values.get("device") is None else values["device"]
+            return MgrConfig(**values)
+
+        return InferenceConfig(
+            COL_CONFIG=bind(self.COL_CONFIG),
+            ROW_CONFIG=bind(self.ROW_CONFIG),
+            ICL_CONFIG=bind(self.ICL_CONFIG),
+        )

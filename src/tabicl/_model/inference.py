@@ -778,9 +778,12 @@ class InferenceManager:
         """
         if not torch.cuda.is_available() or self.exe_device.type != "cuda":
             return 0.0
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-        return torch.cuda.mem_get_info(self.exe_device)[0] / (1024 * 1024)
+        # These APIs otherwise default to the process's current CUDA device
+        # (usually cuda:0), even when this manager is executing on cuda:N.
+        with torch.cuda.device(self.exe_device):
+            torch.cuda.synchronize(self.exe_device)
+            torch.cuda.empty_cache()
+            return torch.cuda.mem_get_info(self.exe_device)[0] / (1024 * 1024)
 
     def get_available_disk_space(self, path: Optional[str]) -> float:
         """Get available disk space at the specified path in MB.
@@ -1294,7 +1297,8 @@ class InferenceManager:
                     print(f"OOM with batch_size={batch_size}, reducing to {max(self.min_batch_size, batch_size // 2)}")
 
                 if self.exe_device.type == "cuda":
-                    torch.cuda.empty_cache()
+                    with torch.cuda.device(self.exe_device):
+                        torch.cuda.empty_cache()
 
                 batch_size = max(self.min_batch_size, batch_size // 2)
 

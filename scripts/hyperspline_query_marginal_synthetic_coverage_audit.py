@@ -209,15 +209,20 @@ def query_marginal_descriptors(
 
 
 @torch.no_grad()
-def extract_points_batch(episodes: Sequence[RealEpisode | SyntheticEpisode], *, source: str) -> list[ColumnPoint]:
+def extract_points_batch(
+    episodes: Sequence[RealEpisode | SyntheticEpisode], *, source: str, device: torch.device
+) -> list[ColumnPoint]:
     if not episodes:
         return []
     shape = (tuple(episodes[0].x_context.shape[1:]), tuple(episodes[0].x_query.shape[1:]))
     if any((tuple(item.x_context.shape[1:]), tuple(item.x_query.shape[1:])) != shape for item in episodes):
         raise ValueError("descriptor batches need equal context/query row and feature shapes")
-    context = torch.cat([item.x_context.float() for item in episodes], dim=0)
-    labels = torch.cat([item.y_context.float() for item in episodes], dim=0)
-    query = torch.cat([item.x_query.float() for item in episodes], dim=0)
+    # Banks deliberately remain on CPU.  Only this shape-compatible slice is
+    # resident on CUDA, preventing hundreds of stored episodes from consuming
+    # VRAM before the actual descriptor reductions begin.
+    context = torch.cat([item.x_context.float() for item in episodes], dim=0).to(device)
+    labels = torch.cat([item.y_context.float() for item in episodes], dim=0).to(device)
+    query = torch.cat([item.x_query.float() for item in episodes], dim=0).to(device)
     values = query_marginal_descriptors(context, labels, query).cpu().numpy().astype(np.float64)
     output: list[ColumnPoint] = []
     for row, episode in enumerate(episodes):
@@ -241,7 +246,8 @@ def extract_points_batch(episodes: Sequence[RealEpisode | SyntheticEpisode], *, 
 
 
 def extract_points(
-    episodes: Sequence[RealEpisode | SyntheticEpisode], *, source: str, batch_size: int, progress_every: int
+    episodes: Sequence[RealEpisode | SyntheticEpisode], *, source: str, batch_size: int, progress_every: int,
+    device: torch.device,
 ) -> list[ColumnPoint]:
     """Batch descriptor extraction by exact shape; CUDA is optional acceleration."""
     grouped: dict[tuple[tuple[int, int], tuple[int, int]], list[RealEpisode | SyntheticEpisode]] = defaultdict(list)
@@ -253,7 +259,7 @@ def extract_points(
         values = grouped[key]
         for start in range(0, len(values), batch_size):
             batch = values[start : start + batch_size]
-            result.extend(extract_points_batch(batch, source=source))
+            result.extend(extract_points_batch(batch, source=source, device=device))
             reporter.update(len(batch))
     return result
 
@@ -397,7 +403,7 @@ def evaluate_direct_headroom(
     """Optional oracle diagnostic; it has no path back to the coverage audit."""
     if args.headroom_tasks <= 0:
         return []
-    device = torch.device(args.headroom_device)
+    device = torch.device(args.headroom_device or args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("--headroom-device requested CUDA but CUDA is unavailable")
     backbone, _ = load_backbone(args, device)
@@ -447,7 +453,8 @@ def evaluate_direct_headroom(
             reporter.update()
             del spline, optimizer
             if device.type == "cuda":
-                torch.cuda.empty_cache()
+                with torch.cuda.device(device):
+                    torch.cuda.empty_cache()
     return results
 
 
@@ -474,7 +481,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--headroom-tasks", type=int, default=0)
     parser.add_argument("--headroom-steps", type=int, default=300)
     parser.add_argument("--headroom-lr", type=float, default=0.03)
-    parser.add_argument("--headroom-device", default="cuda")
+    parser.add_argument(
+        "--headroom-device",
+        default=None,
+        help="Optional DirectSpline GPU; defaults to --device rather than silently using cuda:0.",
+    )
     parser.add_argument("--n-control-points", type=int, default=20)
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--checkpoint-version", default="tabicl-classifier-v2-20260212.ckpt")
@@ -494,8 +505,12 @@ def main() -> None:
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("--device requested CUDA but CUDA is unavailable")
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    _, real_train = load_bank(args.real_train_bank, device=device)
-    _, real_validation = load_bank(args.real_validation_bank, device=device)
+    # Do not materialize the entire audit corpus on CUDA.  ``extract_points``
+    # transfers one homogeneous mini-batch at a time; optional DirectSpline
+    # headroom separately moves its one task at a time.
+    storage_device = torch.device("cpu")
+    _, real_train = load_bank(args.real_train_bank, device=storage_device)
+    _, real_validation = load_bank(args.real_validation_bank, device=storage_device)
     if not real_train or not real_validation:
         raise ValueError("real train and validation banks must both contain episodes")
     print(
@@ -514,11 +529,11 @@ def main() -> None:
         flush=True,
     )
     native = generate_scheduled_episodes(
-        args, args.synthetic_tasks, source_seed=args.synthetic_seed, task_offset=0, device=device,
+        args, args.synthetic_tasks, source_seed=args.synthetic_seed, task_offset=0, device=storage_device,
         observation_mode="native", **schedule,
     )
     expanded = generate_scheduled_episodes(
-        args, args.synthetic_tasks, source_seed=args.synthetic_seed, task_offset=0, device=device,
+        args, args.synthetic_tasks, source_seed=args.synthetic_seed, task_offset=0, device=storage_device,
         observation_mode="coverage_expanded", **schedule,
     )
     matching = validate_matched_synthetic_banks(native, expanded)
@@ -534,7 +549,10 @@ def main() -> None:
         "synthetic_coverage_expanded": expanded,
     }
     points = {
-        name: extract_points(items, source=name, batch_size=args.summary_batch_size, progress_every=args.progress_every)
+        name: extract_points(
+            items, source=name, batch_size=args.summary_batch_size,
+            progress_every=args.progress_every, device=device,
+        )
         for name, items in sources.items()
     }
     for name, values in points.items():
