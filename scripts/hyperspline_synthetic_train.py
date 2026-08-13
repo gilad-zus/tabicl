@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 import random
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -51,7 +52,21 @@ class SyntheticEpisode:
     observation_mode: str = "native"
 
 
-SYNTHETIC_OBSERVATION_MODES = ("native", "coverage_expanded")
+# ``coverage_expanded`` is the original marginal-only coverage intervention.
+# The two structural candidates are intentionally opt-in: they are used by
+# ``hyperspline_synthetic_generator_calibration.py`` to measure whether adding
+# realistic task structure closes the *descriptor* gap to real data.  They are
+# not silently enabled for any historical training or evaluation command.
+SYNTHETIC_OBSERVATION_MODES = (
+    "native",
+    "coverage_expanded",
+    "coverage_structural_light",
+    "coverage_structural_broad",
+)
+
+
+def _is_structural_observation_mode(observation_mode: str) -> bool:
+    return observation_mode in {"coverage_structural_light", "coverage_structural_broad"}
 
 
 def activate_episode_device(device: torch.device | str) -> torch.device:
@@ -105,6 +120,10 @@ def apply_synthetic_observation(
     generator = torch.Generator(device="cpu").manual_seed(int(seed) % (2**63 - 1))
     n_features = values.shape[1]
     primary = torch.randint(0, 7, (n_features,), generator=generator)
+    # The original expansion was deliberately broad.  The structural
+    # candidates use gentler marginal shapes because the first audit showed
+    # that its strongest tails and spreads overshot the real-data range.
+    conservative = _is_structural_observation_mode(observation_mode)
 
     def uniform(low: float, high: float) -> float:
         return float(torch.empty((), dtype=values.dtype).uniform_(low, high, generator=generator))
@@ -114,44 +133,147 @@ def apply_synthetic_observation(
         family = int(primary[column])
         if family == 0:
             # Concave/convex signed powers vary concentration and tail weight.
-            exponent = uniform(0.35, 0.80) if bool(torch.randint(0, 2, (), generator=generator)) else uniform(1.35, 2.40)
+            exponent = (
+                uniform(0.60, 0.92) if bool(torch.randint(0, 2, (), generator=generator)) else uniform(1.10, 1.65)
+            ) if conservative else (
+                uniform(0.35, 0.80) if bool(torch.randint(0, 2, (), generator=generator)) else uniform(1.35, 2.40)
+            )
             z = z.sign() * z.abs().pow(exponent)
         elif family == 1:
             # Smooth asymmetric exponential sensor response (and its mirror).
-            strength, direction = uniform(0.18, 0.70), -1.0 if bool(torch.randint(0, 2, (), generator=generator)) else 1.0
+            strength, direction = uniform(0.10, 0.35) if conservative else uniform(0.18, 0.70), -1.0 if bool(torch.randint(0, 2, (), generator=generator)) else 1.0
             z = direction * torch.expm1(direction * strength * z) / strength
         elif family == 2:
             # Bounded/saturating measurement scale.
-            bound, strength = uniform(0.8, 2.5), uniform(0.35, 1.20)
+            bound, strength = (uniform(1.25, 3.0), uniform(0.30, 0.75)) if conservative else (uniform(0.8, 2.5), uniform(0.35, 1.20))
             z = bound * torch.tanh(strength * z)
         elif family == 3:
             # Symmetric log compression creates lighter tails without a bound.
-            strength = uniform(0.25, 1.25)
+            strength = uniform(0.15, 0.60) if conservative else uniform(0.25, 1.25)
             z = z.sign() * torch.log1p(strength * z.abs()) / strength
         elif family == 4:
             # Asymmetric tail response: a simple monotone piecewise sensor.
-            positive, negative = uniform(1.0, 3.5), uniform(0.35, 1.0)
+            positive, negative = (uniform(1.0, 2.0), uniform(0.55, 1.0)) if conservative else (uniform(1.0, 3.5), uniform(0.35, 1.0))
             z = torch.where(z >= 0, positive * z, negative * z)
         elif family == 5:
             # Censored instrument with a random lower/upper reporting range.
-            low, high = uniform(-2.5, -0.25), uniform(0.25, 2.5)
+            low, high = (uniform(-3.0, -0.75), uniform(0.75, 3.0)) if conservative else (uniform(-2.5, -0.25), uniform(0.25, 2.5))
             z = z.clamp(low, high)
         else:
             # Outlier-prone response: only far tails are stretched.
-            threshold, stretch = uniform(0.6, 1.8), uniform(1.5, 4.0)
+            threshold, stretch = (uniform(1.0, 2.0), uniform(1.10, 1.80)) if conservative else (uniform(0.6, 1.8), uniform(1.5, 4.0))
             z = z.sign() * torch.where(z.abs() <= threshold, z.abs(), threshold + stretch * (z.abs() - threshold))
 
         # Measurement resolution and a near-zero dead zone are each optional.
         # Both remain non-decreasing, so any lost information is realistic
         # coarsening rather than a label-dependent perturbation.
-        if bool(torch.randint(0, 2, (), generator=generator)):
-            step = uniform(0.04, 0.35) * z.detach().std().clamp_min(0.25).item()
+        rounding_probability = 0.35 if conservative else 0.50
+        if float(torch.rand((), generator=generator)) < rounding_probability:
+            step = uniform(0.03, 0.16) * z.detach().std().clamp_min(0.25).item() if conservative else uniform(0.04, 0.35) * z.detach().std().clamp_min(0.25).item()
             z = torch.round(z / step) * step
-        if bool(torch.randint(0, 2, (), generator=generator)):
-            dead_zone = uniform(0.02, 0.35) * z.detach().std().clamp_min(0.25).item()
+        dead_zone_probability = 0.25 if conservative else 0.50
+        if float(torch.rand((), generator=generator)) < dead_zone_probability:
+            dead_zone = uniform(0.01, 0.12) * z.detach().std().clamp_min(0.25).item() if conservative else uniform(0.02, 0.35) * z.detach().std().clamp_min(0.25).item()
             z = torch.where(z.abs() < dead_zone, torch.zeros_like(z), z)
         values[:, column] = torch.nan_to_num(z, nan=0.0, posinf=100.0, neginf=-100.0).clamp(-100.0, 100.0)
     return values.to(device=original_device, dtype=original_dtype)
+
+
+def apply_synthetic_task_structure(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    *,
+    observation_mode: str,
+    seed: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Add deterministic, label-legitimate synthetic task structure.
+
+    This is a *generator* operation carried out before the ICL split.  It may
+    resample rows by class or corrupt generated labels, exactly as a synthetic
+    data-generating process can; it never looks at an eventual query label at
+    inference time.  It creates properties independent monotone marginal
+    transforms cannot provide: class imbalance/noise, redundant correlated
+    columns, and label-independent nuisance columns.  The native and legacy
+    ``coverage_expanded`` paths remain bitwise unchanged.
+    """
+    if not _is_structural_observation_mode(observation_mode):
+        return x, y
+    if x.ndim != 2 or y.ndim != 1 or x.shape[0] != y.shape[0]:
+        raise ValueError("structural observation expects x=(N,D), y=(N,)")
+
+    original_device, original_dtype = x.device, x.dtype
+    values = x.detach().to(device="cpu", dtype=torch.float32).clone()
+    labels = y.detach().to(device="cpu", dtype=torch.long).clone()
+    generator = torch.Generator(device="cpu").manual_seed((int(seed) + 4_271_081) % (2**63 - 1))
+    n_rows, n_features = values.shape
+    classes, inverse = torch.unique(labels, sorted=True, return_inverse=True)
+    n_classes = int(classes.numel())
+    broad = observation_mode == "coverage_structural_broad"
+
+    # Vary real-world label prevalences without dropping a class altogether.
+    # Row resampling happens before the ICL split, so context/query get the
+    # same generated task distribution rather than an artificial covariate
+    # shift.
+    imbalance_probability = 0.80 if broad else 0.45
+    if n_classes > 1 and float(torch.rand((), generator=generator)) < imbalance_probability:
+        log_weight_scale = 1.00 if broad else 0.45
+        class_log_weights = torch.randn(n_classes, generator=generator) * log_weight_scale
+        row_weights = torch.exp(class_log_weights[inverse]).clamp_min(1e-8)
+        draw = torch.multinomial(row_weights, n_rows, replacement=True, generator=generator)
+        # Guarantee that output labels retain the original known class set.
+        for class_index in range(n_classes):
+            source = torch.nonzero(inverse == class_index, as_tuple=False).flatten()
+            draw[class_index] = source[torch.randint(len(source), (), generator=generator)]
+        draw = draw[torch.randperm(n_rows, generator=generator)]
+        values, labels = values[draw], labels[draw]
+
+    # Label noise alters feature--target association while retaining the class
+    # alphabet.  It is sampled independently per row and is bounded so these
+    # candidates remain useful classification tasks.
+    noise_probability = 0.65 if broad else 0.35
+    if n_classes > 1 and float(torch.rand((), generator=generator)) < noise_probability:
+        rate = float(torch.empty((), dtype=values.dtype).uniform_(0.03, 0.28 if broad else 0.14, generator=generator))
+        corrupt = torch.rand(n_rows, generator=generator) < rate
+        replacement = classes[torch.randint(n_classes, (n_rows,), generator=generator)]
+        labels = torch.where(corrupt, replacement, labels)
+    # Noise/resampling must never turn a valid synthetic classification task
+    # into a one-class task.  The repair is tiny (one row per class) and is
+    # deterministic under the task seed.
+    if n_classes > 1:
+        anchors = torch.randperm(n_rows, generator=generator)[:n_classes]
+        labels[anchors] = classes
+
+    # Feature operations are label-free.  Mixing introduces correlated groups;
+    # copying with small noise makes redundant columns; independent replacement
+    # supplies genuinely uninformative columns.  All choices scale with D and
+    # leave small-feature tasks valid.
+    if n_features >= 2:
+        operations = max(1, round(n_features * (0.22 if broad else 0.10)))
+        for _ in range(operations):
+            source = int(torch.randint(n_features, (), generator=generator))
+            target = int(torch.randint(n_features - 1, (), generator=generator))
+            target += int(target >= source)
+            source_values = values[:, source]
+            target_values = values[:, target]
+            source_z = (source_values - source_values.mean()) / source_values.std(unbiased=False).clamp_min(1e-4)
+            target_z = (target_values - target_values.mean()) / target_values.std(unbiased=False).clamp_min(1e-4)
+            if bool(torch.randint(0, 2, (), generator=generator)):
+                mix = float(torch.empty(()).uniform_(0.45 if broad else 0.25, 0.90, generator=generator))
+                values[:, target] = mix * source_z + math.sqrt(max(1.0 - mix * mix, 0.0)) * target_z
+            else:
+                noise_scale = float(torch.empty(()).uniform_(0.03, 0.25 if broad else 0.12, generator=generator))
+                values[:, target] = source_z + noise_scale * torch.randn(n_rows, generator=generator)
+    nuisance_probability = 0.55 if broad else 0.25
+    if n_features and float(torch.rand((), generator=generator)) < nuisance_probability:
+        count = max(1, round(n_features * (0.30 if broad else 0.12)))
+        columns = torch.randperm(n_features, generator=generator)[:count]
+        for column in columns.tolist():
+            if bool(torch.randint(0, 2, (), generator=generator)):
+                values[:, column] = torch.randn(n_rows, generator=generator)
+            else:
+                values[:, column] = torch.round(2.5 * torch.randn(n_rows, generator=generator)) / 2.5
+
+    return values.to(device=original_device, dtype=original_dtype), labels.to(device=y.device, dtype=y.dtype)
 
 
 def seed_generator(seed: int) -> None:
@@ -182,16 +304,24 @@ def prepare_episode(
     if not 0 < n_context < n_rows:
         raise ValueError(f"synthetic task {task_id} has invalid split {n_context}/{n_rows}")
     native_x = x_batch[index, :n_rows, :n_features]
+    native_labels = y_batch[index, :n_rows].to(torch.long)
+    task_seed = int(source_seed) + 1_000_003 * int(task_id)
     x = apply_synthetic_observation(
         native_x,
         observation_mode=observation_mode,
         # Distinct, reproducible column draws for every prior task, including
         # streaming training tasks whose task_id is monotonically increasing.
-        seed=int(source_seed) + 1_000_003 * int(task_id),
+        seed=task_seed,
     ).to(device=device, dtype=torch.float32)
+    x, native_labels = apply_synthetic_task_structure(
+        x,
+        native_labels,
+        observation_mode=observation_mode,
+        seed=task_seed,
+    )
     # The generator labels are made contiguous once over the complete task, not
     # separately for context/query, so query classes retain their true index.
-    classes, y = torch.unique(y_batch[index, :n_rows].to(torch.long), sorted=True, return_inverse=True)
+    classes, y = torch.unique(native_labels.to(torch.long), sorted=True, return_inverse=True)
     return SyntheticEpisode(
         task_id=task_id,
         source_seed=source_seed,

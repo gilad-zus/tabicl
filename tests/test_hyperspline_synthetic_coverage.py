@@ -11,8 +11,13 @@ from scripts import hyperspline_synthetic_train as synthetic
 from scripts.hyperspline_query_marginal_synthetic_coverage_audit import (
     QUERY_MARGINAL_DIM,
     ColumnPoint,
+    descriptor_effective_rank,
     query_marginal_descriptors,
     source_auc,
+)
+from scripts.hyperspline_synthetic_generator_calibration import (
+    calibrate_profiles,
+    split_episodes_by_dataset,
 )
 
 
@@ -85,3 +90,47 @@ def test_group_disjoint_source_auc_is_available_for_the_audit():
     result = source_auc(real, synthetic_points, seed=0)
     assert result["n_splits"] >= 2
     assert 0.0 <= result["auc"] <= 1.0
+
+
+def test_descriptor_effective_rank_accepts_numpy_singular_values():
+    rank = descriptor_effective_rank(np.asarray([[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]]))
+    assert np.isfinite(rank)
+    assert 1.0 <= rank <= 2.0
+
+
+def test_structural_synthetic_observation_is_deterministic_and_changes_task_structure():
+    x = torch.linspace(-2.0, 2.0, 60).reshape(30, 2)
+    y = torch.tensor([0, 1, 2] * 10)
+    first_x, first_y = synthetic.apply_synthetic_task_structure(
+        x, y, observation_mode="coverage_structural_broad", seed=91
+    )
+    repeated_x, repeated_y = synthetic.apply_synthetic_task_structure(
+        x, y, observation_mode="coverage_structural_broad", seed=91
+    )
+    assert torch.equal(first_x, repeated_x)
+    assert torch.equal(first_y, repeated_y)
+    assert torch.isfinite(first_x).all()
+    assert set(first_y.tolist()).issubset({0, 1, 2})
+    native_x, native_y = synthetic.apply_synthetic_task_structure(x, y, observation_mode="native", seed=91)
+    assert torch.equal(native_x, x)
+    assert torch.equal(native_y, y)
+
+
+def test_generator_calibration_splits_entire_dataset_identities_and_ranks_fit_only():
+    class Episode:
+        def __init__(self, dataset: str) -> None:
+            self.dataset = dataset
+
+    episodes = [Episode(f"dataset_{dataset}") for dataset in range(8) for _ in range(3)]
+    fit, selection, fit_ids, selection_ids = split_episodes_by_dataset(episodes, fit_fraction=0.75, seed=5)
+    assert set(fit_ids).isdisjoint(selection_ids)
+    assert {item.dataset for item in fit} == set(fit_ids)
+    assert {item.dataset for item in selection} == set(selection_ids)
+    ranked = calibrate_profiles([
+        {"profile": "native", "macro_real_to_synthetic_nn": 4.0, "macro_synthetic_to_real_nn": 4.0,
+         "descriptor_quantile_l1_gap": 4.0, "source_auc": 0.95},
+        {"profile": "better", "macro_real_to_synthetic_nn": 2.0, "macro_synthetic_to_real_nn": 2.0,
+         "descriptor_quantile_l1_gap": 2.0, "source_auc": 0.70},
+    ])
+    assert ranked[0]["profile"] == "better"
+    assert ranked[0]["fit_rank"] == 1

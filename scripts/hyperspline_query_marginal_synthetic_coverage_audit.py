@@ -147,6 +147,43 @@ def write_csv(path: Path, rows: Sequence[dict]) -> None:
         writer.writerows(rows)
 
 
+def load_column_points(path: Path) -> list[ColumnPoint]:
+    """Reload completed descriptor extraction for failure recovery.
+
+    The audit deliberately writes each source's descriptor CSV before any
+    nearest-neighbour, classifier, or JSON summary calculation.  This keeps a
+    late CPU-only reporting failure from forcing expensive prior generation or
+    GPU summary extraction to run again.
+    """
+    if not path.is_file():
+        raise FileNotFoundError(f"missing completed descriptor output: {path}")
+    with path.open(newline="", encoding="utf8") as handle:
+        rows = list(csv.DictReader(handle))
+    if not rows:
+        raise ValueError(f"descriptor output is empty: {path}")
+    descriptor_fields = sorted(
+        (field for field in rows[0] if field.startswith("descriptor_")),
+        key=lambda field: int(field.rsplit("_", 1)[1]),
+    )
+    if len(descriptor_fields) != QUERY_MARGINAL_DIM:
+        raise ValueError(f"{path} has {len(descriptor_fields)} descriptor fields; expected {QUERY_MARGINAL_DIM}")
+    return [
+        ColumnPoint(
+            source=str(row["source"]),
+            identity=str(row["identity"]),
+            episode_id=int(row["episode_id"]),
+            column=int(row["column"]),
+            n_context=int(row["n_context"]),
+            n_query=int(row["n_query"]),
+            n_features=int(row["n_features"]),
+            n_numerical_features=int(row["n_numerical_features"]),
+            n_classes=int(row["n_classes"]),
+            descriptor=np.asarray([float(row[field]) for field in descriptor_fields], dtype=np.float64),
+        )
+        for row in rows
+    ]
+
+
 def episode_identity(episode: RealEpisode | SyntheticEpisode) -> tuple[str, int, int, int, int, int]:
     """Return ID and dimensional metadata without reading query labels."""
     if isinstance(episode, RealEpisode):
@@ -329,7 +366,8 @@ def source_auc(real_points: Sequence[ColumnPoint], synthetic_points: Sequence[Co
 def descriptor_effective_rank(values: np.ndarray) -> float:
     centered = values - values.mean(axis=0, keepdims=True)
     singular = np.linalg.svd(centered, full_matrices=False, compute_uv=False)
-    weights = singular.square() / max(float(singular.square().sum()), 1e-12)
+    squared = np.square(singular)
+    weights = squared / max(float(squared.sum()), 1e-12)
     entropy = -(weights[weights > 0] * np.log(weights[weights > 0])).sum()
     return float(math.exp(entropy))
 
@@ -460,9 +498,14 @@ def evaluate_direct_headroom(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--real-train-bank", type=Path, required=True)
-    parser.add_argument("--real-validation-bank", type=Path, required=True)
+    parser.add_argument("--real-train-bank", type=Path, default=None)
+    parser.add_argument("--real-validation-bank", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--summarize-existing",
+        action="store_true",
+        help="Recover summary.json from the four already-written *_columns.csv files; no prior, bank, GPU, or backbone work.",
+    )
     parser.add_argument("--device", default="cpu", help="cpu is sufficient; cuda batches descriptor reductions if available.")
     parser.add_argument("--summary-batch-size", type=int, default=16)
     parser.add_argument("--progress-every", type=int, default=16)
@@ -496,11 +539,76 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("invalid synthetic feature/class limits")
     if args.headroom_tasks < 0 or args.headroom_steps <= 0 or args.headroom_lr <= 0:
         raise ValueError("invalid optional DirectSpline headroom arguments")
+    if not args.summarize_existing and (args.real_train_bank is None or args.real_validation_bank is None):
+        raise ValueError("--real-train-bank and --real-validation-bank are required unless --summarize-existing is used")
+    if args.summarize_existing and args.headroom_tasks:
+        raise ValueError("--summarize-existing cannot run optional DirectSpline headroom")
     return args
 
 
 def main() -> None:
     args = parse_args()
+    if args.summarize_existing:
+        output = args.output_dir
+        sources = ("real_train", "real_validation", "synthetic_native", "synthetic_coverage_expanded")
+        points = {source: load_column_points(output / f"{source}_columns.csv") for source in sources}
+        scaler = fit_robust_scaler(points["real_train"], clip=args.scaler_clip)
+        train_values = scaler.transform(descriptor_matrix(points["real_train"]))
+        validation_values = scaler.transform(descriptor_matrix(points["real_validation"]))
+        native_values = scaler.transform(descriptor_matrix(points["synthetic_native"]))
+        expanded_values = scaler.transform(descriptor_matrix(points["synthetic_coverage_expanded"]))
+        distances = {
+            "nearest_real_train": nearest_distances(train_values, validation_values),
+            "nearest_synthetic_native": nearest_distances(native_values, validation_values),
+            "nearest_synthetic_coverage_expanded": nearest_distances(expanded_values, validation_values),
+        }
+        coverage_rows = []
+        for index, point in enumerate(points["real_validation"]):
+            native_distance = float(distances["nearest_synthetic_native"][index])
+            expanded_distance = float(distances["nearest_synthetic_coverage_expanded"][index])
+            coverage_rows.append({
+                "identity": point.identity, "episode_id": point.episode_id, "column": point.column,
+                "n_context": point.n_context, "n_query": point.n_query, "n_features": point.n_features,
+                "n_classes": point.n_classes,
+                "nearest_real_train_distance": float(distances["nearest_real_train"][index]),
+                "nearest_synthetic_native_distance": native_distance,
+                "nearest_synthetic_coverage_expanded_distance": expanded_distance,
+                "expanded_minus_native_distance": expanded_distance - native_distance,
+                "expanded_is_closer_than_native": expanded_distance < native_distance,
+            })
+        write_csv(output / "real_validation_coverage.csv", coverage_rows)
+        auc_rows = [
+            {"synthetic_source": source, **source_auc(points["real_train"], points[source], seed=args.auc_seed)}
+            for source in ("synthetic_native", "synthetic_coverage_expanded")
+        ]
+        write_csv(output / "source_separability.csv", auc_rows)
+        summary = {
+            "protocol": {
+                "descriptor": "23 query unlabeled marginals + 8 context class-invariant label statistics + 2 context/query alignment values",
+                "descriptor_dimension": QUERY_MARGINAL_DIM,
+                "real_scaler_fit": "real_train only",
+                "coverage_target": "real_validation only",
+                "recovered_from_existing_descriptor_csvs": True,
+            },
+            "arguments": vars(args),
+            "matched_synthetic_banks": {"unavailable_after_recovery": True},
+            "source_profiles": {name: source_profile(values, scaler=scaler) for name, values in points.items()},
+            "real_validation_coverage": {
+                "n_columns": len(coverage_rows),
+                "mean_nearest_real_train": float(np.mean(distances["nearest_real_train"])),
+                "mean_nearest_native": float(np.mean(distances["nearest_synthetic_native"])),
+                "mean_nearest_expanded": float(np.mean(distances["nearest_synthetic_coverage_expanded"])),
+                "median_nearest_native": float(np.median(distances["nearest_synthetic_native"])),
+                "median_nearest_expanded": float(np.median(distances["nearest_synthetic_coverage_expanded"])),
+                "expanded_closer_fraction": float(np.mean([row["expanded_is_closer_than_native"] for row in coverage_rows])),
+                "mean_expanded_minus_native_distance": float(np.mean([row["expanded_minus_native_distance"] for row in coverage_rows])),
+            },
+            "source_separability": auc_rows,
+            "optional_direct_headroom": {"enabled": False, "n_records": 0, "mean_nll_improvement_by_source": {}},
+        }
+        write_json(output / "summary.json", summary)
+        print(f"Recovered summary from existing descriptors without GPU/prior work: {output / 'summary.json'}", flush=True)
+        return
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("--device requested CUDA but CUDA is unavailable")
