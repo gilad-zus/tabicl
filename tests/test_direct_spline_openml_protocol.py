@@ -6,6 +6,8 @@ import torch
 from tabicl._experiments.direct_spline_openml import (
     OpenMLTaskData,
     _fit_one_bag,
+    _bag_splits,
+    effective_inner_bag_count,
     greedy_validation_ensemble,
     summarize_experiment,
 )
@@ -135,6 +137,46 @@ def test_greedy_ensemble_uses_validation_to_select_the_better_candidate():
     assert deployment_error("binary", labels, prediction) == pytest.approx(0.0)
 
 
+def test_rare_class_reduces_stratified_bag_count_without_dropping_the_task():
+    labels = np.concatenate((np.repeat(0, 100), np.repeat(1, 100), np.repeat(2, 5)))
+    task = OpenMLTaskData(
+        task_id=363614,
+        dataset_id=2,
+        dataset_name="anneal_like",
+        problem_type="multiclass",
+        n_classes=3,
+        x_train=pd.DataFrame({"x": np.arange(labels.size)}),
+        y_train=labels,
+        x_test=pd.DataFrame({"x": [0, 1]}),
+        y_test=np.array([0, 1]),
+        outer_split_hash="split",
+    )
+    assert effective_inner_bag_count(task, requested_bags=8) == 5
+    splits = list(_bag_splits(task, requested_bags=8, seed=0))
+    assert len(splits) == 5
+    for fit_indices, validation_indices in splits:
+        assert set(labels[validation_indices]) == {0, 1, 2}
+        assert np.bincount(labels[fit_indices], minlength=3).min() >= 2
+
+
+def test_direct_spline_rejects_class_with_too_few_rows_for_train_episodes():
+    labels = np.array([0, 0, 1, 1])
+    task = OpenMLTaskData(
+        task_id=99,
+        dataset_id=2,
+        dataset_name="too_rare",
+        problem_type="binary",
+        n_classes=2,
+        x_train=pd.DataFrame({"x": np.arange(labels.size)}),
+        y_train=labels,
+        x_test=pd.DataFrame({"x": [0, 1]}),
+        y_test=np.array([0, 1]),
+        outer_split_hash="split",
+    )
+    with pytest.raises(ValueError, match="at least three rows"):
+        effective_inner_bag_count(task, requested_bags=8)
+
+
 def test_one_bag_is_train_only_and_returns_complete_prediction_artifacts():
     class TinyBackbone(torch.nn.Module):
         def __init__(self):
@@ -211,6 +253,8 @@ def test_summary_keeps_standard_tabarena_baseline_out_of_internal_paired_elo(tmp
         "tuned_config_label": "D",
         "tuned_validation_deployment_error": 0.22,
         "default_guard_selected_adapted_fraction": 1.0,
+        "direct_spline_requested_bags": 8,
+        "direct_spline_effective_bags": 8,
         "tuned_ensemble_selected_config_labels": ["D"],
         "standard_tabarena": {"benchmark_error": 0.20, "deployment_error": 0.20},
     }

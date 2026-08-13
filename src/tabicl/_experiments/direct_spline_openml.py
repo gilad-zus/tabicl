@@ -3,8 +3,9 @@
 This module intentionally uses only the small :mod:`openml` client to obtain
 the public TabArena-v0.1 task suite.  It does **not** import TabArena,
 AutoGluon, Ray, or any other benchmark model package.  OpenML supplies the
-published outer split; this module owns the eight inner bags, frozen TabICL
-calls, hyperparameter selection, prediction artifacts, and paired Elo report.
+published outer split; this module owns up to eight valid inner bags, frozen
+TabICL calls, hyperparameter selection, prediction artifacts, and paired Elo
+report.
 """
 
 from __future__ import annotations
@@ -466,16 +467,43 @@ def _metric_bundle(
     return {"deployment_error": float(deploy), "benchmark_error": float(bench)}
 
 
-def _bag_splits(task: OpenMLTaskData, *, bags: int, seed: int) -> Iterable[tuple[np.ndarray, np.ndarray]]:
+def effective_inner_bag_count(task: OpenMLTaskData, *, requested_bags: int) -> int:
+    """Return the largest valid stratified OOF bag count up to the request.
+
+    Retouche-style adaptation needs every fitting fold to retain at least two
+    rows from every class: one labelled context row and one episode query row.
+    A fixed 8-fold split is therefore impossible for a task such as ``anneal``
+    whose rarest outer-training class has five rows.  Reducing *only that
+    task* to five folds keeps stratification, produces full OOF predictions,
+    and is preferable to silently dropping its rare class or leaking labels.
+    """
+    if requested_bags < 2:
+        raise ValueError("requested_bags must be at least two")
+    n_rows = len(task.y_train)
     if task.problem_type == "regression":
-        yield from KFold(n_splits=bags, shuffle=True, random_state=seed).split(task.x_train)
-        return
+        if n_rows < requested_bags:
+            raise ValueError(
+                f"task {task.task_id} has {n_rows} outer-training rows; cannot form {requested_bags} regression bags"
+            )
+        return requested_bags
     counts = np.bincount(task.y_train)
-    if counts.min() < bags:
+    smallest_class = int(counts.min())
+    if smallest_class < 3:
         raise ValueError(
-            f"task {task.task_id} has a training class with {counts.min()} rows; cannot form {bags} stratified bags"
+            f"task {task.task_id} has a training class with {smallest_class} rows; "
+            "DirectSpline needs at least three rows per class to retain two fitting rows"
         )
-    yield from StratifiedKFold(n_splits=bags, shuffle=True, random_state=seed).split(task.x_train, task.y_train)
+    return min(requested_bags, smallest_class)
+
+
+def _bag_splits(
+    task: OpenMLTaskData, *, requested_bags: int, seed: int
+) -> Iterable[tuple[np.ndarray, np.ndarray]]:
+    effective_bags = effective_inner_bag_count(task, requested_bags=requested_bags)
+    if task.problem_type == "regression":
+        yield from KFold(n_splits=effective_bags, shuffle=True, random_state=seed).split(task.x_train)
+        return
+    yield from StratifiedKFold(n_splits=effective_bags, shuffle=True, random_state=seed).split(task.x_train, task.y_train)
 
 
 def _fit_one_bag(
@@ -490,6 +518,8 @@ def _fit_one_bag(
     device: torch.device,
     run_fingerprint_hash: str | None = None,
     progress: ProgressCallback | None = None,
+    requested_bags: int | None = None,
+    effective_bags: int | None = None,
 ) -> BagPredictions:
     """Fit one child adapter without reading the OpenML outer-test labels."""
     started = time.perf_counter()
@@ -530,6 +560,8 @@ def _fit_one_bag(
         fit_rows=int(fit_indices.size),
         validation_rows=int(validation_indices.size),
         support_rows=int(support_indices.size),
+        requested_bags=requested_bags,
+        effective_bags=effective_bags,
     )
     torch.manual_seed(_seed(int(config["random_state"]), task.task_id, bag, 2))
     if device.type == "cuda":
@@ -682,6 +714,8 @@ def _fit_one_bag(
         "bag": int(bag),
         "fit_rows": int(fit_indices.size),
         "validation_rows": int(validation_indices.size),
+        "requested_bags": requested_bags,
+        "effective_bags": effective_bags,
         "support_rows": int(support_indices.size),
         "n_features": int(fit_features.shape[1]),
         "n_numerical_features": int(numerical_indices.size),
@@ -831,6 +865,7 @@ def run_task_config(
     config_dir = _config_dir(output_dir, task, label)
     summary_path = config_dir / "config_summary.json"
     predictions_path = config_dir / "config_predictions.npz"
+    effective_bags = effective_inner_bag_count(task, requested_bags=bags)
     if resume and summary_path.is_file() and predictions_path.is_file():
         summary = _json_load(summary_path)
         if summary.get("run_fingerprint_hash") != run_fingerprint_hash:
@@ -845,9 +880,17 @@ def run_task_config(
         classifier_checkpoint=classifier_checkpoint,
         regressor_checkpoint=regressor_checkpoint,
     )
+    _emit(
+        progress,
+        event="config_started",
+        task_id=task.task_id,
+        config_label=label,
+        requested_bags=bags,
+        effective_bags=effective_bags,
+    )
     bag_results: list[BagPredictions] = []
     for bag, (fit_indices, validation_indices) in enumerate(
-        _bag_splits(task, bags=bags, seed=_seed(protocol_seed, task.task_id, 0))
+        _bag_splits(task, requested_bags=bags, seed=_seed(protocol_seed, task.task_id, 0))
     ):
         bag_path = config_dir / f"bag_{bag}.npz"
         if resume and bag_path.is_file():
@@ -869,6 +912,8 @@ def run_task_config(
                 device=device,
                 run_fingerprint_hash=run_fingerprint_hash,
                 progress=progress,
+                requested_bags=bags,
+                effective_bags=effective_bags,
             )
             _save_bag(bag_path, bag_result)
         bag_results.append(bag_result)
@@ -905,6 +950,12 @@ def run_task_config(
         "config": config,
         "checkpoint": checkpoint_metadata,
         "run_fingerprint_hash": run_fingerprint_hash,
+        "requested_bags": bags,
+        "effective_bags": effective_bags,
+        "inner_bag_note": (
+            "Uses the requested number of bags except classification tasks whose rarest outer-training "
+            "class is smaller; those use the largest valid stratified count while retaining two fitting rows/class."
+        ),
         "validation": {
             "identity": _metric_bundle(task.problem_type, task.y_train, identity_validation, task.n_classes),
             "adapted": _metric_bundle(task.problem_type, task.y_train, adapted_validation, task.n_classes),
@@ -1010,6 +1061,8 @@ def summarize_task_tuning(
         ),
         "tuned_ensemble_selected_config_labels": [config_labels[index] for index in ensemble_indices],
         "default_guard_selected_adapted_fraction": default["guard_selected_adapted_fraction"],
+        "direct_spline_requested_bags": default["requested_bags"],
+        "direct_spline_effective_bags": default["effective_bags"],
         "standard_tabarena": None if standard_tabarena is None else standard_tabarena["test"],
         "standard_tabarena_note": (
             "Normal full-outer-training TabICLv2 inference; it is a separate public baseline, "
@@ -1066,6 +1119,8 @@ def summarize_experiment(
             "tuned_config_label": item["tuned_config_label"],
             "tuned_validation_deployment_error": item["tuned_validation_deployment_error"],
             "default_guard_selected_adapted_fraction": item["default_guard_selected_adapted_fraction"],
+            "direct_spline_requested_bags": item["direct_spline_requested_bags"],
+            "direct_spline_effective_bags": item["direct_spline_effective_bags"],
             "tuned_ensemble_selected_config_labels": ";".join(item["tuned_ensemble_selected_config_labels"]),
         }
         if item["standard_tabarena"] is not None:

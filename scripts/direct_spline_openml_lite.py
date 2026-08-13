@@ -3,7 +3,9 @@
 Only the small OpenML client is required.  It downloads the public TabArena
 v0.1 suite (OpenML suite 457), uses each task's published split
 ``repeat=0, fold=0, sample=0`` as the untouched outer test set, and performs
-eight guarded training bags locally.
+up to eight guarded, stratified training bags locally.  A classification task
+with fewer than eight rows in its rarest training class uses fewer bags so
+every fitting fold still contains every class.
 
 The output directory is self-contained: it records the task IDs, split hashes,
 frozen configuration draws, per-bag validation/test predictions, model choices,
@@ -58,6 +60,7 @@ from tabicl._experiments.direct_spline_openml import (
     _json_dump,
     _resolve_checkpoint,
     _resolve_device,
+    effective_inner_bag_count,
     load_tabarena_openml_task,
     run_task_config,
     run_standard_tabarena_baseline,
@@ -205,6 +208,13 @@ def _event_reporter(path: Path):
                 f"peak={event['peak_allocated_gib']:.2f}GiB",
                 flush=True,
             )
+        elif event_name == "config_started":
+            detail = (
+                f"using {event['effective_bags']}/{event['requested_bags']} stratified bags"
+                if event["effective_bags"] != event["requested_bags"]
+                else f"using {event['effective_bags']} bags"
+            )
+            print(f"[{task_prefix} config={event['config_label']}] {detail}", flush=True)
         elif event_name in {"standard_baseline_started", "standard_baseline_completed"}:
             suffix = (
                 "starting normal 8-estimator TabICLv2 baseline"
@@ -263,6 +273,10 @@ def main() -> None:
             },
         },
         "inner_bags": args.bags,
+        "inner_bag_policy": (
+            "Use the requested count unless a classification task's rarest outer-training class is smaller; "
+            "then use that smaller valid stratified count so every fitting fold retains at least two rows/class."
+        ),
         "protocol_seed": args.protocol_seed,
         "bootstrap_rounds": args.bootstrap_rounds,
         "ensemble_rounds": args.ensemble_rounds or max(1, 2 * len(configs)),
@@ -343,7 +357,12 @@ def main() -> None:
                 progress=progress,
             )
         for label, config in zip(labels, configs, strict=True):
-            print(f"[task={task.task_id} config={label}] starting/recovering {args.bags} bags", flush=True)
+            effective_bags = effective_inner_bag_count(task, requested_bags=args.bags)
+            print(
+                f"[task={task.task_id} config={label}] starting/recovering "
+                f"{effective_bags}/{args.bags} valid stratified bags",
+                flush=True,
+            )
             result = run_task_config(
                 task=task,
                 label=label,
