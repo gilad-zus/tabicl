@@ -7,6 +7,7 @@ from tabicl._experiments.direct_spline_openml import (
     OpenMLTaskData,
     _fit_one_bag,
     greedy_validation_ensemble,
+    summarize_experiment,
 )
 from tabicl._experiments.direct_spline_protocol import (
     DEFAULT_DIRECT_SPLINE_CONFIG,
@@ -138,7 +139,9 @@ def test_one_bag_is_train_only_and_returns_complete_prediction_artifacts():
     class TinyBackbone(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            self.head = torch.nn.Linear(2, 2)
+            # Match the frozen TabICL checkpoint: it exposes a wider head than
+            # this binary task, so the runner must select its first two logits.
+            self.head = torch.nn.Linear(2, 10)
 
         def clear_cache(self):
             pass
@@ -192,3 +195,30 @@ def test_one_bag_is_train_only_and_returns_complete_prediction_artifacts():
     assert np.allclose(result.guarded_validation.sum(axis=1), 1.0)
     assert result.metadata["fit_rows"] == 16
     assert result.metadata["validation_rows"] == 8
+
+
+def test_summary_keeps_standard_tabarena_baseline_out_of_internal_paired_elo(tmp_path):
+    task_summary = {
+        "task_id": 1,
+        "dataset_id": 2,
+        "dataset_name": "tiny",
+        "problem_type": "binary",
+        "outer_split_hash": "split",
+        "identity": {"benchmark_error": 0.30, "deployment_error": 0.30},
+        "default": {"benchmark_error": 0.25, "deployment_error": 0.25},
+        "tuned": {"benchmark_error": 0.24, "deployment_error": 0.24},
+        "tuned_ensemble": {"benchmark_error": 0.23, "deployment_error": 0.23},
+        "tuned_config_label": "D",
+        "tuned_validation_deployment_error": 0.22,
+        "default_guard_selected_adapted_fraction": 1.0,
+        "tuned_ensemble_selected_config_labels": ["D"],
+        "standard_tabarena": {"benchmark_error": 0.20, "deployment_error": 0.20},
+    }
+    summary = summarize_experiment(
+        task_summaries=[task_summary], output_dir=tmp_path, bootstrap_rounds=5, bootstrap_seed=0
+    )
+    row = (tmp_path / "task_results.csv").read_text(encoding="utf-8").splitlines()[1]
+    assert summary["standard_tabarena"]["mean_benchmark_error"] == pytest.approx(0.20)
+    assert "standard_tabarena_benchmark_error" in (tmp_path / "task_results.csv").read_text(encoding="utf-8").splitlines()[0]
+    assert "0.2" in row
+    assert set(summary["paired_results"]) == {"default", "tuned", "tuned_ensemble"}

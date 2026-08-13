@@ -16,7 +16,7 @@ import time
 import csv
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import numpy as np
 import torch
@@ -43,6 +43,25 @@ from tabicl._model.tabicl import TabICL
 TABARENA_V0PT1_OPENML_SUITE_ID = 457
 CLASSIFIER_CHECKPOINT = "tabicl-classifier-v2-20260212.ckpt"
 REGRESSOR_CHECKPOINT = "tabicl-regressor-v2-20260212.ckpt"
+
+# This is deliberately the ordinary public TabICLv2 inference configuration,
+# not a reimplementation of the raw one-context path used by DirectSpline.
+# Keeping it explicit makes the additional baseline auditable in every run.
+STANDARD_TABICL_CONFIG: dict[str, Any] = {
+    "n_estimators": 8,
+    "norm_methods": ["none", "power"],
+    "feat_shuffle_method": "latin",
+    "class_shuffle_method": "shift",
+    "outlier_threshold": 4.0,
+    "softmax_temperature": 0.9,
+    "average_logits": True,
+    "support_many_classes": True,
+    "batch_size": 8,
+    "kv_cache": False,
+    "random_state": 0,
+}
+
+ProgressCallback = Callable[[dict[str, Any]], None]
 
 
 @dataclass
@@ -102,6 +121,28 @@ def _json_load(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _file_sha256(path: Path) -> str:
+    """Hash a local checkpoint once so resumed results name the exact weights."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _checkpoint_metadata(path: Path) -> dict[str, Any]:
+    return {
+        "path": str(path.resolve()),
+        "sha256": _file_sha256(path),
+        "bytes": int(path.stat().st_size),
+    }
+
+
+def _emit(progress: ProgressCallback | None, **event: Any) -> None:
+    if progress is not None:
+        progress(event)
+
+
 def _cpu_state_dict(module: torch.nn.Module) -> dict[str, torch.Tensor]:
     return {name: tensor.detach().cpu().clone() for name, tensor in module.state_dict().items()}
 
@@ -131,7 +172,7 @@ def load_frozen_backbone(
     device: torch.device,
     classifier_checkpoint: str | Path | None,
     regressor_checkpoint: str | Path | None,
-) -> tuple[TabICL, Path]:
+) -> tuple[TabICL, Path, dict[str, Any]]:
     """Load the required TabICLv2 head once and keep all backbone weights frozen."""
     path = _resolve_checkpoint(
         regressor_checkpoint if problem_type == "regression" else classifier_checkpoint,
@@ -157,7 +198,7 @@ def load_frozen_backbone(
     for module in backbone.modules():
         if isinstance(module, torch.nn.Dropout):
             module.eval()
-    return backbone, path
+    return backbone, path, _checkpoint_metadata(path)
 
 
 def load_tabarena_openml_task(
@@ -344,6 +385,7 @@ def _predict(
     support_labels: np.ndarray,
     query_features: np.ndarray,
     problem_type: ProblemType,
+    n_classes: int | None,
     query_chunk_rows: int,
     target_mean: float,
     target_scale: float,
@@ -361,8 +403,26 @@ def _predict(
             prediction = backbone.quantile_dist(raw).quantiles.mean(dim=-1).squeeze(0)
             chunks.append((prediction.cpu().numpy() * target_scale + target_mean).astype(np.float64))
         else:
-            chunks.append(raw.softmax(dim=-1).squeeze(0).cpu().numpy().astype(np.float64))
+            logits = _classification_logits(raw, n_classes)
+            chunks.append(logits.softmax(dim=-1).squeeze(0).cpu().numpy().astype(np.float64))
     return np.concatenate(chunks, axis=0)
+
+
+def _classification_logits(raw: torch.Tensor, n_classes: int | None) -> torch.Tensor:
+    """Restrict the foundation-model classifier head to this task's labels.
+
+    TabICL's classifier checkpoint exposes ``max_classes`` logits (typically
+    ten), while an OpenML task can be binary or have fewer classes.  The loss
+    and probabilities must use the same leading task-specific logits; otherwise
+    binary prediction arrays have the checkpoint width rather than ``(n, 2)``.
+    """
+    if n_classes is None or n_classes < 2:
+        raise ValueError(f"classification requires at least two task classes, got {n_classes}")
+    if raw.ndim < 1 or raw.shape[-1] < n_classes:
+        raise ValueError(
+            f"TabICL returned {tuple(raw.shape)} logits, insufficient for {n_classes} task classes"
+        )
+    return raw[..., :n_classes]
 
 
 def _prediction_shape(n_rows: int, problem_type: ProblemType, n_classes: int | None) -> tuple[int, ...]:
@@ -428,6 +488,8 @@ def _fit_one_bag(
     protocol_seed: int,
     backbone: TabICL,
     device: torch.device,
+    run_fingerprint_hash: str | None = None,
+    progress: ProgressCallback | None = None,
 ) -> BagPredictions:
     """Fit one child adapter without reading the OpenML outer-test labels."""
     started = time.perf_counter()
@@ -460,6 +522,15 @@ def _fit_one_bag(
     )
     support_features = fit_features[support_indices]
     support_labels = fit_labels[support_indices]
+    _emit(
+        progress,
+        event="bag_started",
+        task_id=task.task_id,
+        bag=bag,
+        fit_rows=int(fit_indices.size),
+        validation_rows=int(validation_indices.size),
+        support_rows=int(support_indices.size),
+    )
     torch.manual_seed(_seed(int(config["random_state"]), task.task_id, bag, 2))
     if device.type == "cuda":
         torch.cuda.manual_seed_all(_seed(int(config["random_state"]), task.task_id, bag, 2))
@@ -470,6 +541,7 @@ def _fit_one_bag(
             backbone=backbone, adapter=None, numerical_indices=numerical_indices,
             support_features=support_features, support_labels=support_labels,
             query_features=validation_features, problem_type=task.problem_type,
+            n_classes=task.n_classes,
             query_chunk_rows=int(config["evaluation_query_chunk_rows"]),
             target_mean=target_mean, target_scale=target_scale,
         )
@@ -504,7 +576,9 @@ def _fit_one_bag(
             if task.problem_type == "regression":
                 objective = F.mse_loss(backbone.quantile_dist(raw).quantiles.mean(dim=-1).flatten(), query_labels.flatten())
             else:
-                objective = F.cross_entropy(raw.flatten(0, 1), query_labels.long().flatten())
+                objective = F.cross_entropy(
+                    _classification_logits(raw, task.n_classes).flatten(0, 1), query_labels.long().flatten()
+                )
             if step == 1:
                 first_objective = float(objective.detach())
             objective.backward()
@@ -517,6 +591,7 @@ def _fit_one_bag(
                     backbone=backbone, adapter=adapter, numerical_indices=numerical_indices,
                     support_features=support_features, support_labels=support_labels,
                     query_features=validation_features, problem_type=task.problem_type,
+                    n_classes=task.n_classes,
                     query_chunk_rows=int(config["evaluation_query_chunk_rows"]),
                     target_mean=target_mean, target_scale=target_scale,
                 )
@@ -531,6 +606,17 @@ def _fit_one_bag(
                     stale += 1
                     if stale >= int(config["adapter_patience"]):
                         break
+                _emit(
+                    progress,
+                    event="adapter_validation",
+                    task_id=task.task_id,
+                    bag=bag,
+                    step=step,
+                    validation_error=float(candidate_error),
+                    best_validation_error=float(best_error),
+                    stale_validations=stale,
+                    elapsed_seconds=float(time.perf_counter() - started),
+                )
         adapter.load_state_dict(best_state, strict=True)
         adapted_state = _cpu_state_dict(adapter)
         identity_adapter = _make_adapter(support_features, numerical_indices, config, device)
@@ -540,6 +626,7 @@ def _fit_one_bag(
             backbone=backbone, adapter=identity_adapter, numerical_indices=numerical_indices,
             support_features=support_features, support_labels=support_labels,
             query_features=validation_features, problem_type=task.problem_type,
+            n_classes=task.n_classes,
             query_chunk_rows=int(config["evaluation_query_chunk_rows"]),
             target_mean=target_mean, target_scale=target_scale,
         )
@@ -547,6 +634,7 @@ def _fit_one_bag(
             backbone=backbone, adapter=adapter, numerical_indices=numerical_indices,
             support_features=support_features, support_labels=support_labels,
             query_features=validation_features, problem_type=task.problem_type,
+            n_classes=task.n_classes,
             query_chunk_rows=int(config["evaluation_query_chunk_rows"]),
             target_mean=target_mean, target_scale=target_scale,
         )
@@ -566,6 +654,7 @@ def _fit_one_bag(
             backbone=backbone, adapter=None, numerical_indices=numerical_indices,
             support_features=support_features, support_labels=support_labels, query_features=test_features,
             problem_type=task.problem_type, query_chunk_rows=int(config["evaluation_query_chunk_rows"]),
+            n_classes=task.n_classes,
             target_mean=target_mean, target_scale=target_scale,
         )
     else:
@@ -576,6 +665,7 @@ def _fit_one_bag(
             backbone=backbone, adapter=identity_adapter, numerical_indices=numerical_indices,
             support_features=support_features, support_labels=support_labels, query_features=test_features,
             problem_type=task.problem_type, query_chunk_rows=int(config["evaluation_query_chunk_rows"]),
+            n_classes=task.n_classes,
             target_mean=target_mean, target_scale=target_scale,
         )
         adapter.load_state_dict(adapted_state, strict=True)
@@ -583,6 +673,7 @@ def _fit_one_bag(
         backbone=backbone, adapter=adapter, numerical_indices=numerical_indices,
         support_features=support_features, support_labels=support_labels, query_features=test_features,
         problem_type=task.problem_type, query_chunk_rows=int(config["evaluation_query_chunk_rows"]),
+        n_classes=task.n_classes,
         target_mean=target_mean, target_scale=target_scale,
     )
     guarded_test = adapted_test if decision.use_adapted else identity_test
@@ -603,7 +694,9 @@ def _fit_one_bag(
         "adapter_steps_executed": int(executed_steps),
         "train_seconds": float(time.perf_counter() - started),
         "peak_allocated_gib": float(peak_gib),
+        "run_fingerprint_hash": run_fingerprint_hash,
     }
+    _emit(progress, event="bag_completed", task_id=task.task_id, **metadata)
     del adapter
     if device.type == "cuda":
         torch.cuda.empty_cache()
@@ -623,6 +716,102 @@ def _config_dir(output_dir: Path, task: OpenMLTaskData, label: str) -> Path:
     return output_dir / "raw" / f"task_{task.task_id}_{_safe_name(task.dataset_name)}" / f"config_{label}"
 
 
+def _standard_baseline_dir(output_dir: Path, task: OpenMLTaskData) -> Path:
+    return output_dir / "standard_tabarena_baseline" / f"task_{task.task_id}_{_safe_name(task.dataset_name)}"
+
+
+def run_standard_tabarena_baseline(
+    *,
+    task: OpenMLTaskData,
+    output_dir: Path,
+    device: torch.device,
+    classifier_checkpoint: str | Path | None,
+    regressor_checkpoint: str | Path | None,
+    resume: bool,
+    run_fingerprint_hash: str,
+    progress: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    """Run normal public TabICLv2 inference on the full outer-training split.
+
+    This does not take part in DirectSpline guarding, HPO, or ensembling.  It
+    is intentionally stored separately because it uses TabICL's normal eight
+    estimator preprocessing ensemble, whereas the DirectSpline arm needs a
+    differentiable, one-context raw-backbone path.
+    """
+    directory = _standard_baseline_dir(output_dir, task)
+    summary_path = directory / "summary.json"
+    predictions_path = directory / "predictions.npz"
+    if resume and summary_path.is_file() and predictions_path.is_file():
+        summary = _json_load(summary_path)
+        if summary.get("run_fingerprint_hash") != run_fingerprint_hash:
+            raise RuntimeError(
+                f"refusing to resume {directory}: standard-baseline artifacts have a different run fingerprint"
+            )
+        _emit(progress, event="standard_baseline_reused", task_id=task.task_id)
+        return summary
+
+    from tabicl import TabICLClassifier, TabICLRegressor
+
+    directory.mkdir(parents=True, exist_ok=True)
+    started = time.perf_counter()
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    shared = {
+        "n_estimators": int(STANDARD_TABICL_CONFIG["n_estimators"]),
+        "norm_methods": list(STANDARD_TABICL_CONFIG["norm_methods"]),
+        "feat_shuffle_method": str(STANDARD_TABICL_CONFIG["feat_shuffle_method"]),
+        "outlier_threshold": float(STANDARD_TABICL_CONFIG["outlier_threshold"]),
+        "batch_size": int(STANDARD_TABICL_CONFIG["batch_size"]),
+        "kv_cache": bool(STANDARD_TABICL_CONFIG["kv_cache"]),
+        "random_state": int(STANDARD_TABICL_CONFIG["random_state"]),
+        "device": str(device),
+        "verbose": False,
+    }
+    _emit(progress, event="standard_baseline_started", task_id=task.task_id, **shared)
+    if task.problem_type == "regression":
+        estimator = TabICLRegressor(
+            **shared,
+            model_path=str(regressor_checkpoint) if regressor_checkpoint is not None else None,
+            checkpoint_version=REGRESSOR_CHECKPOINT,
+        )
+    else:
+        estimator = TabICLClassifier(
+            **shared,
+            class_shuffle_method=str(STANDARD_TABICL_CONFIG["class_shuffle_method"]),
+            softmax_temperature=float(STANDARD_TABICL_CONFIG["softmax_temperature"]),
+            average_logits=bool(STANDARD_TABICL_CONFIG["average_logits"]),
+            support_many_classes=bool(STANDARD_TABICL_CONFIG["support_many_classes"]),
+            model_path=str(classifier_checkpoint) if classifier_checkpoint is not None else None,
+            checkpoint_version=CLASSIFIER_CHECKPOINT,
+        )
+    estimator.fit(task.x_train, task.y_train)
+    prediction = estimator.predict(task.x_test) if task.problem_type == "regression" else estimator.predict_proba(task.x_test)
+    checkpoint_path = Path(estimator.model_path_)
+    metadata = {
+        "task_id": task.task_id,
+        "dataset_id": task.dataset_id,
+        "dataset_name": task.dataset_name,
+        "problem_type": task.problem_type,
+        "n_classes": task.n_classes,
+        "outer_split_hash": task.outer_split_hash,
+        "standard_tabarena_config": STANDARD_TABICL_CONFIG,
+        "checkpoint": _checkpoint_metadata(checkpoint_path),
+        "run_fingerprint_hash": run_fingerprint_hash,
+        "test": _metric_bundle(task.problem_type, task.y_test, prediction, task.n_classes),
+        "elapsed_seconds": float(time.perf_counter() - started),
+        "peak_allocated_gib": float(
+            0.0 if device.type != "cuda" else torch.cuda.max_memory_allocated(device) / 2**30
+        ),
+    }
+    np.savez_compressed(predictions_path, prediction=prediction)
+    _json_dump(summary_path, metadata)
+    _emit(progress, event="standard_baseline_completed", **metadata)
+    del estimator
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    return metadata
+
+
 def run_task_config(
     *,
     task: OpenMLTaskData,
@@ -635,14 +824,22 @@ def run_task_config(
     classifier_checkpoint: str | Path | None,
     regressor_checkpoint: str | Path | None,
     resume: bool,
+    run_fingerprint_hash: str,
+    progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     """Run/recover all eight child fits for one task/configuration pair."""
     config_dir = _config_dir(output_dir, task, label)
     summary_path = config_dir / "config_summary.json"
     predictions_path = config_dir / "config_predictions.npz"
     if resume and summary_path.is_file() and predictions_path.is_file():
-        return _json_load(summary_path)
-    backbone, checkpoint = load_frozen_backbone(
+        summary = _json_load(summary_path)
+        if summary.get("run_fingerprint_hash") != run_fingerprint_hash:
+            raise RuntimeError(
+                f"refusing to resume {config_dir}: artifacts were made by a different immutable run fingerprint"
+            )
+        _emit(progress, event="config_reused", task_id=task.task_id, config_label=label)
+        return summary
+    backbone, checkpoint, checkpoint_metadata = load_frozen_backbone(
         problem_type=task.problem_type,
         device=device,
         classifier_checkpoint=classifier_checkpoint,
@@ -655,6 +852,11 @@ def run_task_config(
         bag_path = config_dir / f"bag_{bag}.npz"
         if resume and bag_path.is_file():
             bag_result = _load_bag(bag_path)
+            if bag_result.metadata.get("run_fingerprint_hash") != run_fingerprint_hash:
+                raise RuntimeError(
+                    f"refusing to resume {bag_path}: it was made by a different immutable run fingerprint"
+                )
+            _emit(progress, event="bag_reused", task_id=task.task_id, config_label=label, bag=bag)
         else:
             bag_result = _fit_one_bag(
                 task=task,
@@ -665,6 +867,8 @@ def run_task_config(
                 protocol_seed=protocol_seed,
                 backbone=backbone,
                 device=device,
+                run_fingerprint_hash=run_fingerprint_hash,
+                progress=progress,
             )
             _save_bag(bag_path, bag_result)
         bag_results.append(bag_result)
@@ -699,7 +903,8 @@ def run_task_config(
         "outer_split_hash": task.outer_split_hash,
         "config_label": label,
         "config": config,
-        "checkpoint": str(checkpoint),
+        "checkpoint": checkpoint_metadata,
+        "run_fingerprint_hash": run_fingerprint_hash,
         "validation": {
             "identity": _metric_bundle(task.problem_type, task.y_train, identity_validation, task.n_classes),
             "adapted": _metric_bundle(task.problem_type, task.y_train, adapted_validation, task.n_classes),
@@ -718,6 +923,14 @@ def run_task_config(
         "bag_metadata": [result.metadata for result in bag_results],
     }
     _json_dump(summary_path, summary)
+    _emit(
+        progress,
+        event="config_completed",
+        task_id=task.task_id,
+        config_label=label,
+        guarded_validation_error=summary["validation"]["guarded"]["deployment_error"],
+        guarded_test_error=summary["test"]["guarded"]["benchmark_error"],
+    )
     del backbone
     if device.type == "cuda":
         torch.cuda.empty_cache()
@@ -759,6 +972,7 @@ def summarize_task_tuning(
     config_labels: list[str],
     output_dir: Path,
     ensemble_rounds: int,
+    standard_tabarena: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Use OOF validation only to create D, T, and T+E outer-test outputs."""
     summaries = [_json_load(_config_dir(output_dir, task, label) / "config_summary.json") for label in config_labels]
@@ -796,6 +1010,11 @@ def summarize_task_tuning(
         ),
         "tuned_ensemble_selected_config_labels": [config_labels[index] for index in ensemble_indices],
         "default_guard_selected_adapted_fraction": default["guard_selected_adapted_fraction"],
+        "standard_tabarena": None if standard_tabarena is None else standard_tabarena["test"],
+        "standard_tabarena_note": (
+            "Normal full-outer-training TabICLv2 inference; it is a separate public baseline, "
+            "not the matched raw-identity control used by DirectSpline."
+        ),
     }
     _json_dump(output_dir / "task_summaries" / f"task_{task.task_id}_{_safe_name(task.dataset_name)}.json", result)
     return result
@@ -849,16 +1068,24 @@ def summarize_experiment(
             "default_guard_selected_adapted_fraction": item["default_guard_selected_adapted_fraction"],
             "tuned_ensemble_selected_config_labels": ";".join(item["tuned_ensemble_selected_config_labels"]),
         }
+        if item["standard_tabarena"] is not None:
+            row["standard_tabarena_benchmark_error"] = item["standard_tabarena"]["benchmark_error"]
+            row["standard_tabarena_deployment_error"] = item["standard_tabarena"]["deployment_error"]
         for method in methods:
             row[f"{method}_benchmark_error"] = item[method]["benchmark_error"]
             row[f"{method}_deployment_error"] = item[method]["deployment_error"]
             row[f"{method}_minus_identity_benchmark_error"] = (
                 item[method]["benchmark_error"] - item["identity"]["benchmark_error"]
             )
+            if item["standard_tabarena"] is not None:
+                row[f"{method}_minus_standard_tabarena_benchmark_error"] = (
+                    item[method]["benchmark_error"] - item["standard_tabarena"]["benchmark_error"]
+                )
         rows.append(row)
     csv_path = output_dir / "task_results.csv"
     with csv_path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        fieldnames = list(dict.fromkeys(key for row in rows for key in row))
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
     summary = {
@@ -869,6 +1096,18 @@ def summarize_experiment(
         ),
         "metric_note": "Binary: 1-AUC; multiclass: log loss; regression: RMSE for comparison, MSE for guard/HPO.",
         "paired_results": paired,
+        "standard_tabarena": {
+            "available": all(item["standard_tabarena"] is not None for item in task_summaries),
+            "note": (
+                "This is the normal full-outer-training TabICLv2 baseline. It is reported as task metrics "
+                "and mean error only, not folded into the internal paired-Elo scale."
+            ),
+            "mean_benchmark_error": (
+                None
+                if any(item["standard_tabarena"] is None for item in task_summaries)
+                else float(np.mean([item["standard_tabarena"]["benchmark_error"] for item in task_summaries]))
+            ),
+        },
         "task_results_csv": str(csv_path),
     }
     _json_dump(output_dir / "summary.json", summary)
