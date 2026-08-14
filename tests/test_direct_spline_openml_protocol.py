@@ -275,10 +275,26 @@ def test_summary_keeps_standard_tabarena_baseline_out_of_internal_paired_elo(tmp
         "standard_tabarena": {"benchmark_error": 0.20, "deployment_error": 0.20},
     }
     summary = summarize_experiment(
-        task_summaries=[task_summary], output_dir=tmp_path, bootstrap_rounds=5, bootstrap_seed=0
+        task_summaries=[task_summary],
+        output_dir=tmp_path,
+        bootstrap_rounds=5,
+        bootstrap_seed=0,
+        skipped_tasks=[
+            {
+                "task_id": 99,
+                "dataset_name": "wide",
+                "n_features": 1776,
+                "max_features": 100,
+                "reason": "n_features_exceeds_max_features",
+            }
+        ],
+        task_eligibility={"max_features": 100},
     )
     row = (tmp_path / "task_results.csv").read_text(encoding="utf-8").splitlines()[1]
     assert summary["standard_tabarena"]["mean_benchmark_error"] == pytest.approx(0.20)
     assert "standard_tabarena_benchmark_error" in (tmp_path / "task_results.csv").read_text(encoding="utf-8").splitlines()[0]
     assert "0.2" in row
     assert set(summary["paired_results"]) == {"default", "tuned", "tuned_ensemble"}
+    assert summary["n_skipped_tasks"] == 1
+    assert summary["skipped_tasks"][0]["dataset_name"] == "wide"
+    assert summary["task_eligibility"] == {"max_features": 100}

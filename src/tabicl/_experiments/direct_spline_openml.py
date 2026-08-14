@@ -1102,6 +1102,8 @@ def summarize_experiment(
     output_dir: Path,
     bootstrap_rounds: int,
     bootstrap_seed: int,
+    skipped_tasks: list[dict[str, Any]] | None = None,
+    task_eligibility: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Write task metrics and paired-Elo deltas without a TabArena install.
 
@@ -1112,6 +1114,7 @@ def summarize_experiment(
     """
     if not task_summaries:
         raise ValueError("cannot summarise an empty experiment")
+    skipped_tasks = [] if skipped_tasks is None else skipped_tasks
     methods = ("default", "tuned", "tuned_ensemble")
     identity = np.asarray(
         [float(item["identity"]["benchmark_error"]) for item in task_summaries], dtype=float
@@ -1168,6 +1171,9 @@ def summarize_experiment(
         writer.writerows(rows)
     summary = {
         "n_tasks": len(task_summaries),
+        "n_skipped_tasks": len(skipped_tasks),
+        "task_eligibility": task_eligibility,
+        "skipped_tasks": skipped_tasks,
         "paired_elo_note": (
             "Elo deltas are paired DirectSpline-versus-identity values on this run only; "
             "they are not absolute ratings on Retouche's published multi-method pool."

@@ -88,6 +88,15 @@ def parse_args() -> argparse.Namespace:
         help="OpenML task ID. Repeat for a pilot; omit to run the public 51-task suite.",
     )
     parser.add_argument("--max-tasks", type=int, default=None, help="Take the first N suite tasks; for smoke tests only.")
+    parser.add_argument(
+        "--max-features",
+        type=int,
+        default=None,
+        help=(
+            "Skip tasks with more input columns than this cap. Omit to keep the full suite; "
+            "all exclusions are recorded in the progress and final summary."
+        ),
+    )
     parser.add_argument("--outer-repeat", type=int, default=0)
     parser.add_argument("--outer-fold", type=int, default=0)
     parser.add_argument("--outer-sample", type=int, default=0)
@@ -245,6 +254,12 @@ def _event_reporter(path: Path):
                 else f"complete: test={event['test']['benchmark_error']:.6g} time={event['elapsed_seconds']:.1f}s"
             )
             print(f"[{task_prefix}] standard baseline: {suffix}", flush=True)
+        elif event_name == "task_skipped":
+            print(
+                f"[{task_prefix} dataset={event['dataset_name']}] skipped: "
+                f"features={event['n_features']} exceeds max_features={event['max_features']}",
+                flush=True,
+            )
         elif event_name.endswith("reused"):
             print(f"[{task_prefix}] reused {event_name.replace('_', ' ')}", flush=True)
 
@@ -264,6 +279,8 @@ def _validate(args: argparse.Namespace) -> None:
         raise ValueError("random-config and bootstrap counts must be non-negative/positive")
     if args.max_tasks is not None and args.max_tasks <= 0:
         raise ValueError("--max-tasks must be positive")
+    if args.max_features is not None and args.max_features <= 0:
+        raise ValueError("--max-features must be positive")
     if min(args.outer_repeat, args.outer_fold, args.outer_sample) < 0:
         raise ValueError("outer repeat/fold/sample values must be non-negative")
     if args.allow_compatible_code_resume and not args.resume:
@@ -296,6 +313,14 @@ def main() -> None:
                 "fold": args.outer_fold,
                 "sample": args.outer_sample,
             },
+        },
+        "task_eligibility": {
+            "max_features": args.max_features,
+            "rule": (
+                "All input columns are eligible."
+                if args.max_features is None
+                else "Skip a task when its published outer-training table has more input columns than max_features."
+            ),
         },
         "inner_bags": args.bags,
         "inner_bag_policy": (
@@ -384,6 +409,7 @@ def main() -> None:
     device = _resolve_device(args.device)
     progress = _event_reporter(args.output_dir / "progress.jsonl")
     task_summaries: list[dict[str, Any]] = []
+    skipped_tasks: list[dict[str, Any]] = []
     for task_id in task_ids:
         task = load_tabarena_openml_task(
             task_id,
@@ -397,6 +423,27 @@ def main() -> None:
             f"features={task.x_train.shape[1]}",
             flush=True,
         )
+        n_features = int(task.x_train.shape[1])
+        if args.max_features is not None and n_features > args.max_features:
+            skipped = {
+                "task_id": task.task_id,
+                "dataset_id": task.dataset_id,
+                "dataset_name": task.dataset_name,
+                "problem_type": task.problem_type,
+                "n_features": n_features,
+                "max_features": args.max_features,
+                "reason": "n_features_exceeds_max_features",
+            }
+            skipped_tasks.append(skipped)
+            progress({"event": "task_skipped", **skipped})
+            _json_dump(
+                args.output_dir / "run_progress.json",
+                {
+                    "completed_task_ids": [item["task_id"] for item in task_summaries],
+                    "skipped_tasks": skipped_tasks,
+                },
+            )
+            continue
         standard_tabarena = None
         if not args.skip_standard_baseline:
             standard_tabarena = run_standard_tabarena_baseline(
@@ -444,12 +491,20 @@ def main() -> None:
             standard_tabarena=standard_tabarena,
         )
         task_summaries.append(task_summary)
-        _json_dump(args.output_dir / "run_progress.json", {"completed_task_ids": [item["task_id"] for item in task_summaries]})
+        _json_dump(
+            args.output_dir / "run_progress.json",
+            {
+                "completed_task_ids": [item["task_id"] for item in task_summaries],
+                "skipped_tasks": skipped_tasks,
+            },
+        )
     summary = summarize_experiment(
         task_summaries=task_summaries,
         output_dir=args.output_dir,
         bootstrap_rounds=args.bootstrap_rounds,
         bootstrap_seed=args.protocol_seed,
+        skipped_tasks=skipped_tasks,
+        task_eligibility=immutable_run["task_eligibility"],
     )
     print(json.dumps(summary, indent=2), flush=True)
 
