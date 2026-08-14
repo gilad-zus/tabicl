@@ -68,12 +68,33 @@ def deployment_error(
         if prediction.ndim != 2:
             raise ValueError("multiclass predictions must have shape (n_rows, n_classes)")
         classes = np.arange(n_classes if n_classes is not None else prediction.shape[1])
-        return float(log_loss(labels, prediction, labels=classes))
+        # TabICL produces float32 softmax values.  Casting them to NumPy does
+        # not make their row sums exactly one, and sklearn's log_loss rightly
+        # warns when the accumulated float32 rounding error is visible.  Make
+        # the metric's probability contract explicit here.  This is also what
+        # sklearn does internally after issuing that warning, so it does not
+        # change the intended loss; it merely makes the input valid and keeps
+        # a long benchmark log readable.
+        probabilities = _normalise_probability_rows(prediction)
+        return float(log_loss(labels, probabilities, labels=classes))
     if problem_type == "regression":
         if prediction.ndim != 1:
             prediction = prediction.reshape(-1)
         return float(mean_squared_error(labels, prediction))
     raise ValueError(f"unknown problem type: {problem_type!r}")
+
+
+def _normalise_probability_rows(prediction: np.ndarray) -> np.ndarray:
+    """Return finite non-negative class probabilities with unit row sums."""
+    probabilities = np.asarray(prediction, dtype=np.float64)
+    if not np.isfinite(probabilities).all():
+        raise ValueError("multiclass predictions must be finite probabilities")
+    if np.any(probabilities < 0.0):
+        raise ValueError("multiclass predictions must be non-negative probabilities")
+    row_sums = probabilities.sum(axis=1, keepdims=True, dtype=np.float64)
+    if np.any(row_sums <= 0.0):
+        raise ValueError("each multiclass prediction row must have positive probability mass")
+    return probabilities / row_sums
 
 
 def benchmark_error(

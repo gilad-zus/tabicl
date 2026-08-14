@@ -44,11 +44,17 @@ import argparse
 import hashlib
 import importlib.metadata
 import json
+import os
 import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+# This needs to be set before the first CUDA allocation.  It reduces allocator
+# fragmentation without changing model computations; an explicit user setting
+# still takes precedence.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 
@@ -100,6 +106,14 @@ def parse_args() -> argparse.Namespace:
         help="Skip normal eight-estimator TabICLv2 inference; use only for a fast DirectSpline smoke test.",
     )
     parser.add_argument("--resume", action="store_true", help="Reuse completed bag/config artifacts from this exact output directory.")
+    parser.add_argument(
+        "--allow-compatible-code-resume",
+        action="store_true",
+        help=(
+            "With --resume, reuse artifacts after a code-only runtime/metric fix when every experimental "
+            "setting is identical. The source transition is recorded separately."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true", help="Write the frozen manifest but do not download task data or run fits.")
     return parser.parse_args()
 
@@ -178,6 +192,15 @@ def _fingerprint(payload: dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")).hexdigest()
 
 
+def _same_experimental_semantics(previous: dict[str, Any], current: dict[str, Any]) -> bool:
+    """Allow an explicit resume across a recorded code-only runtime fix."""
+    ignored = {"repository_revision", "source_sha256"}
+    return (
+        {key: value for key, value in previous.items() if key not in ignored}
+        == {key: value for key, value in current.items() if key not in ignored}
+    )
+
+
 def _event_reporter(path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -243,6 +266,8 @@ def _validate(args: argparse.Namespace) -> None:
         raise ValueError("--max-tasks must be positive")
     if min(args.outer_repeat, args.outer_fold, args.outer_sample) < 0:
         raise ValueError("outer repeat/fold/sample values must be non-negative")
+    if args.allow_compatible_code_resume and not args.resume:
+        raise ValueError("--allow-compatible-code-resume requires --resume")
 
 
 def main() -> None:
@@ -303,10 +328,38 @@ def main() -> None:
                 "or choose a new --output-dir."
             )
         if previous.get("run_fingerprint_sha256") != run_fingerprint_hash or previous.get("immutable_run") != immutable_run:
-            raise ValueError(
-                "refusing to resume: the existing output directory has a different immutable run fingerprint; "
-                "choose a new --output-dir."
+            previous_run = previous.get("immutable_run")
+            if not (
+                args.allow_compatible_code_resume
+                and isinstance(previous_run, dict)
+                and _same_experimental_semantics(previous_run, immutable_run)
+            ):
+                raise ValueError(
+                    "refusing to resume: the existing output directory has a different immutable run fingerprint; "
+                    "choose a new --output-dir."
+                )
+            prior_hash = str(previous["run_fingerprint_sha256"])
+            provenance_path = args.output_dir / "compatible_code_resumes.jsonl"
+            with provenance_path.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                            "previous_run_fingerprint_sha256": prior_hash,
+                            "previous_source_sha256": previous_run.get("source_sha256"),
+                            "resumed_source_sha256": immutable_run["source_sha256"],
+                            "reason": "explicit compatible code-only resume",
+                        },
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
+            print(
+                "Resuming with explicitly recorded compatible code-only changes; "
+                f"retaining immutable run fingerprint {prior_hash[:12]}",
+                flush=True,
             )
+            run_fingerprint_hash = prior_hash
         manifest = previous
     elif args.resume:
         raise FileNotFoundError(f"cannot safely --resume without {manifest_path}")

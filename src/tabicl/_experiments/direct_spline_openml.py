@@ -25,6 +25,7 @@ import torch.nn.functional as F
 from huggingface_hub import hf_hub_download
 from sklearn.model_selection import KFold, StratifiedKFold
 from sklearn.preprocessing import LabelEncoder
+from torch.utils.checkpoint import checkpoint
 
 from tabicl._experiments.direct_spline_protocol import (
     FoldPreprocessor,
@@ -332,8 +333,9 @@ def _forward(
     context_features: torch.Tensor,
     context_labels: torch.Tensor,
     query_features: torch.Tensor,
+    *,
+    checkpoint_backbone_activations: bool = False,
 ) -> torch.Tensor:
-    backbone.clear_cache()
     features = torch.cat(
         (
             _transform(context_features, adapter, numerical_indices),
@@ -341,7 +343,19 @@ def _forward(
         ),
         dim=1,
     )
-    return backbone(features, context_labels)
+
+    def run_backbone(input_features: torch.Tensor) -> torch.Tensor:
+        backbone.clear_cache()
+        return backbone(input_features, context_labels)
+
+    if checkpoint_backbone_activations:
+        # The backbone is frozen but gradients still need to pass through it
+        # to the DirectSpline adapter.  Checkpointing trades a second frozen
+        # forward call during backward for substantially lower activation
+        # memory, which lets wide OpenML tasks fit on a 10-GiB GPU without
+        # changing an episode's rows or its numerical precision.
+        return checkpoint(run_backbone, features, use_reentrant=False)
+    return run_backbone(features)
 
 
 def _optimizer(adapter: DirectSplineTransform, config: dict[str, Any]) -> torch.optim.Optimizer:
@@ -604,7 +618,15 @@ def _fit_one_bag(
             query_features = train_features[query_rows].unsqueeze(0)
             query_labels = train_labels[query_rows].unsqueeze(0)
             optimizer.zero_grad(set_to_none=True)
-            raw = _forward(backbone, adapter, numerical_indices, context_features, context_labels, query_features)
+            raw = _forward(
+                backbone,
+                adapter,
+                numerical_indices,
+                context_features,
+                context_labels,
+                query_features,
+                checkpoint_backbone_activations=True,
+            )
             if task.problem_type == "regression":
                 objective = F.mse_loss(backbone.quantile_dist(raw).quantiles.mean(dim=-1).flatten(), query_labels.flatten())
             else:
@@ -726,6 +748,7 @@ def _fit_one_bag(
         "adapter_first_objective": first_objective,
         "adapter_final_objective": final_objective,
         "adapter_steps_executed": int(executed_steps),
+        "backbone_activation_checkpointing": adapter is not None,
         "train_seconds": float(time.perf_counter() - started),
         "peak_allocated_gib": float(peak_gib),
         "run_fingerprint_hash": run_fingerprint_hash,

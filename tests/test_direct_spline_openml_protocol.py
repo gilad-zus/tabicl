@@ -1,3 +1,5 @@
+import warnings
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -55,6 +57,19 @@ def test_preprocessor_rejects_reordered_columns():
     preprocessor = FoldPreprocessor.fit(pd.DataFrame({"a": [1, 2], "b": ["x", "y"]}))
     with pytest.raises(ValueError, match="columns"):
         preprocessor.transform(pd.DataFrame({"b": ["x"], "a": [1]}))
+
+
+def test_multiclass_deployment_error_normalizes_softmax_rounding_without_warning():
+    labels = np.array([0, 1, 2])
+    # These are representative float32 softmax rows after conversion to
+    # float64: valid probabilities, but not exact unit sums.
+    prediction = np.array(
+        [[0.70000005, 0.20000002, 0.09999999], [0.1, 0.80000007, 0.09999998], [0.2, 0.3, 0.49999994]]
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        error = deployment_error("multiclass", labels, prediction, n_classes=3)
+    assert np.isfinite(error)
 
 
 def test_classification_episode_is_disjoint_and_preserves_classes():
@@ -237,6 +252,7 @@ def test_one_bag_is_train_only_and_returns_complete_prediction_artifacts():
     assert np.allclose(result.guarded_validation.sum(axis=1), 1.0)
     assert result.metadata["fit_rows"] == 16
     assert result.metadata["validation_rows"] == 8
+    assert result.metadata["backbone_activation_checkpointing"] is True
 
 
 def test_summary_keeps_standard_tabarena_baseline_out_of_internal_paired_elo(tmp_path):
