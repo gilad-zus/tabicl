@@ -59,7 +59,6 @@ try:  # Supports tests and ``python scripts/...`` invocation.
     from scripts.hyperspline_synthetic_train import (
         SYNTHETIC_OBSERVATION_MODES,
         SyntheticEpisode,
-        forward_episode,
         generate_episodes,
         generate_scheduled_episodes,
         load_episode_bank,
@@ -79,7 +78,6 @@ except ModuleNotFoundError:  # pragma: no cover - direct invocation.
     from hyperspline_synthetic_train import (
         SYNTHETIC_OBSERVATION_MODES,
         SyntheticEpisode,
-        forward_episode,
         generate_episodes,
         generate_scheduled_episodes,
         load_episode_bank,
@@ -87,7 +85,13 @@ except ModuleNotFoundError:  # pragma: no cover - direct invocation.
         validate_episode_classes,
     )
 
-from tabicl._hyperspline import HyperSplineTransform, backbone_state_dict_hash, load_hyperspline_checkpoint, save_hyperspline_checkpoint
+from tabicl._hyperspline import (
+    HyperSplineTransform,
+    backbone_state_dict_hash,
+    load_hyperspline_checkpoint,
+    save_hyperspline_checkpoint,
+    summarize_context,
+)
 
 
 MANIFEST_VERSION = 1
@@ -320,6 +324,8 @@ def hyperspline_config(args: argparse.Namespace) -> dict[str, Any]:
         "hidden_dim": args.hidden_dim,
         "gate_initial_probability": args.gate_initial_probability,
         "target_aware": args.target_aware,
+        "conditioning_mode": args.conditioning_mode,
+        "capacity_matched_conditioning": args.capacity_matched_conditioning,
     }
 
 
@@ -338,23 +344,42 @@ def model_state_cpu(module: torch.nn.Module) -> dict[str, torch.Tensor]:
 
 
 def forward_identity(backbone, episode: SyntheticEpisode) -> tuple[torch.Tensor, torch.Tensor]:
-    """Unmodified TabICL baseline; never constructs a HyperSpline module."""
-    logits = backbone(torch.cat((episode.x_context, episode.x_query), dim=1), episode.y_context)
+    """The fixed context-standardisation baseline used by an identity HyperSpline.
+
+    A zero-deformation HyperSpline standardises both partitions by context
+    location/scale before reaching TabICL.  Comparing a learned spline to raw
+    features would therefore accidentally credit basic standardisation rather
+    than the learned monotone deformation.
+    """
+    statistics = summarize_context(episode.x_context.float())
+    context = (episode.x_context.float() - statistics.location.unsqueeze(1)) / statistics.scale.unsqueeze(1)
+    query = (episode.x_query.float() - statistics.location.unsqueeze(1)) / statistics.scale.unsqueeze(1)
+    logits = backbone(torch.cat((context, query), dim=1), episode.y_context)
     logits = logits[..., : episode.n_classes]
     loss = F.cross_entropy(logits.flatten(0, 1), episode.y_query.flatten())
     return loss, logits
 
 
-def forward_hyperspline(backbone, hyperspline: HyperSplineTransform, episode: SyntheticEpisode) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
-    """Use the shared implementation, but apply TabICL's task-class contract.
+def forward_hyperspline(
+    backbone, hyperspline: HyperSplineTransform, episode: SyntheticEpisode
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    """Apply the audited conditioner without ever exposing query labels.
 
-    The checkpoint has ``max_classes`` outputs.  Synthetic tasks may use fewer
-    labels, so both training loss and deployed probabilities must restrict to
-    the same leading task-specific head.
+    ``HyperSplineTransform.forward`` is essential for ``query_marginal``: it
+    builds a label-free summary of ``x_query`` alongside target-aware context
+    statistics.  The older streaming helper only supported context-only
+    conditioning, so using it here would silently run a different experiment.
     """
-    _, logits, diagnostics = forward_episode(backbone, hyperspline, episode)
+    transformed_context, transformed_query, parameters = hyperspline(
+        episode.x_context,
+        episode.x_query,
+        y_context=episode.y_context if hyperspline.target_aware else None,
+        return_parameters=True,
+    )
+    logits = backbone(torch.cat((transformed_context, transformed_query), dim=1), episode.y_context)
     logits = logits[..., : episode.n_classes]
     loss = F.cross_entropy(logits.flatten(0, 1), episode.y_query.flatten())
+    diagnostics = {"grid_deformation_penalty": hyperspline.grid_deformation_penalty(parameters)}
     return loss, logits, diagnostics
 
 
@@ -369,6 +394,30 @@ def validation_mean_nll(backbone, hyperspline: HyperSplineTransform, episodes: S
     return float(np.mean(losses))
 
 
+def identity_validation_mean_nll(backbone, episodes: Sequence[SyntheticEpisode]) -> float:
+    """Selection reference matching the deployed identity preprocessing exactly."""
+    losses = []
+    with torch.no_grad():
+        for episode in episodes:
+            backbone.clear_cache()
+            loss, _ = forward_identity(backbone, episode)
+            losses.append(float(loss))
+    return float(np.mean(losses))
+
+
+def training_source_seed(train_seed: int, step: int) -> int:
+    """Return a unique-in-practice NumPy-compatible seed for one stream step.
+
+    NumPy's legacy global RNG accepts only unsigned 32-bit seeds.  The prior
+    stream deliberately spaces step seeds by 1,000,003; reducing modulo
+    ``2**32`` preserves every already-valid historical seed and gives this
+    odd stride a full 2**32-step period, far beyond this benchmark's budget.
+    """
+    if step <= 0:
+        raise ValueError("training step must be positive")
+    return (int(train_seed) + int(step) * 1_000_003) % (2**32)
+
+
 def scheduled_training_episodes(args: argparse.Namespace, step: int, device: torch.device) -> list[SyntheticEpisode]:
     """Fresh task batch whose shape cycle matches the frozen hold-out schedule."""
     choices = [(length, fraction) for length in args.sequence_lengths for fraction in args.context_fractions]
@@ -377,11 +426,11 @@ def scheduled_training_episodes(args: argparse.Namespace, step: int, device: tor
     step_args = argparse.Namespace(**vars(args))
     step_args.sequence_length = int(length)
     step_args.context_fraction = float(fraction)
-    # A step-specific seed makes generation independent of resume history.
+    # A step-specific uint32 seed makes generation independent of resume history.
     return generate_episodes(
         step_args,
         args.tasks_per_step,
-        source_seed=args.train_seed + step * 1_000_003,
+        source_seed=training_source_seed(args.train_seed, step),
         task_offset=1_000_000_000 + step * args.tasks_per_step,
         device=device,
     )
@@ -476,7 +525,7 @@ def train(args: argparse.Namespace) -> None:
     write_json(run_dir / "run_config.json", {"fingerprint": fingerprint, "args": vars(args), "manifest": str(manifest_path(args.output_dir))})
     current_step, best_step = 0, 0
     hyperspline.eval()
-    best_loss = validation_mean_nll(backbone, hyperspline, validation)
+    best_loss = identity_validation_mean_nll(backbone, validation)
     best_state = model_state_cpu(hyperspline)
     if args.resume:
         if not state_path.is_file():
@@ -578,6 +627,7 @@ def train(args: argparse.Namespace) -> None:
                         "budget_step": step,
                         "selected_step": best_step,
                         "selected_validation_nll": best_loss,
+                        "model_config": model_config,
                         "manifest_hash": sha256_file(manifest_path(args.output_dir)),
                         "raw_final_test_used": False,
                     },
@@ -845,7 +895,24 @@ def parse_args() -> argparse.Namespace:
     train_parser.add_argument("--hidden-dim", type=int, default=64)
     train_parser.add_argument("--n-control-points", type=int, default=20)
     train_parser.add_argument("--gate-initial-probability", type=float, default=0.10)
-    train_parser.add_argument("--target-aware", action="store_true")
+    train_parser.add_argument(
+        "--conditioning-mode",
+        choices=("context", "query_marginal", "context_query_shift"),
+        default="query_marginal",
+        help="Primary arm is query_marginal, exactly the 33D conditioning input audited above.",
+    )
+    train_parser.add_argument(
+        "--target-aware",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use the context-label statistics in query_marginal conditioning; query labels are never accepted.",
+    )
+    train_parser.add_argument(
+        "--capacity-matched-conditioning",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Pad control arms to the largest conditioner width so arm comparisons isolate available information.",
+    )
     train_parser.add_argument("--transform-regularization", type=float, default=0.0)
     train_parser.add_argument("--model-seed", type=int, default=0)
     train_parser.add_argument("--train-seed", type=int, default=61_001)

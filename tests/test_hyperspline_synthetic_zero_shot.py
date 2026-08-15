@@ -6,8 +6,35 @@ import argparse
 
 import numpy as np
 import pytest
+import torch
 
 from scripts import hyperspline_synthetic_zero_shot as zero_shot
+from scripts.hyperspline_synthetic_train import SyntheticEpisode
+from tabicl._hyperspline import HyperSplineTransform
+
+
+class _ToyBackbone:
+    """Small differentiable stand-in that returns logits only for query rows."""
+
+    def clear_cache(self) -> None:
+        pass
+
+    def __call__(self, features: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        query = features[:, labels.shape[1] :, 0]
+        return torch.stack((query, -query), dim=-1)
+
+
+def _episode() -> SyntheticEpisode:
+    return SyntheticEpisode(
+        task_id=1,
+        source_seed=1,
+        x_context=torch.tensor([[[0.0, 1.0], [1.0, 0.0], [2.0, 1.0], [3.0, 0.0]]]),
+        x_query=torch.tensor([[[0.5, 0.5], [2.5, 0.5]]]),
+        y_context=torch.tensor([[0.0, 1.0, 0.0, 1.0]]),
+        y_query=torch.tensor([0, 1]),
+        n_classes=2,
+        observation_mode="coverage_expanded",
+    )
 
 
 def test_paired_elo_delta_counts_wins_losses_and_ties():
@@ -16,6 +43,54 @@ def test_paired_elo_delta_counts_wins_losses_and_ties():
     assert (result["wins"], result["losses"], result["ties"]) == (2, 1, 1)
     assert result["score"] == pytest.approx(0.625)
     assert result["elo_delta"] > 0
+
+
+def test_training_stream_seed_wraps_at_numpy_uint32_boundary_without_repeating():
+    # The prior failure occurred here: old arithmetic exceeded NumPy's valid
+    # [0, 2**32 - 1] seed range around step 4,295.
+    values = [zero_shot.training_source_seed(61_001, step) for step in range(1, 5_001)]
+    assert all(0 <= value < 2**32 for value in values)
+    assert len(values) == len(set(values))
+    # Keep the already-completed pre-wrap run reproducible.
+    assert values[0] == 61_001 + 1_000_003
+
+
+def test_query_marginal_transform_receives_query_features_but_not_query_labels():
+    torch.manual_seed(3)
+    model = HyperSplineTransform(
+        n_control_points=6,
+        hidden_dim=8,
+        target_aware=True,
+        conditioning_mode="query_marginal",
+        capacity_matched_conditioning=True,
+    ).eval()
+    # Make the initially zero output head visibly depend on the conditioner.
+    with torch.no_grad():
+        model.mlp[-1].weight.zero_()
+        model.mlp[-1].bias.zero_()
+        model.mlp[-1].weight[5].fill_(1.0)  # The scalar spline gate.
+    episode = _episode()
+    _, _, first = model(episode.x_context, episode.x_query, y_context=episode.y_context, return_parameters=True)
+    # An unlabeled query-location shift changes the two alignment features.
+    _, _, shifted = model(episode.x_context, episode.x_query + 5.0, y_context=episode.y_context, return_parameters=True)
+    assert not torch.allclose(first.gate, shifted.gate)
+
+
+def test_identity_baseline_matches_an_untrained_query_marginal_hyperspline():
+    torch.manual_seed(4)
+    model = HyperSplineTransform(
+        n_control_points=6,
+        hidden_dim=8,
+        gate_initial_probability=0.1,
+        target_aware=True,
+        conditioning_mode="query_marginal",
+        capacity_matched_conditioning=True,
+    ).eval()
+    episode, backbone = _episode(), _ToyBackbone()
+    identity_loss, identity_logits = zero_shot.forward_identity(backbone, episode)
+    model_loss, model_logits, _ = zero_shot.forward_hyperspline(backbone, model, episode)
+    torch.testing.assert_close(model_logits, identity_logits)
+    torch.testing.assert_close(model_loss, identity_loss)
 
 
 def test_seed_averaging_keeps_one_elo_game_per_table():

@@ -1073,6 +1073,11 @@ def summarize_task_tuning(
         "problem_type": task.problem_type,
         "n_classes": task.n_classes,
         "outer_split_hash": task.outer_split_hash,
+        "pipeline": default.get("pipeline", "lite_raw"),
+        "identity_definition": default.get(
+            "identity_definition",
+            "Raw frozen TabICL identity path used by the legacy lite DirectSpline runner.",
+        ),
         "identity": _metric_bundle(task.problem_type, task.y_test, identity_test, task.n_classes),
         "default": default["test"]["guarded"],
         "tuned": summaries[selected_index]["test"]["guarded"],
@@ -1089,7 +1094,7 @@ def summarize_task_tuning(
         "standard_tabarena": None if standard_tabarena is None else standard_tabarena["test"],
         "standard_tabarena_note": (
             "Normal full-outer-training TabICLv2 inference; it is a separate public baseline, "
-            "not the matched raw-identity control used by DirectSpline."
+            "not the matched inner-bag identity control used by DirectSpline."
         ),
     }
     _json_dump(output_dir / "task_summaries" / f"task_{task.task_id}_{_safe_name(task.dataset_name)}.json", result)
@@ -1140,6 +1145,7 @@ def summarize_experiment(
             "dataset_name": item["dataset_name"],
             "problem_type": item["problem_type"],
             "outer_split_hash": item["outer_split_hash"],
+            "pipeline": item.get("pipeline", "lite_raw"),
             "identity_benchmark_error": item["identity"]["benchmark_error"],
             "identity_deployment_error": item["identity"]["deployment_error"],
             "tuned_config_label": item["tuned_config_label"],

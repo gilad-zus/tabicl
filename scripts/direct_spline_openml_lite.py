@@ -36,6 +36,14 @@ Do not alter the default configuration after inspecting a smoke-test outer-test
 score.  Its purpose is only to verify data access, memory, and artifact layout.
 Use a new output directory for each changed command; ``--resume`` accepts only
 the exact immutable fingerprint recorded in its manifest.
+
+The sibling ``direct_spline_openml_standard.py`` launcher selects the corrected
+full-pipeline arm.  It keeps TabICLv2's ordinary preprocessing and eight-view
+ensemble in both its identity and spline paths, so its paired Elo directly
+answers whether the spline itself helps.  The default uses every row of each
+inner-bag fit partition as context.  ``--context-cap`` is available for a
+memory-constrained diagnostic, but is explicitly labelled as capped rather
+than public-estimator parity.
 """
 
 from __future__ import annotations
@@ -78,9 +86,14 @@ from tabicl._experiments.direct_spline_protocol import (
     DEFAULT_DIRECT_SPLINE_CONFIG,
     shared_random_direct_spline_configs,
 )
+from tabicl._experiments.direct_spline_openml_standard import (
+    run_task_config_standard,
+    shared_standard_direct_spline_configs,
+    standard_direct_spline_config,
+)
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(*, default_pipeline: str = "lite") -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
@@ -106,6 +119,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ensemble-rounds", type=int, default=None, help="Defaults to twice the number of configs.")
     parser.add_argument("--protocol-seed", type=int, default=0, help="Controls shared bags and support contexts, not HPO draws.")
     parser.add_argument("--bootstrap-rounds", type=int, default=200)
+    parser.add_argument(
+        "--pipeline",
+        choices=("lite", "standard"),
+        default=default_pipeline,
+        help=(
+            "'lite' reproduces the existing raw one-context headroom path. "
+            "'standard' uses the matched normal TabICLv2 preprocessing/ensemble path."
+        ),
+    )
+    parser.add_argument(
+        "--context-cap",
+        type=int,
+        default=0,
+        help=(
+            "Standard pipeline only: maximum inner-bag fit rows used as context. "
+            "0 (the default) means every fit row and enables exact public-estimator identity parity."
+        ),
+    )
+    parser.add_argument(
+        "--train-context-rows",
+        type=int,
+        default=1024,
+        help="Standard pipeline only: sampled labelled-context rows per adapter training episode.",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--classifier-checkpoint", type=Path, default=None)
     parser.add_argument("--regressor-checkpoint", type=Path, default=None)
@@ -159,6 +196,7 @@ def _experiment_source_hashes() -> dict[str, str]:
     paths = {
         "launcher": Path(__file__).resolve(),
         "openml_runner": root / "src" / "tabicl" / "_experiments" / "direct_spline_openml.py",
+        "standard_openml_runner": root / "src" / "tabicl" / "_experiments" / "direct_spline_openml_standard.py",
         "protocol": root / "src" / "tabicl" / "_experiments" / "tabarena_direct_spline_protocol.py",
         "direct_spline": root / "src" / "tabicl" / "_hyperspline" / "module.py",
     }
@@ -220,8 +258,9 @@ def _event_reporter(path: Path):
         event_name = event["event"]
         task_prefix = f"task={event.get('task_id', '?')}"
         if event_name == "bag_started":
+            pipeline = " standard" if event.get("pipeline") == "standard_ensemble" else ""
             print(
-                f"[{task_prefix} bag={event['bag']}] fitting: train={event['fit_rows']} "
+                f"[{task_prefix} bag={event['bag']}{pipeline}] fitting: train={event['fit_rows']} "
                 f"validation={event['validation_rows']} support={event['support_rows']}",
                 flush=True,
             )
@@ -233,11 +272,14 @@ def _event_reporter(path: Path):
                 flush=True,
             )
         elif event_name == "bag_completed":
+            parity = ""
+            if "identity_parity_max_abs_validation" in event:
+                parity = f" parity≤{event['identity_parity_max_abs_validation']:.2g}"
             print(
                 f"[{task_prefix} bag={event['bag']}] complete: guard={'adapted' if event['guard_selected_adapted'] else 'identity'} "
                 f"validation={event['adapted_error']:.6g}/{event['identity_error']:.6g} "
                 f"steps={event['adapter_steps_executed']} time={event['train_seconds']:.1f}s "
-                f"peak={event['peak_allocated_gib']:.2f}GiB",
+                f"peak={event['peak_allocated_gib']:.2f}GiB{parity}",
                 flush=True,
             )
         elif event_name == "config_started":
@@ -267,6 +309,20 @@ def _event_reporter(path: Path):
 
 
 def _configs(args: argparse.Namespace) -> tuple[list[str], list[dict[str, Any]]]:
+    if args.pipeline == "standard":
+        context_cap = None if args.context_cap == 0 else args.context_cap
+        default = standard_direct_spline_config(
+            context_cap=context_cap,
+            train_context_rows=args.train_context_rows,
+        )
+        random = shared_standard_direct_spline_configs(
+            args.n_random_configs,
+            seed=args.tuning_seed,
+            context_cap=context_cap,
+        )
+        for config in random:
+            config["train_context_rows"] = args.train_context_rows
+        return ["D", *(f"R{index + 1}" for index in range(len(random)))], [default, *random]
     default = dict(DEFAULT_DIRECT_SPLINE_CONFIG)
     random = shared_random_direct_spline_configs(args.n_random_configs, seed=args.tuning_seed)
     return ["D", *(f"R{index + 1}" for index in range(len(random)))], [default, *random]
@@ -281,14 +337,18 @@ def _validate(args: argparse.Namespace) -> None:
         raise ValueError("--max-tasks must be positive")
     if args.max_features is not None and args.max_features <= 0:
         raise ValueError("--max-features must be positive")
+    if args.context_cap < 0:
+        raise ValueError("--context-cap must be zero (all rows) or positive")
+    if args.train_context_rows <= 0:
+        raise ValueError("--train-context-rows must be positive")
     if min(args.outer_repeat, args.outer_fold, args.outer_sample) < 0:
         raise ValueError("outer repeat/fold/sample values must be non-negative")
     if args.allow_compatible_code_resume and not args.resume:
         raise ValueError("--allow-compatible-code-resume requires --resume")
 
 
-def main() -> None:
-    args = parse_args()
+def main(*, default_pipeline: str = "lite") -> None:
+    args = parse_args(default_pipeline=default_pipeline)
     _validate(args)
     labels, configs = _configs(args)
     task_ids = list(args.task_id) if args.task_id else tabarena_v0pt1_task_ids()
@@ -299,7 +359,7 @@ def main() -> None:
     checkpoint_fingerprints = None if args.dry_run else _resolve_run_checkpoints(args, task_ids)
     manifest_path = args.output_dir / "experiment_manifest.json"
     immutable_run = {
-        "schema_version": 2,
+        "schema_version": 3,
         "repository_revision": _git_revision(),
         "source_sha256": _experiment_source_hashes(),
         "python": sys.version,
@@ -330,11 +390,22 @@ def main() -> None:
         "protocol_seed": args.protocol_seed,
         "bootstrap_rounds": args.bootstrap_rounds,
         "ensemble_rounds": args.ensemble_rounds or max(1, 2 * len(configs)),
+        "pipeline": args.pipeline,
+        "standard_pipeline": (
+            None
+            if args.pipeline == "lite"
+            else {
+                "identity_context": "all inner-bag fit rows" if args.context_cap == 0 else "stratified capped rows",
+                "context_cap": None if args.context_cap == 0 else args.context_cap,
+                "train_context_rows": args.train_context_rows,
+                "normal_tabarena_config": STANDARD_TABICL_CONFIG,
+            }
+        ),
         "guard": {
             "binary": "1 - ROC-AUC",
             "multiclass": "log loss",
             "regression": "MSE",
-            "required_relative_improvement": DEFAULT_DIRECT_SPLINE_CONFIG["guard_relative_improvement"],
+            "required_relative_improvement": configs[0]["guard_relative_improvement"],
         },
         "leaderboard_metric": {"binary": "1 - ROC-AUC", "multiclass": "log loss", "regression": "RMSE"},
         "config_labels": labels,
@@ -391,13 +462,17 @@ def main() -> None:
     else:
         args.output_dir.mkdir(parents=True, exist_ok=True)
         manifest = {
-            "experiment": "DirectSpline OpenML TabArena-v0.1 Lite reproduction",
+            "experiment": (
+                "DirectSpline OpenML TabArena-v0.1 standard-ensemble experiment"
+                if args.pipeline == "standard"
+                else "DirectSpline OpenML TabArena-v0.1 Lite reproduction"
+            ),
             "created_at_utc": datetime.now(timezone.utc).isoformat(),
             "immutable_run": immutable_run,
             "run_fingerprint_sha256": run_fingerprint_hash,
             "outer_test_policy": "never read by preprocessing fitting, adapter optimisation, guard, HPO, or ensembling",
             "absolute_elo_note": (
-                "This run computes paired Elo deltas versus its own matched raw TabICL identity baseline. "
+                "This run computes paired Elo deltas versus its own matched TabICL identity baseline. "
                 "Those deltas cannot be compared numerically with absolute ELO on TabArena's large published method pool."
             ),
         }
@@ -463,7 +538,8 @@ def main() -> None:
                 f"{effective_bags}/{args.bags} valid stratified bags",
                 flush=True,
             )
-            result = run_task_config(
+            run_config = run_task_config_standard if args.pipeline == "standard" else run_task_config
+            result = run_config(
                 task=task,
                 label=label,
                 config=config,
