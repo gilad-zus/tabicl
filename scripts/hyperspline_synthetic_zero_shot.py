@@ -455,6 +455,27 @@ def run_fingerprint(args: argparse.Namespace, manifest: dict[str, Any]) -> str:
     )
 
 
+def checkpoint_budgets(args: argparse.Namespace) -> list[int]:
+    """Return declared plus optional diagnostic checkpoint budgets.
+
+    Extra budgets decide only when an already-trained state is serialized; they
+    do not alter the task stream, model, optimizer, or validation selection.
+    They are intentionally excluded from ``run_fingerprint`` so a completed
+    40k state can be resumed to add an 80k snapshot without invalidating it.
+    """
+    primary = list(args.scale_tasks)
+    extra = list(getattr(args, "extra_checkpoint_tasks", ()))
+    if primary != sorted(primary):
+        raise ValueError("--scale-tasks must be strictly increasing")
+    if len(extra) != len(set(extra)):
+        raise ValueError("--extra-checkpoint-tasks must not repeat a budget")
+    if set(primary).intersection(extra):
+        raise ValueError("--extra-checkpoint-tasks must not duplicate --scale-tasks")
+    if extra and max(extra) > max(primary):
+        raise ValueError("extra checkpoint budgets must not exceed the final --scale-tasks budget")
+    return sorted((*primary, *extra))
+
+
 def save_training_state(
     path: Path,
     *,
@@ -487,10 +508,9 @@ def save_training_state(
 def train(args: argparse.Namespace) -> None:
     manifest = load_manifest(args.output_dir)
     validate_training_distribution(args, manifest)
-    if any(tasks % args.tasks_per_step for tasks in args.scale_tasks):
-        raise ValueError("every --scale-tasks value must be divisible by --tasks-per-step")
-    if args.scale_tasks != sorted(args.scale_tasks):
-        raise ValueError("--scale-tasks must be strictly increasing")
+    all_checkpoint_budgets = checkpoint_budgets(args)
+    if any(tasks % args.tasks_per_step for tasks in all_checkpoint_budgets):
+        raise ValueError("every checkpoint budget must be divisible by --tasks-per-step")
     if args.max_train_steps is not None and args.max_train_steps <= 0:
         raise ValueError("--max-train-steps must be positive")
     target_step = max(args.scale_tasks) // args.tasks_per_step
@@ -559,7 +579,7 @@ def train(args: argparse.Namespace) -> None:
             best_state=best_state,
         )
 
-    scale_steps = {tasks: tasks // args.tasks_per_step for tasks in args.scale_tasks}
+    scale_steps = {tasks: tasks // args.tasks_per_step for tasks in all_checkpoint_budgets}
     for step in range(current_step + 1, target_step + 1):
         hyperspline.train()
         episodes = scheduled_training_episodes(args, step, device)
@@ -783,12 +803,23 @@ def report(args: argparse.Namespace) -> None:
     if device.type == "cuda" and device.index is not None:
         torch.cuda.set_device(device)
     backbone, _ = load_backbone(args, device)
-    test = load_bank_from_manifest(args.output_dir, manifest, "test", device)
-    validate_episode_classes(test, backbone.max_classes)
-    baseline = {episode.task_id: metric_row(backbone, None, episode) for episode in test}
-    output_dir = args.output_dir / "reports"
+    evaluation_bank = load_bank_from_manifest(args.output_dir, manifest, args.bank, device)
+    validate_episode_classes(evaluation_bank, backbone.max_classes)
+    baseline = {episode.task_id: metric_row(backbone, None, episode) for episode in evaluation_bank}
+    output_dir = args.output_dir / "reports" / args.bank
     all_rows: list[dict[str, Any]] = []
-    all_summary: dict[str, Any] = {"protocol": manifest["protocol"], "runs": {}}
+    all_summary: dict[str, Any] = {
+        "protocol": manifest["protocol"],
+        "evaluated_bank": args.bank,
+        "is_final_test": args.bank == "test",
+        "selection_note": (
+            "This validation-bank report is diagnostic only: its mean NLL selected these checkpoints. "
+            "Do not treat it as final generalization evidence."
+            if args.bank == "validation"
+            else "This is the frozen final test bank, which was not used for training or checkpoint selection."
+        ),
+        "runs": {},
+    }
     rows_by_budget: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for run_dir in args.run_dir:
         run_dir = Path(run_dir)
@@ -808,7 +839,7 @@ def report(args: argparse.Namespace) -> None:
             )
             hyperspline.eval()
             rows = []
-            for episode in test:
+            for episode in evaluation_bank:
                 candidate = metric_row(backbone, hyperspline, episode)
                 row: dict[str, Any] = {
                     "run": run_dir.name,
@@ -842,7 +873,7 @@ def report(args: argparse.Namespace) -> None:
         }
     write_csv(output_dir / "per_table_metrics.csv", all_rows)
     write_json(output_dir / "summary.json", all_summary)
-    print(f"Wrote held-out zero-shot metrics: {output_dir}", flush=True)
+    print(f"Wrote {args.bank} zero-shot metrics: {output_dir}", flush=True)
 
 
 def add_shared_benchmark_arguments(parser: argparse.ArgumentParser) -> None:
@@ -888,6 +919,12 @@ def parse_args() -> argparse.Namespace:
     train_parser.add_argument("--device", default="cuda")
     train_parser.add_argument("--run-name", required=True)
     train_parser.add_argument("--scale-tasks", type=parse_int_csv, required=True, help="Cumulative fresh-task budgets, e.g. 40000,160000,640000.")
+    train_parser.add_argument(
+        "--extra-checkpoint-tasks",
+        type=parse_int_csv,
+        default=[],
+        help="Optional intermediate snapshots (for example 80000); safe to add when resuming because it does not change training.",
+    )
     train_parser.add_argument("--max-train-steps", type=int, default=None, help="Smoke-test cap; never marks an unfinished scale as complete.")
     train_parser.add_argument("--tasks-per-step", type=int, default=4)
     train_parser.add_argument("--validate-every", type=int, default=1000)
@@ -918,13 +955,19 @@ def parse_args() -> argparse.Namespace:
     train_parser.add_argument("--train-seed", type=int, default=61_001)
     train_parser.add_argument("--resume", action="store_true")
 
-    report_parser = subparsers.add_parser("report", help="Open frozen test bank after all selection is complete.")
+    report_parser = subparsers.add_parser("report", help="Report a validation diagnostic or, only when appropriate, the frozen final test bank.")
     report_parser.add_argument("--output-dir", type=Path, required=True)
     report_parser.add_argument("--checkpoint", default=None)
     report_parser.add_argument("--checkpoint-version", default="tabicl-classifier-v2-20260212.ckpt")
     report_parser.add_argument("--device", default="cuda")
     report_parser.add_argument("--run-dir", type=Path, action="append", required=True, help="May be repeated for independently seeded runs.")
     report_parser.add_argument("--scale-tasks", type=parse_int_csv, required=True)
+    report_parser.add_argument(
+        "--bank",
+        choices=("validation", "test"),
+        default="test",
+        help="validation is a checkpoint-selection diagnostic; test is the final unopened bank.",
+    )
     report_parser.add_argument("--bootstrap-seed", type=int, default=9_001)
     report_parser.add_argument("--bootstrap-samples", type=int, default=2000)
     return parser.parse_args()

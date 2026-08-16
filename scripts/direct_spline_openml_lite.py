@@ -347,17 +347,54 @@ def _validate(args: argparse.Namespace) -> None:
         raise ValueError("--allow-compatible-code-resume requires --resume")
 
 
+def _frozen_manifest_task_ids(manifest: dict[str, Any], manifest_path: Path) -> list[int]:
+    """Read the canonical task order from an existing immutable manifest."""
+    try:
+        raw_task_ids = manifest["immutable_run"]["data_source"]["task_ids"]
+    except (KeyError, TypeError) as error:
+        raise ValueError(
+            f"cannot safely resume: {manifest_path} has no immutable OpenML task list"
+        ) from error
+    if not isinstance(raw_task_ids, list) or not raw_task_ids:
+        raise ValueError(f"cannot safely resume: {manifest_path} has an invalid immutable OpenML task list")
+    try:
+        task_ids = [int(task_id) for task_id in raw_task_ids]
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"cannot safely resume: {manifest_path} has a non-integer OpenML task ID") from error
+    if len(set(task_ids)) != len(task_ids):
+        raise ValueError(f"cannot safely resume: {manifest_path} has duplicate OpenML task IDs")
+    return task_ids
+
+
 def main(*, default_pipeline: str = "lite") -> None:
     args = parse_args(default_pipeline=default_pipeline)
     _validate(args)
     labels, configs = _configs(args)
-    task_ids = list(args.task_id) if args.task_id else tabarena_v0pt1_task_ids()
+    manifest_path = args.output_dir / "experiment_manifest.json"
+    previous: dict[str, Any] | None = None
+    if manifest_path.is_file():
+        if not args.resume:
+            raise FileExistsError(
+                f"{manifest_path} already exists. Use --resume only for the exact immutable run, "
+                "or choose a new --output-dir."
+            )
+        previous = json.loads(manifest_path.read_text(encoding="utf-8"))
+    elif args.resume:
+        raise FileNotFoundError(f"cannot safely --resume without {manifest_path}")
+
+    if args.task_id:
+        task_ids = list(args.task_id)
+    elif previous is not None:
+        # A resume must be reproducible even when OpenML is temporarily down.
+        task_ids = _frozen_manifest_task_ids(previous, manifest_path)
+        print(f"Resuming with {len(task_ids)} task ID(s) frozen in {manifest_path}; skipping OpenML suite lookup", flush=True)
+    else:
+        task_ids = tabarena_v0pt1_task_ids()
     if len(set(task_ids)) != len(task_ids):
         raise ValueError("task IDs must be unique")
     if args.max_tasks is not None:
         task_ids = task_ids[: args.max_tasks]
     checkpoint_fingerprints = None if args.dry_run else _resolve_run_checkpoints(args, task_ids)
-    manifest_path = args.output_dir / "experiment_manifest.json"
     immutable_run = {
         "schema_version": 3,
         "repository_revision": _git_revision(),
@@ -416,13 +453,7 @@ def main(*, default_pipeline: str = "lite") -> None:
         "standard_tabarena_baseline": None if args.skip_standard_baseline else STANDARD_TABICL_CONFIG,
     }
     run_fingerprint_hash = _fingerprint(immutable_run)
-    if manifest_path.is_file():
-        previous = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if not args.resume:
-            raise FileExistsError(
-                f"{manifest_path} already exists. Use --resume only for the exact immutable run, "
-                "or choose a new --output-dir."
-            )
+    if previous is not None:
         if previous.get("run_fingerprint_sha256") != run_fingerprint_hash or previous.get("immutable_run") != immutable_run:
             previous_run = previous.get("immutable_run")
             if not (
@@ -457,8 +488,6 @@ def main(*, default_pipeline: str = "lite") -> None:
             )
             run_fingerprint_hash = prior_hash
         manifest = previous
-    elif args.resume:
-        raise FileNotFoundError(f"cannot safely --resume without {manifest_path}")
     else:
         args.output_dir.mkdir(parents=True, exist_ok=True)
         manifest = {

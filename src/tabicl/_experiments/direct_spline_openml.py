@@ -265,20 +265,52 @@ def load_tabarena_openml_task(
     )
 
 
-def tabarena_v0pt1_task_ids() -> list[int]:
-    """Return the canonical 51 public task IDs from OpenML suite 457."""
+def tabarena_v0pt1_task_ids(*, attempts: int = 5, initial_retry_seconds: float = 5.0) -> list[int]:
+    """Return the canonical 51 public task IDs from OpenML suite 457.
+
+    OpenML's study endpoint occasionally returns a transient gateway error even
+    while individual task downloads are healthy.  Retrying here is safe: the
+    resulting list is checked for the exact published cardinality before it is
+    ever used to create a new manifest.  Resumed runs do not call this helper;
+    they recover their already-frozen task IDs from ``experiment_manifest``.
+    """
+    if attempts < 1:
+        raise ValueError("attempts must be positive")
+    if initial_retry_seconds < 0:
+        raise ValueError("initial_retry_seconds must be non-negative")
     try:
         import openml
     except ModuleNotFoundError as error:  # pragma: no cover - launcher diagnosis.
         raise ModuleNotFoundError("Install `openml` to obtain the public task suite.") from error
-    suite = openml.study.get_suite(TABARENA_V0PT1_OPENML_SUITE_ID)
-    task_ids = [int(task_id) for task_id in suite.tasks]
-    if len(task_ids) != 51:
-        raise RuntimeError(
-            f"OpenML suite {TABARENA_V0PT1_OPENML_SUITE_ID} returned {len(task_ids)} tasks, expected 51. "
-            "Refuse to run against a silently changed benchmark suite."
-        )
-    return task_ids
+    for attempt in range(1, attempts + 1):
+        try:
+            suite = openml.study.get_suite(TABARENA_V0PT1_OPENML_SUITE_ID)
+            task_ids = [int(task_id) for task_id in suite.tasks]
+            if len(task_ids) != 51:
+                raise RuntimeError(
+                    f"OpenML suite {TABARENA_V0PT1_OPENML_SUITE_ID} returned {len(task_ids)} tasks, expected 51. "
+                    "Refuse to run against a silently changed benchmark suite."
+                )
+            return task_ids
+        except RuntimeError:
+            # A successful response with a changed suite is not transient and
+            # must never be retried into a different benchmark definition.
+            raise
+        except Exception as error:
+            if attempt == attempts:
+                raise RuntimeError(
+                    f"could not retrieve OpenML suite {TABARENA_V0PT1_OPENML_SUITE_ID} after {attempts} attempts; "
+                    "start a new run later, or use --resume for an output directory that already has an "
+                    "experiment_manifest.json"
+                ) from error
+            delay_seconds = initial_retry_seconds * (2 ** (attempt - 1))
+            print(
+                f"OpenML suite {TABARENA_V0PT1_OPENML_SUITE_ID} request failed "
+                f"({type(error).__name__}: {error}); retrying in {delay_seconds:g}s "
+                f"({attempt}/{attempts})",
+                flush=True,
+            )
+            time.sleep(delay_seconds)
 
 
 def _make_adapter(

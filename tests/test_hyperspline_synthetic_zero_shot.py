@@ -55,6 +55,14 @@ def test_training_stream_seed_wraps_at_numpy_uint32_boundary_without_repeating()
     assert values[0] == 61_001 + 1_000_003
 
 
+def test_intermediate_checkpoint_budget_can_be_added_without_changing_primary_schedule():
+    args = argparse.Namespace(scale_tasks=[40_000, 160_000, 640_000], extra_checkpoint_tasks=[80_000])
+    assert zero_shot.checkpoint_budgets(args) == [40_000, 80_000, 160_000, 640_000]
+    args.extra_checkpoint_tasks = [40_000]
+    with pytest.raises(ValueError, match="must not duplicate"):
+        zero_shot.checkpoint_budgets(args)
+
+
 def test_query_marginal_transform_receives_query_features_but_not_query_labels():
     torch.manual_seed(3)
     model = HyperSplineTransform(

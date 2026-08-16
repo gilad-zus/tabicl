@@ -368,7 +368,7 @@ def _forward_method(
     feature_shuffles: list[list[int]],
     checkpoint_activations: bool,
 ) -> torch.Tensor:
-    """Forward the frozen normal inference path, retaining gradients to splines."""
+    """Forward one preprocessed normal-ensemble branch."""
 
     backbone = bundle.backbone
 
@@ -377,12 +377,11 @@ def _forward_method(
         return backbone(
             X=features,
             y_train=labels,
-            # The public classifier supplies the shuffle metadata so its
-            # column embedder can share work across equivalent tables.  The
-            # public regressor instead forwards its already-shuffled views
-            # without that metadata.  Preserve that small but real pipeline
-            # difference here; otherwise an "identity" spline would not be
-            # the normal regressor.
+            # The public classifier supplies shuffle metadata so its column
+            # embedder can share work across equivalent tables.  The public
+            # regressor instead forwards its already-shuffled views without
+            # that metadata.  Preserve that small but real pipeline
+            # difference for the eval/parity path.
             feature_shuffles=feature_shuffles if bundle.problem_type != "regression" else None,
             return_logits=True,
             softmax_temperature=float(STANDARD_TABICL_CONFIG["softmax_temperature"]),
@@ -394,6 +393,24 @@ def _forward_method(
     return run(views)
 
 
+def _enable_frozen_training_path(backbone: TabICL) -> None:
+    """Enable TabICL's autograd path without making its weights trainable.
+
+    TabICL's evaluation path dispatches through its memory manager, which
+    deliberately executes under ``torch.no_grad``.  That is right for normal
+    prediction and is exactly what the parity checks exercise, but cannot
+    train an upstream spline.  TabICL's train-mode path computes the same
+    supplied ensemble views directly and retains the input gradient.  Keep all
+    backbone parameters frozen and force Dropout back to evaluation mode, just
+    as the legacy DirectSpline runner does.
+    """
+
+    backbone.train()
+    for module in backbone.modules():
+        if isinstance(module, torch.nn.Dropout):
+            module.eval()
+
+
 def _aggregate_classification_logits(
     outputs: list[tuple[torch.Tensor, list[np.ndarray | None]]],
     *,
@@ -403,6 +420,11 @@ def _aggregate_classification_logits(
 
     corrected: list[torch.Tensor] = []
     for raw, patterns in outputs:
+        # Match TabICLClassifier._batch_forward, which promotes every AMP
+        # member to float32 before undoing class shuffles, averaging logits,
+        # and applying the ensemble softmax.  Keeping this reduction in
+        # float16 can move probabilities by several 1e-3 on larger tasks.
+        raw = raw.float()
         for index, pattern in enumerate(patterns):
             if pattern is None:
                 raise RuntimeError("classification ensemble member is missing its class shuffle")
@@ -423,6 +445,10 @@ def _normal_prediction(
 ) -> np.ndarray:
     """Predict with normal ensemble views and an optional DirectSpline set."""
 
+    # This is the public-inference-equivalent side of the comparison.  In
+    # particular, evaluation mode uses TabICL's shuffled-view optimization
+    # and no-grad inference manager.
+    bundle.backbone.eval()
     generator = bundle.estimator.ensemble_generator_
     query_encoded = _encoded_query(bundle, query_x)
     outputs: list[tuple[torch.Tensor, list[np.ndarray | None]]] = []
@@ -448,7 +474,9 @@ def _normal_prediction(
                 checkpoint_activations=False,
             )
             if bundle.problem_type == "regression":
-                regression_outputs.append(bundle.backbone.quantile_dist(raw).quantiles.mean(dim=-1))
+                # The public regressor likewise promotes each member's final
+                # statistic before the cross-estimator mean.
+                regression_outputs.append(bundle.backbone.quantile_dist(raw).quantiles.mean(dim=-1).float())
             else:
                 outputs.append((raw, class_patterns))
     if bundle.problem_type == "regression":
@@ -547,6 +575,7 @@ def _training_logits(
 ) -> torch.Tensor:
     """Return normal-ensemble logits/predictions for one sampled training episode."""
 
+    _enable_frozen_training_path(bundle.backbone)
     generator = bundle.estimator.ensemble_generator_
     classification_outputs: list[tuple[torch.Tensor, list[np.ndarray | None]]] = []
     regression_outputs: list[torch.Tensor] = []
@@ -618,20 +647,31 @@ def _fit_one_bag_standard(
     if device.type == "cuda":
         torch.cuda.manual_seed_all(adapter_seed)
     adapters = _make_adapters(bundle, config, device)
-    identity_validation, parity_validation, parity_reference = _identity_parity(
-        bundle=bundle,
-        adapters=adapters,
-        query_x=validation_x,
-        device=device,
-        config=config,
-    )
-    identity_test, parity_test, parity_reference_test = _identity_parity(
-        bundle=bundle,
-        adapters=adapters,
-        query_x=test_x,
-        device=device,
-        config=config,
-    )
+    if adapters is None:
+        # A numerical spline cannot alter a categorical-only (or wholly
+        # constant-after-filtering) table.  Use the public estimator directly
+        # for all three arms, rather than requiring an unnecessary manual
+        # reconstruction to agree with it.  This is an explicit neutral tie,
+        # not a skipped or hidden task.
+        identity_validation = _identity_prediction(bundle, validation_x)
+        identity_test = _identity_prediction(bundle, test_x)
+        parity_validation = parity_test = 0.0
+        parity_reference = parity_reference_test = "public_no_trainable_numerical_features"
+    else:
+        identity_validation, parity_validation, parity_reference = _identity_parity(
+            bundle=bundle,
+            adapters=adapters,
+            query_x=validation_x,
+            device=device,
+            config=config,
+        )
+        identity_test, parity_test, parity_reference_test = _identity_parity(
+            bundle=bundle,
+            adapters=adapters,
+            query_x=test_x,
+            device=device,
+            config=config,
+        )
     _emit(
         progress,
         event="bag_started",
@@ -753,6 +793,7 @@ def _fit_one_bag_standard(
         "effective_bags": effective_bags,
         "n_features": int(task.x_train.shape[1]),
         "n_numerical_features": int(bundle.numerical_indices.size),
+        "no_trainable_numerical_features": bool(adapters is None),
         "normal_estimators": int(STANDARD_TABICL_CONFIG["n_estimators"]),
         "pipeline": "standard_ensemble",
         "context_policy": (

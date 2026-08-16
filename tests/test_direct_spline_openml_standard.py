@@ -18,6 +18,7 @@ class _TinyStandardBackbone(torch.nn.Module):
         super().__init__()
         self.max_classes = 10
         self.head = torch.nn.Linear(2, 10)
+        self.forward_training_flags = []
 
     def clear_cache(self):
         pass
@@ -32,9 +33,18 @@ class _TinyStandardBackbone(torch.nn.Module):
         inference_config=None,
     ):
         del feature_shuffles, return_logits, softmax_temperature, inference_config
+        self.forward_training_flags.append(self.training)
         # The real inference head exposes exactly the task's label width,
         # rather than the checkpoint's maximum class count.
         return self.head(X[:, y_train.shape[1] :])[..., :2]
+
+
+class _HalfPrecisionEvalBackbone(_TinyStandardBackbone):
+    """Mimic the reduced-precision output produced by AMP inference."""
+
+    def forward(self, *args, **kwargs):
+        output = super().forward(*args, **kwargs)
+        return output if self.training else output.half()
 
 
 def test_standard_config_uses_all_fit_rows_unless_explicitly_capped():
@@ -87,6 +97,7 @@ def test_standard_runner_checks_public_identity_and_preserves_prediction_shapes(
         "query_batch_rows": 4,
         "cross_column_mixing_rank": 0,
     }
+    backbone = _HalfPrecisionEvalBackbone()
     result = _fit_one_bag_standard(
         task=task,
         fit_indices=np.arange(16),
@@ -94,7 +105,7 @@ def test_standard_runner_checks_public_identity_and_preserves_prediction_shapes(
         bag=0,
         config=config,
         protocol_seed=0,
-        backbone=_TinyStandardBackbone(),
+        backbone=backbone,
         device=torch.device("cpu"),
         run_fingerprint_hash="test",
         progress=None,
@@ -109,3 +120,49 @@ def test_standard_runner_checks_public_identity_and_preserves_prediction_shapes(
     assert result.metadata["support_rows"] == 16
     assert result.metadata["identity_parity_reference"] == "public_full_context_estimator"
     assert result.metadata["identity_parity_max_abs_validation"] <= config["identity_parity_atol"]
+    # Evaluation/parity runs use the public inference mode; adapter updates
+    # switch only the frozen backbone execution path back to autograd mode.
+    assert any(backbone.forward_training_flags)
+    assert any(not flag for flag in backbone.forward_training_flags)
+
+
+def test_categorical_only_task_is_recorded_as_a_public_identity_tie():
+    rows = 32
+    features = pd.DataFrame(
+        {
+            "role": np.tile(["analyst", "manager"], rows // 2),
+            "resource": np.tile(["a", "b", "c", "d"], rows // 4),
+        }
+    )
+    labels = np.tile([0, 1], rows // 2)
+    task = OpenMLTaskData(
+        task_id=2,
+        dataset_id=3,
+        dataset_name="categorical_only",
+        problem_type="binary",
+        n_classes=2,
+        x_train=features.iloc[:24].reset_index(drop=True),
+        y_train=labels[:24],
+        x_test=features.iloc[24:].reset_index(drop=True),
+        y_test=labels[24:],
+        outer_split_hash="test",
+    )
+    result = _fit_one_bag_standard(
+        task=task,
+        fit_indices=np.arange(16),
+        validation_indices=np.arange(16, 24),
+        bag=0,
+        config=standard_direct_spline_config(train_context_rows=4),
+        protocol_seed=0,
+        backbone=_TinyStandardBackbone(),
+        device=torch.device("cpu"),
+        run_fingerprint_hash="test",
+        progress=None,
+        requested_bags=8,
+        effective_bags=8,
+    )
+    assert result.metadata["no_trainable_numerical_features"]
+    assert result.metadata["identity_parity_reference"] == "public_no_trainable_numerical_features"
+    assert result.metadata["adapter_steps_executed"] == 0
+    assert np.array_equal(result.identity_validation, result.adapted_validation)
+    assert np.array_equal(result.identity_test, result.guarded_test)

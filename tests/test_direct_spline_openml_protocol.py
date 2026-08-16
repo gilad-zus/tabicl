@@ -1,3 +1,5 @@
+import sys
+import types
 import warnings
 
 import numpy as np
@@ -12,7 +14,9 @@ from tabicl._experiments.direct_spline_openml import (
     effective_inner_bag_count,
     greedy_validation_ensemble,
     summarize_experiment,
+    tabarena_v0pt1_task_ids,
 )
+import tabicl._experiments.direct_spline_openml as direct_spline_openml
 from tabicl._experiments.direct_spline_protocol import (
     DEFAULT_DIRECT_SPLINE_CONFIG,
     FoldPreprocessor,
@@ -96,6 +100,26 @@ def test_prediction_context_is_train_only_stratified_subset():
     )
     assert rows.size == 6
     assert set(labels[rows]) == {0, 1}
+
+
+def test_tabarena_suite_lookup_retries_a_transient_openml_failure(monkeypatch):
+    calls = 0
+
+    def get_suite(_suite_id):
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise ConnectionError("temporary gateway failure")
+        return types.SimpleNamespace(tasks=list(range(51)))
+
+    fake_openml = types.SimpleNamespace(study=types.SimpleNamespace(get_suite=get_suite))
+    monkeypatch.setitem(sys.modules, "openml", fake_openml)
+    delays: list[float] = []
+    monkeypatch.setattr(direct_spline_openml.time, "sleep", delays.append)
+
+    assert tabarena_v0pt1_task_ids(attempts=3, initial_retry_seconds=0.25) == list(range(51))
+    assert calls == 3
+    assert delays == [0.25, 0.5]
 
 
 def test_identity_guard_requires_full_half_percent_relative_improvement():
