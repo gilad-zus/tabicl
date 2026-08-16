@@ -68,6 +68,36 @@ def test_standard_adapter_identity_changes_only_numeric_positions():
     assert torch.equal(transformed[..., 1], canonical[..., 1])
 
 
+def test_standard_direct_spline_is_bit_exact_identity_before_first_update():
+    canonical = torch.tensor(
+        [
+            [-3.1251, -0.5001, 0.3334],
+            [-1.0002, 0.4999, 1.7501],
+            [0.1251, 2.0002, 4.1251],
+        ],
+        dtype=torch.float32,
+    )
+    support = canonical.unsqueeze(0)
+    adapter = DirectSplineTransform(
+        support,
+        n_control_points=20,
+        trainable_location_scale=True,
+        cross_column_mixing_rank=3,
+        cross_column_mixing_bound=0.1,
+    )
+    with torch.no_grad():
+        adapter.location.zero_()
+        adapter.scale.fill_(1.0)
+
+    transformed = adapter.transform(support)
+
+    # Exact equality matters here: an allclose-sized perturbation before an
+    # AMP backbone can cross a float16 rounding boundary.
+    assert torch.equal(transformed, support)
+    transformed.sum().backward()
+    assert adapter.gap_logits.grad is not None
+
+
 def test_standard_runner_checks_public_identity_and_preserves_prediction_shapes():
     rows = 32
     features = pd.DataFrame(

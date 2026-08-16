@@ -63,6 +63,13 @@ def test_intermediate_checkpoint_budget_can_be_added_without_changing_primary_sc
         zero_shot.checkpoint_budgets(args)
 
 
+def test_probability_normalisation_removes_float32_softmax_row_sum_drift():
+    raw = np.asarray([[0.10000001, 0.2, 0.7], [0.3, 0.3, 0.40000004]], dtype=np.float32)
+    probabilities = zero_shot.normalise_probability_rows(raw)
+    np.testing.assert_allclose(probabilities.sum(axis=1), np.ones(2), rtol=0.0, atol=1e-15)
+    assert probabilities.dtype == np.float64
+
+
 def test_query_marginal_transform_receives_query_features_but_not_query_labels():
     torch.manual_seed(3)
     model = HyperSplineTransform(

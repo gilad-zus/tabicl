@@ -668,6 +668,28 @@ def train(args: argparse.Namespace) -> None:
     print(f"Training {status} through {target_step * args.tasks_per_step:,} tasks. Run report only after a requested scale checkpoint exists.", flush=True)
 
 
+def normalise_probability_rows(prediction: np.ndarray) -> np.ndarray:
+    """Validate and exactly normalise float32 softmax rows for sklearn metrics.
+
+    TabICL emits float32 softmax values.  Conversion to float64 preserves their
+    tiny accumulated rounding error, which recent sklearn versions warn about
+    even though they normalise internally afterward.  Normalising here makes
+    the metric input contract explicit and keeps long reports readable without
+    suppressing unrelated warnings.
+    """
+    probabilities = np.asarray(prediction, dtype=np.float64)
+    if probabilities.ndim != 2:
+        raise ValueError("class probabilities must have shape (n_rows, n_classes)")
+    if not np.isfinite(probabilities).all():
+        raise ValueError("class probabilities must be finite")
+    if np.any(probabilities < 0.0):
+        raise ValueError("class probabilities must be non-negative")
+    row_sums = probabilities.sum(axis=1, keepdims=True, dtype=np.float64)
+    if np.any(row_sums <= 0.0):
+        raise ValueError("each probability row must have positive mass")
+    return probabilities / row_sums
+
+
 def metric_row(backbone, hyperspline: HyperSplineTransform | None, episode: SyntheticEpisode) -> dict[str, float]:
     with torch.no_grad():
         backbone.clear_cache()
@@ -675,7 +697,7 @@ def metric_row(backbone, hyperspline: HyperSplineTransform | None, episode: Synt
             _, logits = forward_identity(backbone, episode)
         else:
             _, logits, _ = forward_hyperspline(backbone, hyperspline, episode)
-        probabilities = torch.softmax(logits.flatten(0, 1), dim=-1).cpu().numpy().astype(np.float64)
+        probabilities = normalise_probability_rows(torch.softmax(logits.flatten(0, 1), dim=-1).cpu().numpy())
     labels = episode.y_query.detach().cpu().numpy().astype(int)
     nll = float(log_loss(labels, probabilities, labels=list(range(episode.n_classes))))
     accuracy = float((probabilities.argmax(axis=1) == labels).mean())

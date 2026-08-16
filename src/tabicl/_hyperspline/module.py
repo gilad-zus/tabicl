@@ -770,7 +770,18 @@ class DirectSplineTransform(nn.Module):
             identity_gaps = identity_controls[..., 1:] - identity_controls[..., :-1]
             gaps = identity_gaps * torch.exp(torch.tanh(self.gap_logits))
             gaps = 2.0 * gaps / gaps.sum(dim=-1, keepdim=True).clamp_min(self.eps)
-            controls = torch.cat((torch.full_like(gaps[..., :1], -1.0), -1.0 + gaps.cumsum(dim=-1)), dim=-1)
+            # Express the learned curve as a residual around the exact
+            # Greville identity controls.  Constructing controls from a
+            # normalized cumulative sum is mathematically equivalent, but at
+            # zero logits its float32 roundoff can leave a tiny non-identity
+            # curve.  That perturbation is enough to cross an AMP rounding
+            # boundary in a frozen downstream model.
+            reference_gaps = 2.0 * identity_gaps / identity_gaps.sum(dim=-1, keepdim=True).clamp_min(self.eps)
+            control_residual = torch.cat(
+                (torch.zeros_like(gaps[..., :1]), (gaps - reference_gaps).cumsum(dim=-1)),
+                dim=-1,
+            )
+            controls = identity_controls + control_residual
         location, scale, _ = self._location_scale_range()
         return HyperSplineParameters(controls, torch.sigmoid(self.gate_logits), location, scale)
 
@@ -852,8 +863,20 @@ class DirectSplineTransform(nn.Module):
         _, _, standardized_range = self._location_scale_range()
         z = (x.float() - params.location.unsqueeze(1)) / params.scale.unsqueeze(1)
         u = (z / standardized_range.unsqueeze(1)).clamp(-1.0, 1.0)
-        spline = evaluate_bspline(u, params.control_points, self.knots_for_transform(), self.degree)
-        return z + params.gate.unsqueeze(1) * standardized_range.unsqueeze(1) * (spline - u)
+        knots = self.knots_for_transform()
+        identity_controls = greville_abscissae(knots, self.degree, params.control_points.shape[-1])
+        # B-spline evaluation is linear in its controls.  Evaluating only the
+        # control-point residual is algebraically the same as
+        # ``spline(u) - u``, while producing a bit-exact zero for a freshly
+        # initialized identity spline instead of subtracting two rounded
+        # polynomial evaluations.
+        spline_residual = evaluate_bspline(
+            u,
+            params.control_points - identity_controls,
+            knots,
+            self.degree,
+        )
+        return z + params.gate.unsqueeze(1) * standardized_range.unsqueeze(1) * spline_residual
 
     def transform(self, x: torch.Tensor) -> torch.Tensor:
         output = self.unmixed_transform(x)
