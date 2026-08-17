@@ -83,6 +83,13 @@ STANDARD_DIRECT_SPLINE_CONFIG: dict[str, Any] = {
     "random_state": 0,
 }
 
+# The public estimator and the reconstructed path both delegate large-query
+# inference to automatic memory managers.  Their numerical execution plans can
+# diverge solely because live GPU memory differs between the two sequential
+# calls.  A fixed probe keeps the public-path audit deterministic.  The matched
+# no-spline versus fresh-spline audit still covers every validation/test row.
+PUBLIC_IDENTITY_PARITY_MAX_ROWS = 8_192
+
 
 @dataclass
 class _StandardBag:
@@ -499,6 +506,13 @@ def _identity_prediction(bundle: _StandardBag, query_x: Any) -> np.ndarray:
     return np.asarray(bundle.estimator.predict_proba(query_x), dtype=np.float64)
 
 
+def _leading_rows(query_x: Any, n_rows: int) -> Any:
+    """Return a positional prefix without losing DataFrame column metadata."""
+    if hasattr(query_x, "iloc"):
+        return query_x.iloc[:n_rows].reset_index(drop=True)
+    return query_x[:n_rows]
+
+
 def _identity_parity(
     *,
     bundle: _StandardBag,
@@ -525,20 +539,39 @@ def _identity_parity(
     )
     parity_errors: list[float] = []
     if bundle.support_indices.size == bundle.fit_labels.size:
-        public_identity = _identity_prediction(bundle, query_x)
-        max_public_abs = float(np.max(np.abs(matched_identity - public_identity)))
+        query_rows = len(query_x)
+        public_parity_rows = min(query_rows, PUBLIC_IDENTITY_PARITY_MAX_ROWS)
+        if public_parity_rows == query_rows:
+            matched_public_probe = matched_identity
+            public_query = query_x
+        else:
+            public_query = _leading_rows(query_x, public_parity_rows)
+            matched_public_probe = _normal_prediction(
+                bundle=bundle,
+                query_x=public_query,
+                context_indices=bundle.support_indices,
+                adapters=None,
+                device=device,
+            )
+        public_identity = _identity_prediction(bundle, public_query)
+        max_public_abs = float(np.max(np.abs(matched_public_probe - public_identity)))
         if not np.allclose(
-            matched_identity,
+            matched_public_probe,
             public_identity,
             rtol=float(config["identity_parity_rtol"]),
             atol=float(config["identity_parity_atol"]),
         ):
             raise RuntimeError(
                 "standard-pipeline identity parity failed: the reconstructed normal TabICL path differs from "
-                f"the public estimator (max_abs={max_public_abs:.3g}). Refuse to train against a mismatched baseline."
+                f"the public estimator on its {public_parity_rows}-row parity probe "
+                f"(max_abs={max_public_abs:.3g}). Refuse to train against a mismatched baseline."
             )
         parity_errors.append(max_public_abs)
-        reference = "public_full_context_estimator"
+        reference = (
+            "public_full_context_estimator"
+            if public_parity_rows == query_rows
+            else f"public_full_context_estimator_probe_{public_parity_rows}_of_{query_rows}"
+        )
     else:
         reference = "matched_capped_standard_views"
     if adapters is None:

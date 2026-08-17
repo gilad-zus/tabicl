@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import torch
 
+import tabicl._experiments.direct_spline_openml_standard as standard_openml
 from tabicl._experiments.direct_spline_openml import OpenMLTaskData
 from tabicl._experiments.direct_spline_openml_standard import (
     _apply_adapter,
@@ -196,3 +197,54 @@ def test_categorical_only_task_is_recorded_as_a_public_identity_tie():
     assert result.metadata["adapter_steps_executed"] == 0
     assert np.array_equal(result.identity_validation, result.adapted_validation)
     assert np.array_equal(result.identity_test, result.guarded_test)
+
+
+def test_large_query_uses_bounded_public_probe_but_full_spline_parity(monkeypatch):
+    rows = 40
+    features = pd.DataFrame(
+        {
+            "x0": np.linspace(-1.0, 1.0, rows),
+            "x1": np.tile([0.0, 1.0], rows // 2),
+        }
+    )
+    labels = np.tile([0, 1], rows // 2)
+    task = OpenMLTaskData(
+        task_id=3,
+        dataset_id=4,
+        dataset_name="bounded_public_probe",
+        problem_type="binary",
+        n_classes=2,
+        x_train=features.iloc[:24].reset_index(drop=True),
+        y_train=labels[:24],
+        x_test=features.iloc[24:].reset_index(drop=True),
+        y_test=labels[24:],
+        outer_split_hash="test",
+    )
+    monkeypatch.setattr(standard_openml, "PUBLIC_IDENTITY_PARITY_MAX_ROWS", 4)
+    config = {
+        **standard_direct_spline_config(train_context_rows=4),
+        "adapter_steps": 1,
+        "adapter_patience": 1,
+        "validation_interval": 1,
+        "query_batch_rows": 4,
+        "cross_column_mixing_rank": 0,
+    }
+
+    result = _fit_one_bag_standard(
+        task=task,
+        fit_indices=np.arange(16),
+        validation_indices=np.arange(16, 24),
+        bag=0,
+        config=config,
+        protocol_seed=0,
+        backbone=_HalfPrecisionEvalBackbone(),
+        device=torch.device("cpu"),
+        run_fingerprint_hash="test",
+        progress=None,
+        requested_bags=8,
+        effective_bags=8,
+    )
+
+    assert result.metadata["identity_parity_reference"] == "public_full_context_estimator_probe_4_of_8"
+    assert result.metadata["identity_parity_reference_test"] == "public_full_context_estimator_probe_4_of_16"
+    assert result.identity_test.shape == (16, 2)

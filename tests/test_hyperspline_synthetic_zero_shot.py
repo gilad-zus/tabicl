@@ -45,6 +45,31 @@ def test_paired_elo_delta_counts_wins_losses_and_ties():
     assert result["elo_delta"] > 0
 
 
+def test_binary_deployment_surrogate_rewards_correct_ranking():
+    labels = torch.tensor([0, 0, 1, 1])
+    good = torch.tensor([[[2.0, -2.0], [1.0, -1.0], [-1.0, 1.0], [-2.0, 2.0]]])
+    bad = good.flip(-1)
+    assert zero_shot.deployment_surrogate(good, labels, 2, 0.1) < zero_shot.deployment_surrogate(bad, labels, 2, 0.1)
+
+
+def test_cdf_conditioner_is_identity_initialized_and_row_invariant():
+    torch.manual_seed(3)
+    model = HyperSplineTransform(
+        n_control_points=8, hidden_dim=16, conditioning_mode="cdf",
+        target_aware=True, generate_location=True, generate_scale=True,
+        gate_location_scale=True, cdf_quantiles=9, cdf_num_heads=4,
+    )
+    episode = _episode()
+    context, query = model(episode.x_context, episode.x_query, y_context=episode.y_context)
+    permutation = torch.tensor([2, 0, 3, 1])
+    permuted_context, permuted_query = model(
+        episode.x_context[:, permutation], episode.x_query,
+        y_context=episode.y_context[:, permutation],
+    )
+    assert torch.allclose(query, permuted_query, atol=1e-6)
+    assert torch.allclose(context[:, permutation], permuted_context, atol=1e-6)
+
+
 def test_training_stream_seed_wraps_at_numpy_uint32_boundary_without_repeating():
     # The prior failure occurred here: old arithmetic exceeded NumPy's valid
     # [0, 2**32 - 1] seed range around step 4,295.

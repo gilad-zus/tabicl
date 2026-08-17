@@ -49,6 +49,7 @@ than public-estimator parity.
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import importlib.metadata
 import json
@@ -297,11 +298,18 @@ def _event_reporter(path: Path):
             )
             print(f"[{task_prefix}] standard baseline: {suffix}", flush=True)
         elif event_name == "task_skipped":
-            print(
-                f"[{task_prefix} dataset={event['dataset_name']}] skipped: "
-                f"features={event['n_features']} exceeds max_features={event['max_features']}",
-                flush=True,
-            )
+            if event.get("reason") == "cuda_out_of_memory":
+                print(
+                    f"[{task_prefix} dataset={event['dataset_name']}] skipped after CUDA OOM "
+                    f"during {event['stage']}; continuing with the next task",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[{task_prefix} dataset={event['dataset_name']}] skipped: "
+                    f"features={event['n_features']} exceeds max_features={event['max_features']}",
+                    flush=True,
+                )
         elif event_name.endswith("reused"):
             print(f"[{task_prefix}] reused {event_name.replace('_', ' ')}", flush=True)
 
@@ -345,6 +353,43 @@ def _validate(args: argparse.Namespace) -> None:
         raise ValueError("outer repeat/fold/sample values must be non-negative")
     if args.allow_compatible_code_resume and not args.resume:
         raise ValueError("--allow-compatible-code-resume requires --resume")
+
+
+def _is_cuda_out_of_memory(error: BaseException) -> bool:
+    """Recognize both modern typed and older text-only PyTorch CUDA OOMs."""
+    return isinstance(error, torch.OutOfMemoryError) or (
+        isinstance(error, RuntimeError) and "CUDA out of memory" in str(error)
+    )
+
+
+def _write_run_progress(
+    output_dir: Path,
+    task_summaries: list[dict[str, Any]],
+    skipped_tasks: list[dict[str, Any]],
+) -> None:
+    _json_dump(
+        output_dir / "run_progress.json",
+        {
+            "completed_task_ids": [item["task_id"] for item in task_summaries],
+            "skipped_tasks": skipped_tasks,
+        },
+    )
+
+
+def _persisted_cuda_oom_skips(output_dir: Path) -> dict[int, dict[str, Any]]:
+    """Recover hardware-specific skips so resume does not repeat a known OOM."""
+    path = output_dir / "run_progress.json"
+    if not path.is_file():
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    raw_skips = payload.get("skipped_tasks", [])
+    if not isinstance(raw_skips, list):
+        raise ValueError(f"{path} has an invalid skipped_tasks record")
+    recovered: dict[int, dict[str, Any]] = {}
+    for item in raw_skips:
+        if isinstance(item, dict) and item.get("reason") == "cuda_out_of_memory":
+            recovered[int(item["task_id"])] = item
+    return recovered
 
 
 def _frozen_manifest_task_ids(manifest: dict[str, Any], manifest_path: Path) -> list[int]:
@@ -514,7 +559,18 @@ def main(*, default_pipeline: str = "lite") -> None:
     progress = _event_reporter(args.output_dir / "progress.jsonl")
     task_summaries: list[dict[str, Any]] = []
     skipped_tasks: list[dict[str, Any]] = []
+    persisted_cuda_oom_skips = _persisted_cuda_oom_skips(args.output_dir) if args.resume else {}
     for task_id in task_ids:
+        if task_id in persisted_cuda_oom_skips:
+            skipped = persisted_cuda_oom_skips[task_id]
+            skipped_tasks.append(skipped)
+            print(
+                f"[task={task_id} dataset={skipped['dataset_name']}] reusing recorded CUDA-OOM skip; "
+                "use a new output directory to retry on larger hardware",
+                flush=True,
+            )
+            _write_run_progress(args.output_dir, task_summaries, skipped_tasks)
+            continue
         task = load_tabarena_openml_task(
             task_id,
             outer_repeat=args.outer_repeat,
@@ -540,69 +596,97 @@ def main(*, default_pipeline: str = "lite") -> None:
             }
             skipped_tasks.append(skipped)
             progress({"event": "task_skipped", **skipped})
-            _json_dump(
-                args.output_dir / "run_progress.json",
-                {
-                    "completed_task_ids": [item["task_id"] for item in task_summaries],
-                    "skipped_tasks": skipped_tasks,
-                },
-            )
+            _write_run_progress(args.output_dir, task_summaries, skipped_tasks)
             continue
-        standard_tabarena = None
-        if not args.skip_standard_baseline:
-            standard_tabarena = run_standard_tabarena_baseline(
+        stage = "standard_baseline"
+        cuda_oom_skipped = False
+        try:
+            standard_tabarena = None
+            if not args.skip_standard_baseline:
+                standard_tabarena = run_standard_tabarena_baseline(
+                    task=task,
+                    output_dir=args.output_dir,
+                    device=device,
+                    classifier_checkpoint=args.classifier_checkpoint,
+                    regressor_checkpoint=args.regressor_checkpoint,
+                    resume=args.resume,
+                    run_fingerprint_hash=run_fingerprint_hash,
+                    progress=progress,
+                )
+            for label, config in zip(labels, configs, strict=True):
+                stage = f"config_{label}"
+                effective_bags = effective_inner_bag_count(task, requested_bags=args.bags)
+                print(
+                    f"[task={task.task_id} config={label}] starting/recovering "
+                    f"{effective_bags}/{args.bags} valid stratified bags",
+                    flush=True,
+                )
+                run_config = run_task_config_standard if args.pipeline == "standard" else run_task_config
+                result = run_config(
+                    task=task,
+                    label=label,
+                    config=config,
+                    output_dir=args.output_dir,
+                    bags=args.bags,
+                    protocol_seed=args.protocol_seed,
+                    device=device,
+                    classifier_checkpoint=args.classifier_checkpoint,
+                    regressor_checkpoint=args.regressor_checkpoint,
+                    resume=args.resume,
+                    run_fingerprint_hash=run_fingerprint_hash,
+                    progress=progress,
+                )
+                print(
+                    f"[task={task.task_id} config={label}] "
+                    f"guarded validation={result['validation']['guarded']['deployment_error']:.6g}; "
+                    "outer-test score withheld until validation-only selection is complete",
+                    flush=True,
+                )
+            stage = "task_summary"
+            task_summary = summarize_task_tuning(
                 task=task,
+                config_labels=labels,
                 output_dir=args.output_dir,
-                device=device,
-                classifier_checkpoint=args.classifier_checkpoint,
-                regressor_checkpoint=args.regressor_checkpoint,
-                resume=args.resume,
-                run_fingerprint_hash=run_fingerprint_hash,
-                progress=progress,
+                ensemble_rounds=immutable_run["ensemble_rounds"],
+                standard_tabarena=standard_tabarena,
             )
-        for label, config in zip(labels, configs, strict=True):
-            effective_bags = effective_inner_bag_count(task, requested_bags=args.bags)
-            print(
-                f"[task={task.task_id} config={label}] starting/recovering "
-                f"{effective_bags}/{args.bags} valid stratified bags",
-                flush=True,
-            )
-            run_config = run_task_config_standard if args.pipeline == "standard" else run_task_config
-            result = run_config(
-                task=task,
-                label=label,
-                config=config,
-                output_dir=args.output_dir,
-                bags=args.bags,
-                protocol_seed=args.protocol_seed,
-                device=device,
-                classifier_checkpoint=args.classifier_checkpoint,
-                regressor_checkpoint=args.regressor_checkpoint,
-                resume=args.resume,
-                run_fingerprint_hash=run_fingerprint_hash,
-                progress=progress,
-            )
-            print(
-                f"[task={task.task_id} config={label}] "
-                f"guarded validation={result['validation']['guarded']['deployment_error']:.6g}; "
-                "outer-test score withheld until validation-only selection is complete",
-                flush=True,
-            )
-        task_summary = summarize_task_tuning(
-            task=task,
-            config_labels=labels,
-            output_dir=args.output_dir,
-            ensemble_rounds=immutable_run["ensemble_rounds"],
-            standard_tabarena=standard_tabarena,
-        )
+        except RuntimeError as error:
+            if not _is_cuda_out_of_memory(error):
+                raise
+            allocated_gib = reserved_gib = total_gib = None
+            if device.type == "cuda":
+                allocated_gib = float(torch.cuda.memory_allocated(device) / 2**30)
+                reserved_gib = float(torch.cuda.memory_reserved(device) / 2**30)
+                total_gib = float(torch.cuda.get_device_properties(device).total_memory / 2**30)
+            skipped = {
+                "task_id": task.task_id,
+                "dataset_id": task.dataset_id,
+                "dataset_name": task.dataset_name,
+                "problem_type": task.problem_type,
+                "n_features": n_features,
+                "outer_train_rows": int(len(task.y_train)),
+                "outer_test_rows": int(len(task.y_test)),
+                "reason": "cuda_out_of_memory",
+                "stage": stage,
+                "device": str(device),
+                "cuda_allocated_gib": allocated_gib,
+                "cuda_reserved_gib": reserved_gib,
+                "cuda_total_gib": total_gib,
+                "error": str(error).splitlines()[0],
+            }
+            skipped_tasks.append(skipped)
+            progress({"event": "task_skipped", **skipped})
+            _write_run_progress(args.output_dir, task_summaries, skipped_tasks)
+            cuda_oom_skipped = True
+        if cuda_oom_skipped:
+            # This runs after the exception handler has released its traceback
+            # and the tensors referenced by the failed backward frame.
+            gc.collect()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            continue
         task_summaries.append(task_summary)
-        _json_dump(
-            args.output_dir / "run_progress.json",
-            {
-                "completed_task_ids": [item["task_id"] for item in task_summaries],
-                "skipped_tasks": skipped_tasks,
-            },
-        )
+        _write_run_progress(args.output_dir, task_summaries, skipped_tasks)
     summary = summarize_experiment(
         task_summaries=task_summaries,
         output_dir=args.output_dir,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Optional
 
@@ -55,6 +56,9 @@ class HyperSplineTransform(nn.Module):
         raw_context_gate_initial_probability: float = 0.5,
         conditioning_mode: str = "context",
         capacity_matched_conditioning: bool = False,
+        gate_location_scale: bool = False,
+        cdf_quantiles: int = 33,
+        cdf_num_heads: int = 4,
         eps: float = 1e-6,
     ) -> None:
         super().__init__()
@@ -69,9 +73,9 @@ class HyperSplineTransform(nn.Module):
             raise ValueError("supervised residuals require target_aware=True")
         if residual_variants > 1:
             raise ValueError("supervised residual variants are mutually exclusive")
-        if conditioning_mode not in {"context", "query_marginal", "context_query_shift"}:
+        if conditioning_mode not in {"context", "query_marginal", "context_query_shift", "cdf"}:
             raise ValueError(
-                "conditioning_mode must be one of: context, query_marginal, context_query_shift"
+                "conditioning_mode must be one of: context, query_marginal, context_query_shift, cdf"
             )
         if conditioning_mode != "context" and residual_variants:
             raise ValueError(
@@ -92,6 +96,10 @@ class HyperSplineTransform(nn.Module):
             raise ValueError("raw_context_residual_bound must be positive")
         if not 0 < raw_context_gate_initial_probability < 1:
             raise ValueError("raw_context_gate_initial_probability must be in (0, 1)")
+        if cdf_quantiles < 9:
+            raise ValueError("cdf_quantiles must be at least 9")
+        if cdf_num_heads <= 0 or hidden_dim % cdf_num_heads:
+            raise ValueError("cdf_num_heads must divide hidden_dim")
         self.n_control_points = n_control_points
         self.degree = degree
         self.standardized_range = standardized_range
@@ -108,6 +116,8 @@ class HyperSplineTransform(nn.Module):
         self.raw_context_residual_bound = raw_context_residual_bound
         self.conditioning_mode = conditioning_mode
         self.capacity_matched_conditioning = capacity_matched_conditioning
+        self.gate_location_scale = gate_location_scale
+        self.cdf_quantiles = cdf_quantiles
         self.eps = eps
         knots = uniform_augmented_knots(n_control_points, degree)
         identity = greville_abscissae(knots, degree, n_control_points)
@@ -147,6 +157,46 @@ class HyperSplineTransform(nn.Module):
         nn.init.zeros_(last.bias)
         gate_bias = torch.logit(torch.tensor(gate_initial_probability)).item()
         last.bias.data[n_control_points - 1] = gate_bias
+        if conditioning_mode == "cdf":
+            # Seven ordered curves describe the information relevant to a
+            # per-column monotone map: context/query empirical CDFs, their
+            # signed and absolute shifts, and three class-invariant summaries
+            # of the labelled context CDFs.  Raw rows and class identifiers are
+            # never embedded, keeping this substantially cheaper than a table
+            # transformer while retaining much more shape information than the
+            # fixed 9-quantile summary.
+            probabilities = torch.linspace(0.01, 0.99, cdf_quantiles)
+            self.register_buffer("cdf_probabilities", probabilities)
+            self.cdf_curve_encoder = nn.Sequential(
+                nn.LayerNorm(cdf_quantiles),
+                nn.Linear(cdf_quantiles, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
+            self.cdf_curve_type_embedding = nn.Parameter(torch.zeros(7, hidden_dim))
+            nn.init.normal_(self.cdf_curve_type_embedding, std=0.02)
+            self.cdf_curve_attention = nn.MultiheadAttention(hidden_dim, cdf_num_heads, batch_first=True)
+            self.cdf_curve_norm = nn.LayerNorm(hidden_dim)
+            # 8 existing class-invariant supervised values, two context/query
+            # alignment values, four table-size values, and two tie fractions.
+            cdf_scalar_dim = SUPERVISED_SUMMARY_DIM + 2 + 4 + 2
+            self.cdf_scalar_encoder = nn.Sequential(
+                nn.LayerNorm(cdf_scalar_dim),
+                nn.Linear(cdf_scalar_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
+            self.cdf_column_attention = nn.MultiheadAttention(hidden_dim, cdf_num_heads, batch_first=True)
+            self.cdf_column_norm = nn.LayerNorm(hidden_dim)
+            self.cdf_output_head = nn.Sequential(
+                nn.LayerNorm(2 * hidden_dim),
+                nn.Linear(2 * hidden_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, output_dim),
+            )
+            nn.init.zeros_(self.cdf_output_head[-1].weight)
+            nn.init.zeros_(self.cdf_output_head[-1].bias)
+            self.cdf_output_head[-1].bias.data[n_control_points - 1] = gate_bias
         if supervised_residual:
             self.supervised_residual_mlp = nn.Sequential(
                 nn.LayerNorm(SUPERVISED_SUMMARY_DIM),
@@ -429,11 +479,155 @@ class HyperSplineTransform(nn.Module):
         scale_raw = raw[..., self.n_control_points + 1]
         location = statistics.location
         scale = statistics.scale
+        location_scale_gate = gate if self.gate_location_scale else torch.ones_like(gate)
         if self.generate_location:
-            location = location + scale * self.location_bound * torch.tanh(loc_raw)
+            location = location + scale * self.location_bound * location_scale_gate * torch.tanh(loc_raw)
         if self.generate_scale:
-            scale = scale * torch.exp(self.log_scale_bound * torch.tanh(scale_raw))
+            scale = scale * torch.exp(
+                self.log_scale_bound * location_scale_gate * torch.tanh(scale_raw)
+            )
         return HyperSplineParameters(control_points, gate, location, scale.clamp_min(self.eps), residual_gate)
+
+    def _cdf_quantile_curve(
+        self,
+        values: torch.Tensor,
+        statistics: ColumnStatistics,
+        missing: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        finite = torch.isfinite(values)
+        valid = finite if missing is None else finite & ~missing
+        normalized = (values.float() - statistics.location.unsqueeze(1)) / statistics.scale.unsqueeze(1)
+        normalized = normalized.masked_fill(~valid, float("nan")).transpose(1, 2)
+        curves = torch.nanquantile(
+            normalized,
+            self.cdf_probabilities.to(device=values.device, dtype=normalized.dtype),
+            dim=-1,
+        ).permute(1, 2, 0)
+        return curves.nan_to_num(0.0).clamp(-20.0, 20.0)
+
+    def _cdf_class_curves(
+        self,
+        x_context: torch.Tensor,
+        statistics: ColumnStatistics,
+        y_context: Optional[torch.Tensor],
+        missing: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        shape = (*statistics.location.shape, self.cdf_quantiles)
+        zeros = x_context.new_zeros(shape, dtype=torch.float32)
+        if y_context is None:
+            return zeros, zeros.clone(), zeros.clone()
+        b, _, d = x_context.shape
+        normalized = (x_context.float() - statistics.location.unsqueeze(1)) / statistics.scale.unsqueeze(1)
+        finite = torch.isfinite(x_context)
+        valid = finite if missing is None else finite & ~missing
+        means, deviations, ranges = zeros.clone(), zeros.clone(), zeros.clone()
+        probabilities = self.cdf_probabilities.to(device=x_context.device, dtype=normalized.dtype)
+        for batch_idx in range(b):
+            classes = torch.unique(y_context[batch_idx], sorted=True)
+            for feature_idx in range(d):
+                class_curves = []
+                for label in classes:
+                    keep = valid[batch_idx, :, feature_idx] & (y_context[batch_idx] == label)
+                    if keep.any():
+                        class_curves.append(
+                            torch.quantile(normalized[batch_idx, keep, feature_idx], probabilities)
+                        )
+                if not class_curves:
+                    continue
+                stacked = torch.stack(class_curves).clamp(-20.0, 20.0)
+                means[batch_idx, feature_idx] = stacked.mean(dim=0)
+                deviations[batch_idx, feature_idx] = stacked.std(dim=0, unbiased=False)
+                ranges[batch_idx, feature_idx] = stacked.amax(dim=0) - stacked.amin(dim=0)
+        return means, deviations, ranges
+
+    @staticmethod
+    def _cdf_tie_fraction(values: torch.Tensor, missing: Optional[torch.Tensor]) -> torch.Tensor:
+        b, _, d = values.shape
+        result = values.new_zeros((b, d), dtype=torch.float32)
+        finite = torch.isfinite(values)
+        valid = finite if missing is None else finite & ~missing
+        for batch_idx in range(b):
+            for feature_idx in range(d):
+                column = values[batch_idx, valid[batch_idx, :, feature_idx], feature_idx]
+                if column.numel():
+                    result[batch_idx, feature_idx] = 1.0 - column.unique().numel() / column.numel()
+        return result
+
+    def _cdf_raw(
+        self,
+        x_context: torch.Tensor,
+        x_query: torch.Tensor,
+        context_statistics: ColumnStatistics,
+        query_statistics: ColumnStatistics,
+        y_context: Optional[torch.Tensor],
+        context_missing: Optional[torch.Tensor],
+        query_missing: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        context_curve = self._cdf_quantile_curve(x_context, context_statistics, context_missing)
+        query_curve = self._cdf_quantile_curve(x_query, context_statistics, query_missing)
+        class_mean, class_std, class_range = self._cdf_class_curves(
+            x_context, context_statistics, y_context, context_missing
+        )
+        difference = query_curve - context_curve
+        curves = torch.stack(
+            (
+                context_curve,
+                query_curve,
+                difference,
+                difference.abs(),
+                class_mean,
+                class_std,
+                class_range,
+            ),
+            dim=2,
+        )
+        b, d, n_curves, _ = curves.shape
+        tokens = self.cdf_curve_encoder(curves.reshape(b * d * n_curves, self.cdf_quantiles))
+        tokens = tokens.reshape(b * d, n_curves, -1) + self.cdf_curve_type_embedding.unsqueeze(0)
+        attended, _ = self.cdf_curve_attention(tokens, tokens, tokens, need_weights=False)
+        column_tokens = self.cdf_curve_norm(tokens + attended).mean(dim=1).reshape(b, d, -1)
+        cross_column, _ = self.cdf_column_attention(
+            column_tokens, column_tokens, column_tokens, need_weights=False
+        )
+        column_tokens = self.cdf_column_norm(column_tokens + cross_column)
+
+        relative_location = (
+            query_statistics.location - context_statistics.location
+        ) / context_statistics.scale
+        log_scale_ratio = (
+            query_statistics.scale / context_statistics.scale
+        ).clamp_min(self.eps).log()
+        alignment = torch.stack((relative_location, log_scale_ratio), dim=-1)
+        fixed_sizes = x_context.new_tensor(
+            [math.log1p(x_context.shape[1]) / 10.0,
+             math.log1p(x_query.shape[1]) / 10.0,
+             math.log1p(d) / 10.0]
+        ).view(1, 1, 3).expand(b, d, -1)
+        class_sizes = x_context.new_zeros((b, 1, 1), dtype=torch.float32)
+        if y_context is not None:
+            for batch_idx in range(b):
+                class_sizes[batch_idx, 0, 0] = math.log1p(
+                    torch.unique(y_context[batch_idx]).numel()
+                ) / 4.0
+        table_sizes = torch.cat((fixed_sizes, class_sizes.expand(b, d, 1)), dim=-1)
+        ties = torch.stack(
+            (
+                self._cdf_tie_fraction(x_context, context_missing),
+                self._cdf_tie_fraction(x_query, query_missing),
+            ),
+            dim=-1,
+        )
+        scalars = torch.cat(
+            (
+                context_statistics.summary[..., -SUPERVISED_SUMMARY_DIM:],
+                alignment,
+                table_sizes,
+                ties,
+            ),
+            dim=-1,
+        )
+        scalar_tokens = self.cdf_scalar_encoder(scalars)
+        return self.cdf_output_head(torch.cat((column_tokens, scalar_tokens), dim=-1))
 
     def grid_deformation_penalty(
         self,
@@ -491,6 +685,8 @@ class HyperSplineTransform(nn.Module):
         if self.conditioning_mode == "context":
             summary = context_statistics.summary
             return self._capacity_match_conditioning(summary)
+        if self.conditioning_mode == "cdf":
+            raise RuntimeError("cdf conditioning consumes empirical curves, not a flat summary")
         if query_statistics is None:
             raise ValueError(f"conditioning_mode={self.conditioning_mode!r} requires x_query statistics")
         query_marginal = query_statistics.summary[..., :UNSUPERVISED_SUMMARY_DIM]
@@ -539,6 +735,18 @@ class HyperSplineTransform(nn.Module):
                 y_context=y_context if self.target_aware else None,
                 context_missing=context_missing,
             )
+        elif self.conditioning_mode == "cdf":
+            query_statistics = summarize_context(x_query, query_missing, eps=self.eps)
+            raw = self._cdf_raw(
+                x_context,
+                x_query,
+                statistics,
+                query_statistics,
+                y_context if self.target_aware else None,
+                context_missing,
+                query_missing,
+            )
+            parameters = self._parameters_from_raw(raw, statistics, None)
         else:
             # Do not route y_query through this path.  The context
             # statistics still provide class-invariant label-aware terms;

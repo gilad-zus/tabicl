@@ -319,7 +319,7 @@ def audit(args: argparse.Namespace) -> None:
 
 
 def hyperspline_config(args: argparse.Namespace) -> dict[str, Any]:
-    return {
+    config = {
         "n_control_points": args.n_control_points,
         "hidden_dim": args.hidden_dim,
         "gate_initial_probability": args.gate_initial_probability,
@@ -327,6 +327,42 @@ def hyperspline_config(args: argparse.Namespace) -> dict[str, Any]:
         "conditioning_mode": args.conditioning_mode,
         "capacity_matched_conditioning": args.capacity_matched_conditioning,
     }
+    arm = getattr(args, "arm", "legacy_nll")
+    if arm != "legacy_nll":
+        config["conditioning_mode"] = "cdf" if arm == "cdf_elo_locscale" else "query_marginal"
+        config["generate_location"] = arm.endswith("locscale")
+        config["generate_scale"] = arm.endswith("locscale")
+        config["gate_location_scale"] = arm.endswith("locscale")
+        if arm == "cdf_elo_locscale":
+            config["capacity_matched_conditioning"] = False
+            config["cdf_quantiles"] = args.cdf_quantiles
+            config["cdf_num_heads"] = args.cdf_num_heads
+    return config
+
+
+def deployment_surrogate(logits: torch.Tensor, labels: torch.Tensor, n_classes: int, ce_weight: float) -> torch.Tensor:
+    flat_logits, flat_labels = logits.flatten(0, 1), labels.flatten()
+    ce = F.cross_entropy(flat_logits, flat_labels)
+    if n_classes != 2:
+        return ce
+    scores = flat_logits[:, 1] - flat_logits[:, 0]
+    positive, negative = scores[flat_labels == 1], scores[flat_labels == 0]
+    if not positive.numel() or not negative.numel():
+        return ce
+    return F.softplus(-(positive[:, None] - negative[None, :])).mean() + ce_weight * ce
+
+
+def validation_deployment(backbone, hyperspline, episodes, identity_rows):
+    rows = []
+    hyperspline.eval()
+    for episode, identity in zip(episodes, identity_rows):
+        candidate = metric_row(backbone, hyperspline, episode)
+        rows.append({f"identity_{key}": value for key, value in identity.items()} |
+                    {f"candidate_{key}": value for key, value in candidate.items()})
+    summary = aggregate_report(rows, bootstrap_seed=0, bootstrap_samples=0)
+    return (summary,
+            float(np.mean([row["candidate_nll"] for row in rows])),
+            float(np.mean([row["candidate_deployment_error"] for row in rows])))
 
 
 def validate_training_distribution(args: argparse.Namespace, manifest: dict[str, Any]) -> None:
@@ -437,8 +473,7 @@ def scheduled_training_episodes(args: argparse.Namespace, step: int, device: tor
 
 
 def run_fingerprint(args: argparse.Namespace, manifest: dict[str, Any]) -> str:
-    return stable_digest(
-        {
+    payload = {
             "manifest_hash": sha256_file(manifest_path(args.output_dir)),
             "model": hyperspline_config(args),
             "optimization": {
@@ -452,7 +487,13 @@ def run_fingerprint(args: argparse.Namespace, manifest: dict[str, Any]) -> str:
             },
             "backbone_reference": args.checkpoint_version,
         }
-    )
+    if getattr(args, "arm", "legacy_nll") != "legacy_nll":
+        payload["deployment_objective"] = {
+            "arm": args.arm, "auc_ce_weight": args.auc_ce_weight,
+            "identity_regret_weight": args.identity_regret_weight,
+            "regret_temperature": args.regret_temperature,
+        }
+    return stable_digest(payload)
 
 
 def checkpoint_budgets(args: argparse.Namespace) -> list[int]:
@@ -486,6 +527,7 @@ def save_training_state(
     best_loss: float,
     best_step: int,
     best_state: dict[str, torch.Tensor],
+    selection_state: dict[str, float] | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".tmp")
@@ -499,6 +541,7 @@ def save_training_state(
             "best_loss": best_loss,
             "best_step": best_step,
             "best_state": best_state,
+            "selection_state": selection_state,
         },
         temporary,
     )
@@ -518,6 +561,9 @@ def train(args: argparse.Namespace) -> None:
         target_step = min(target_step, args.max_train_steps)
     if args.validate_every <= 0 or args.tasks_per_step <= 0 or args.lr <= 0:
         raise ValueError("invalid optimization configuration")
+    if getattr(args, "arm", "legacy_nll") != "legacy_nll":
+        if args.auc_ce_weight < 0 or args.identity_regret_weight < 0 or args.regret_temperature <= 0:
+            raise ValueError("deployment objective weights must be non-negative and temperature positive")
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but torch.cuda.is_available() is False")
@@ -534,6 +580,7 @@ def train(args: argparse.Namespace) -> None:
     model_config = hyperspline_config(args)
     hyperspline = HyperSplineTransform(**model_config).to(device)
     optimizer = torch.optim.Adam(hyperspline.parameters(), lr=args.lr)
+    deployment_arm = getattr(args, "arm", "legacy_nll") != "legacy_nll"
 
     run_dir = args.output_dir / "runs" / args.run_name
     checkpoint_dir = run_dir / "checkpoints"
@@ -547,6 +594,10 @@ def train(args: argparse.Namespace) -> None:
     hyperspline.eval()
     best_loss = identity_validation_mean_nll(backbone, validation)
     best_state = model_state_cpu(hyperspline)
+    identity_rows = [metric_row(backbone, None, episode) for episode in validation] if deployment_arm else []
+    best_score, best_deployment_error = 0.5, float(np.mean(
+        [row["deployment_error"] for row in identity_rows]
+    )) if deployment_arm else float("inf")
     if args.resume:
         if not state_path.is_file():
             raise FileNotFoundError(f"--resume requires saved state: {state_path}")
@@ -561,12 +612,18 @@ def train(args: argparse.Namespace) -> None:
                     optimizer_state[key] = value.to(device)
         current_step = int(state["step"])
         best_loss, best_step, best_state = float(state["best_loss"]), int(state["best_step"]), state["best_state"]
+        if deployment_arm:
+            selection = state.get("selection_state") or {}
+            best_score = float(selection.get("score", best_score))
+            best_deployment_error = float(selection.get("deployment_error", best_deployment_error))
         print(f"Resumed {args.run_name} after step={current_step}; selected validation NLL={best_loss:.6f} at step={best_step}", flush=True)
     else:
-        append_csv(
-            run_dir / "validation.csv",
-            {"step": 0, "tasks_seen": 0, "mean_validation_nll": best_loss, "selected": True, "selection_reason": "identity"},
-        )
+        initial_validation = {"step": 0, "tasks_seen": 0, "mean_validation_nll": best_loss,
+                              "selected": True, "selection_reason": "identity"}
+        if deployment_arm:
+            initial_validation.update({"elo_score": best_score, "elo_delta": 0.0,
+                                       "mean_deployment_error": best_deployment_error})
+        append_csv(run_dir / "validation.csv", initial_validation)
         print(f"[identity] mean validation NLL={best_loss:.6f}; final test bank remains unopened", flush=True)
         save_training_state(
             state_path,
@@ -577,6 +634,7 @@ def train(args: argparse.Namespace) -> None:
             best_loss=best_loss,
             best_step=best_step,
             best_state=best_state,
+            selection_state={"score": best_score, "deployment_error": best_deployment_error} if deployment_arm else None,
         )
 
     scale_steps = {tasks: tasks // args.tasks_per_step for tasks in all_checkpoint_budgets}
@@ -585,45 +643,76 @@ def train(args: argparse.Namespace) -> None:
         episodes = scheduled_training_episodes(args, step, device)
         validate_episode_classes(episodes, backbone.max_classes)
         optimizer.zero_grad(set_to_none=True)
-        task_losses, grid_penalties = [], []
+        task_losses, grid_penalties, deployment_losses, regret_penalties = [], [], [], []
         for episode in episodes:
             backbone.clear_cache()
-            loss, _, diagnostics = forward_hyperspline(backbone, hyperspline, episode)
-            objective = loss + args.transform_regularization * diagnostics["grid_deformation_penalty"]
+            loss, logits, diagnostics = forward_hyperspline(backbone, hyperspline, episode)
+            objective = loss
+            if deployment_arm:
+                candidate = deployment_surrogate(logits, episode.y_query, episode.n_classes, args.auc_ce_weight)
+                with torch.no_grad():
+                    backbone.clear_cache()
+                    _, identity_logits = forward_identity(backbone, episode)
+                    identity = deployment_surrogate(identity_logits, episode.y_query, episode.n_classes, args.auc_ce_weight)
+                regret = args.regret_temperature * F.softplus(
+                    (candidate - identity) / args.regret_temperature
+                )
+                objective = candidate + args.identity_regret_weight * regret
+                deployment_losses.append(float(candidate.detach()))
+                regret_penalties.append(float(regret.detach()))
+            objective = objective + args.transform_regularization * diagnostics["grid_deformation_penalty"]
             (objective / len(episodes)).backward()
             task_losses.append(float(loss.detach()))
             grid_penalties.append(float(diagnostics["grid_deformation_penalty"].detach()))
         gradient_norm = float(torch.nn.utils.clip_grad_norm_(hyperspline.parameters(), max_norm=1.0))
         optimizer.step()
-        append_csv(
-            run_dir / "training.csv",
-            {
+        training_row = {
                 "step": step,
                 "tasks_seen": step * args.tasks_per_step,
                 "mean_fresh_task_nll": float(np.mean(task_losses)),
                 "mean_grid_deformation_penalty": float(np.mean(grid_penalties)),
                 "pre_clip_gradient_norm": gradient_norm,
-            },
-        )
+            }
+        if deployment_arm:
+            training_row.update({"mean_deployment_surrogate": float(np.mean(deployment_losses)),
+                                 "mean_identity_regret_penalty": float(np.mean(regret_penalties))})
+        append_csv(run_dir / "training.csv", training_row)
         is_scale = step in scale_steps.values()
         if step == 1 or step % args.validate_every == 0 or is_scale or step == target_step:
-            validation_loss = validation_mean_nll(backbone, hyperspline, validation)
-            selected = validation_loss < best_loss
+            if deployment_arm:
+                deployment_summary, validation_loss, deployment_error = validation_deployment(
+                    backbone, hyperspline, validation, identity_rows
+                )
+                score = float(deployment_summary["elo"]["score"])
+                selected = score > best_score or (
+                    score == best_score and deployment_error < best_deployment_error
+                )
+            else:
+                validation_loss = validation_mean_nll(backbone, hyperspline, validation)
+                selected = validation_loss < best_loss
             if selected:
                 best_loss, best_step, best_state = validation_loss, step, model_state_cpu(hyperspline)
+                if deployment_arm:
+                    best_score, best_deployment_error = score, deployment_error
+            validation_row = {
+                "step": step, "tasks_seen": step * args.tasks_per_step,
+                "mean_validation_nll": validation_loss, "selected": selected,
+                "selection_reason": ("higher_elo_then_lower_error" if selected else "not_selected")
+                if deployment_arm else ("lower_nll" if selected else "not_selected"),
+            }
+            if deployment_arm:
+                validation_row.update({"elo_score": score,
+                                       "elo_delta": deployment_summary["elo"]["elo_delta"],
+                                       "mean_deployment_error": deployment_error})
             append_csv(
                 run_dir / "validation.csv",
-                {
-                    "step": step,
-                    "tasks_seen": step * args.tasks_per_step,
-                    "mean_validation_nll": validation_loss,
-                    "selected": selected,
-                    "selection_reason": "lower_nll" if selected else "not_selected",
-                },
+                validation_row,
             )
             print(
                 f"[step={step} tasks={step * args.tasks_per_step}] fresh_nll={np.mean(task_losses):.6f} "
-                f"val_nll={validation_loss:.6f} best={best_loss:.6f}@{best_step}",
+                f"val_nll={validation_loss:.6f} "
+                + (f"elo={deployment_summary['elo']['elo_delta']:+.1f} score={score:.3f} " if deployment_arm else "")
+                + f"best={best_loss:.6f}@{best_step}",
                 flush=True,
             )
             if is_scale:
@@ -647,6 +736,8 @@ def train(args: argparse.Namespace) -> None:
                         "budget_step": step,
                         "selected_step": best_step,
                         "selected_validation_nll": best_loss,
+                        "selected_elo_score": best_score if deployment_arm else None,
+                        "selected_deployment_error": best_deployment_error if deployment_arm else None,
                         "model_config": model_config,
                         "manifest_hash": sha256_file(manifest_path(args.output_dir)),
                         "raw_final_test_used": False,
@@ -663,6 +754,7 @@ def train(args: argparse.Namespace) -> None:
                 best_loss=best_loss,
                 best_step=best_step,
                 best_state=best_state,
+                selection_state={"score": best_score, "deployment_error": best_deployment_error} if deployment_arm else None,
             )
     status = "complete" if target_step == max(args.scale_tasks) // args.tasks_per_step else "stopped early"
     print(f"Training {status} through {target_step * args.tasks_per_step:,} tasks. Run report only after a requested scale checkpoint exists.", flush=True)
@@ -829,6 +921,8 @@ def report(args: argparse.Namespace) -> None:
     validate_episode_classes(evaluation_bank, backbone.max_classes)
     baseline = {episode.task_id: metric_row(backbone, None, episode) for episode in evaluation_bank}
     output_dir = args.output_dir / "reports" / args.bank
+    if getattr(args, "report_name", None):
+        output_dir = output_dir / args.report_name
     all_rows: list[dict[str, Any]] = []
     all_summary: dict[str, Any] = {
         "protocol": manifest["protocol"],
@@ -940,6 +1034,12 @@ def parse_args() -> argparse.Namespace:
     train_parser.add_argument("--checkpoint-version", default="tabicl-classifier-v2-20260212.ckpt")
     train_parser.add_argument("--device", default="cuda")
     train_parser.add_argument("--run-name", required=True)
+    train_parser.add_argument(
+        "--arm",
+        choices=("legacy_nll", "stats_elo_shape", "stats_elo_locscale", "cdf_elo_locscale"),
+        default="legacy_nll",
+        help="Opt-in zero-shot arm; legacy_nll exactly preserves earlier runs.",
+    )
     train_parser.add_argument("--scale-tasks", type=parse_int_csv, required=True, help="Cumulative fresh-task budgets, e.g. 40000,160000,640000.")
     train_parser.add_argument(
         "--extra-checkpoint-tasks",
@@ -956,7 +1056,7 @@ def parse_args() -> argparse.Namespace:
     train_parser.add_argument("--gate-initial-probability", type=float, default=0.10)
     train_parser.add_argument(
         "--conditioning-mode",
-        choices=("context", "query_marginal", "context_query_shift"),
+        choices=("context", "query_marginal", "context_query_shift", "cdf"),
         default="query_marginal",
         help="Primary arm is query_marginal, exactly the 33D conditioning input audited above.",
     )
@@ -973,6 +1073,11 @@ def parse_args() -> argparse.Namespace:
         help="Pad control arms to the largest conditioner width so arm comparisons isolate available information.",
     )
     train_parser.add_argument("--transform-regularization", type=float, default=0.0)
+    train_parser.add_argument("--cdf-quantiles", type=int, default=33)
+    train_parser.add_argument("--cdf-num-heads", type=int, default=4)
+    train_parser.add_argument("--auc-ce-weight", type=float, default=0.10)
+    train_parser.add_argument("--identity-regret-weight", type=float, default=1.0)
+    train_parser.add_argument("--regret-temperature", type=float, default=0.05)
     train_parser.add_argument("--model-seed", type=int, default=0)
     train_parser.add_argument("--train-seed", type=int, default=61_001)
     train_parser.add_argument("--resume", action="store_true")
@@ -992,6 +1097,10 @@ def parse_args() -> argparse.Namespace:
     )
     report_parser.add_argument("--bootstrap-seed", type=int, default=9_001)
     report_parser.add_argument("--bootstrap-samples", type=int, default=2000)
+    report_parser.add_argument(
+        "--report-name", default=None,
+        help="Optional subdirectory label, useful when comparing different arms without overwriting reports.",
+    )
     return parser.parse_args()
 
 
