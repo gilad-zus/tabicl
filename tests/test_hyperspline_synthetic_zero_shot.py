@@ -52,6 +52,21 @@ def test_binary_deployment_surrogate_rewards_correct_ranking():
     assert zero_shot.deployment_surrogate(good, labels, 2, 0.1) < zero_shot.deployment_surrogate(bad, labels, 2, 0.1)
 
 
+def test_cdf_shape_arm_uses_rich_input_without_location_scale_outputs():
+    args = argparse.Namespace(
+        arm="cdf_elo_shape", n_control_points=20, hidden_dim=64,
+        gate_initial_probability=0.1, target_aware=True,
+        conditioning_mode="query_marginal", capacity_matched_conditioning=True,
+        cdf_quantiles=33, cdf_num_heads=4,
+    )
+    config = zero_shot.hyperspline_config(args)
+    assert config["conditioning_mode"] == "cdf"
+    assert config["generate_location"] is False
+    assert config["generate_scale"] is False
+    assert config["gate_location_scale"] is False
+    assert config["capacity_matched_conditioning"] is False
+
+
 def test_cdf_conditioner_is_identity_initialized_and_row_invariant():
     torch.manual_seed(3)
     model = HyperSplineTransform(

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass
+import json
 from pathlib import Path
 import time
 from typing import Any
@@ -506,6 +507,155 @@ def _identity_prediction(bundle: _StandardBag, query_x: Any) -> np.ndarray:
     return np.asarray(bundle.estimator.predict_proba(query_x), dtype=np.float64)
 
 
+def _difference_summary(left: Any, right: Any) -> dict[str, Any]:
+    """Return compact, JSON-safe diagnostics for two numerical arrays."""
+
+    left_array = np.asarray(left)
+    right_array = np.asarray(right)
+    summary: dict[str, Any] = {
+        "left_shape": list(left_array.shape),
+        "right_shape": list(right_array.shape),
+    }
+    if left_array.shape != right_array.shape:
+        summary["shape_match"] = False
+        return summary
+    summary["shape_match"] = True
+    difference = np.abs(left_array.astype(np.float64) - right_array.astype(np.float64)).ravel()
+    finite = difference[np.isfinite(difference)]
+    summary["nonfinite_differences"] = int(difference.size - finite.size)
+    if finite.size:
+        summary.update(
+            {
+                "max_abs": float(np.max(finite)),
+                "mean_abs": float(np.mean(finite)),
+                "p95_abs": float(np.quantile(finite, 0.95)),
+            }
+        )
+    return summary
+
+
+def _aggregate_public_regression_members(bundle: _StandardBag, members: list[np.ndarray]) -> np.ndarray:
+    """Apply the public regressor's exact per-member inverse scaling and mean."""
+
+    values = np.concatenate(members, axis=0)
+    n_estimators, n_rows = values.shape
+    unscaled = bundle.estimator.y_scaler_.inverse_transform(values.reshape(-1, 1))
+    return np.mean(unscaled.reshape(n_estimators, n_rows), axis=0).astype(np.float64)
+
+
+def _regression_parity_diagnostics(
+    *,
+    bundle: _StandardBag,
+    query_x: Any,
+    device: torch.device,
+    reconstructed_prediction: np.ndarray,
+    public_prediction: np.ndarray,
+) -> dict[str, Any]:
+    """Localise a public-versus-reconstructed regression parity failure.
+
+    This is intentionally executed only after parity has already failed.  It
+    independently checks the public ensemble arrays, each branch's model
+    outputs, and the final inverse-scaling aggregation.  That tells us whether
+    to fix preprocessing, inference execution, or regression aggregation
+    instead of weakening the parity check.
+    """
+
+    diagnostics: dict[str, Any] = {
+        "existing_reconstructed_vs_public": _difference_summary(
+            reconstructed_prediction, public_prediction
+        )
+    }
+    if bundle.problem_type != "regression":
+        diagnostics["detail"] = "branch diagnostics are currently implemented for regression"
+        return diagnostics
+
+    generator = bundle.estimator.ensemble_generator_
+    encoded = bundle.estimator.X_encoder_.transform(query_x)
+    public_data = generator.transform(encoded, mode="both")
+    filtered_query = generator.unique_filter_.transform(encoded)
+    public_members: list[np.ndarray] = []
+    reconstructed_members: list[np.ndarray] = []
+    branches: dict[str, Any] = {}
+
+    # The inference managers expose their chosen batch/offload plans only in
+    # verbose mode.  Enable it for these failure-only replay calls so the
+    # server log records whether the two paths selected different plans.
+    manager_configs = [
+        bundle.estimator.inference_config_.COL_CONFIG,
+        bundle.estimator.inference_config_.ROW_CONFIG,
+        bundle.estimator.inference_config_.ICL_CONFIG,
+    ]
+    previous_verbose = [bool(config.get("verbose", False)) for config in manager_configs]
+    for manager_config in manager_configs:
+        manager_config.update({"verbose": True})
+
+    try:
+        for method, (public_views, public_labels) in public_data.items():
+            preprocessor = generator.preprocessors_[method]
+            views, labels, feature_shuffles, _patterns = _build_method_batch(
+                bundle=bundle,
+                method=method,
+                context_canonical=preprocessor.X_transformed_[bundle.support_indices],
+                query_canonical=preprocessor.transform(filtered_query),
+                context_labels=bundle.fit_labels[bundle.support_indices],
+                adapters=None,
+                device=device,
+            )
+            reconstructed_views = views.detach().cpu().numpy()
+            reconstructed_labels = labels.detach().cpu().numpy()
+            branch: dict[str, Any] = {
+                "views": _difference_summary(public_views.astype(np.float32), reconstructed_views),
+                "labels": _difference_summary(public_labels.astype(np.float32), reconstructed_labels),
+            }
+
+            print(f"[parity diagnostic method={method}] replaying public regression branch", flush=True)
+            public_output = np.asarray(
+                bundle.estimator._batch_forward(public_views, public_labels, output_type="mean"),
+                dtype=np.float64,
+            )
+            print(f"[parity diagnostic method={method}] replaying reconstructed regression branch", flush=True)
+            reconstructed_raw = _forward_method(
+                bundle=bundle,
+                views=views,
+                labels=labels,
+                feature_shuffles=feature_shuffles,
+                checkpoint_activations=False,
+            )
+            reconstructed_output = (
+                bundle.backbone.quantile_dist(reconstructed_raw)
+                .quantiles.mean(dim=-1)
+                .float()
+                .cpu()
+                .numpy()
+                .astype(np.float64)
+            )
+            branch["member_predictions"] = _difference_summary(public_output, reconstructed_output)
+            branches[str(method)] = branch
+            public_members.append(public_output)
+            reconstructed_members.append(reconstructed_output)
+
+        public_replay = _aggregate_public_regression_members(bundle, public_members)
+        reconstructed_replay = _aggregate_public_regression_members(bundle, reconstructed_members)
+        diagnostics.update(
+            {
+                "branches": branches,
+                "public_replay_vs_public_predict": _difference_summary(public_replay, public_prediction),
+                "reconstructed_replay_vs_existing_reconstructed": _difference_summary(
+                    reconstructed_replay, reconstructed_prediction
+                ),
+                "public_replay_vs_reconstructed_replay": _difference_summary(
+                    public_replay, reconstructed_replay
+                ),
+            }
+        )
+    except Exception as diagnostic_error:  # diagnostics must not hide the original parity failure
+        diagnostics["diagnostic_error"] = f"{type(diagnostic_error).__name__}: {diagnostic_error}"
+    finally:
+        for manager_config, verbose in zip(manager_configs, previous_verbose, strict=True):
+            manager_config.update({"verbose": verbose})
+    return diagnostics
+
+
 def _leading_rows(query_x: Any, n_rows: int) -> Any:
     """Return a positional prefix without losing DataFrame column metadata."""
     if hasattr(query_x, "iloc"):
@@ -561,10 +711,18 @@ def _identity_parity(
             rtol=float(config["identity_parity_rtol"]),
             atol=float(config["identity_parity_atol"]),
         ):
+            diagnostics = _regression_parity_diagnostics(
+                bundle=bundle,
+                query_x=public_query,
+                device=device,
+                reconstructed_prediction=matched_public_probe,
+                public_prediction=public_identity,
+            )
             raise RuntimeError(
                 "standard-pipeline identity parity failed: the reconstructed normal TabICL path differs from "
                 f"the public estimator on its {public_parity_rows}-row parity probe "
-                f"(max_abs={max_public_abs:.3g}). Refuse to train against a mismatched baseline."
+                f"(max_abs={max_public_abs:.3g}). Refuse to train against a mismatched baseline. "
+                f"parity_diagnostics={json.dumps(diagnostics, sort_keys=True)}"
             )
         parity_errors.append(max_public_abs)
         reference = (

@@ -329,11 +329,11 @@ def hyperspline_config(args: argparse.Namespace) -> dict[str, Any]:
     }
     arm = getattr(args, "arm", "legacy_nll")
     if arm != "legacy_nll":
-        config["conditioning_mode"] = "cdf" if arm == "cdf_elo_locscale" else "query_marginal"
+        config["conditioning_mode"] = "cdf" if arm.startswith("cdf_elo_") else "query_marginal"
         config["generate_location"] = arm.endswith("locscale")
         config["generate_scale"] = arm.endswith("locscale")
         config["gate_location_scale"] = arm.endswith("locscale")
-        if arm == "cdf_elo_locscale":
+        if arm.startswith("cdf_elo_"):
             config["capacity_matched_conditioning"] = False
             config["cdf_quantiles"] = args.cdf_quantiles
             config["cdf_num_heads"] = args.cdf_num_heads
@@ -911,6 +911,16 @@ def average_model_seed_rows(rows: Sequence[dict[str, Any]]) -> list[dict[str, An
 
 def report(args: argparse.Namespace) -> None:
     manifest = load_manifest(args.output_dir)
+    deployment_selected = []
+    for configured_run_dir in args.run_dir:
+        run_config_path = Path(configured_run_dir) / "run_config.json"
+        run_config = json.loads(run_config_path.read_text(encoding="utf8"))
+        deployment_selected.append(run_config.get("args", {}).get("arm", "legacy_nll") != "legacy_nll")
+    if any(deployment_selected) and not all(deployment_selected):
+        raise ValueError("report legacy-NLL and ELO-selected runs separately so their protocols stay explicit")
+    protocol = dict(manifest["protocol"])
+    if all(deployment_selected):
+        protocol["selection"] = "validation paired-ELO score; mean deployment error breaks score ties"
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested for report but unavailable")
@@ -925,11 +935,15 @@ def report(args: argparse.Namespace) -> None:
         output_dir = output_dir / args.report_name
     all_rows: list[dict[str, Any]] = []
     all_summary: dict[str, Any] = {
-        "protocol": manifest["protocol"],
+        "protocol": protocol,
         "evaluated_bank": args.bank,
         "is_final_test": args.bank == "test",
         "selection_note": (
-            "This validation-bank report is diagnostic only: its mean NLL selected these checkpoints. "
+            "This validation-bank report is diagnostic only: paired ELO selected these checkpoints, "
+            "with mean deployment error breaking score ties. "
+            "Do not treat it as final generalization evidence."
+            if args.bank == "validation" and all(deployment_selected)
+            else "This validation-bank report is diagnostic only: its mean NLL selected these checkpoints. "
             "Do not treat it as final generalization evidence."
             if args.bank == "validation"
             else "This is the frozen final test bank, which was not used for training or checkpoint selection."
@@ -1036,7 +1050,10 @@ def parse_args() -> argparse.Namespace:
     train_parser.add_argument("--run-name", required=True)
     train_parser.add_argument(
         "--arm",
-        choices=("legacy_nll", "stats_elo_shape", "stats_elo_locscale", "cdf_elo_locscale"),
+        choices=(
+            "legacy_nll", "stats_elo_shape", "stats_elo_locscale",
+            "cdf_elo_shape", "cdf_elo_locscale",
+        ),
         default="legacy_nll",
         help="Opt-in zero-shot arm; legacy_nll exactly preserves earlier runs.",
     )

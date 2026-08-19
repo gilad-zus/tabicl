@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import pytest
 import torch
 
 import tabicl._experiments.direct_spline_openml_standard as standard_openml
@@ -46,6 +47,42 @@ class _HalfPrecisionEvalBackbone(_TinyStandardBackbone):
     def forward(self, *args, **kwargs):
         output = super().forward(*args, **kwargs)
         return output if self.training else output.half()
+
+
+class _OffsetPublicRegressionBackbone(torch.nn.Module):
+    """Regression stand-in whose public and reconstructed forwards disagree."""
+
+    def __init__(self):
+        super().__init__()
+        self.max_classes = 0
+
+    def clear_cache(self):
+        pass
+
+    def forward(
+        self,
+        X,
+        y_train,
+        feature_shuffles=None,
+        return_logits=True,
+        softmax_temperature=0.9,
+        inference_config=None,
+    ):
+        del feature_shuffles, return_logits, softmax_temperature, inference_config
+        prediction = X[:, y_train.shape[1] :].mean(dim=-1, keepdim=True)
+        return prediction.expand(-1, -1, 3)
+
+    def quantile_dist(self, raw):
+        class _Distribution:
+            quantiles = raw
+
+        return _Distribution()
+
+    def predict_stats(self, X, y_train, output_type="mean", alphas=None, inference_config=None):
+        del alphas, inference_config
+        assert output_type == ["mean"]
+        # Deliberately model a public/private-path bug for the failure report.
+        return {"mean": self.forward(X, y_train).mean(dim=-1) + 0.25}
 
 
 def test_standard_config_uses_all_fit_rows_unless_explicitly_capped():
@@ -248,3 +285,54 @@ def test_large_query_uses_bounded_public_probe_but_full_spline_parity(monkeypatc
     assert result.metadata["identity_parity_reference"] == "public_full_context_estimator_probe_4_of_8"
     assert result.metadata["identity_parity_reference_test"] == "public_full_context_estimator_probe_4_of_16"
     assert result.identity_test.shape == (16, 2)
+
+
+def test_regression_parity_failure_reports_which_stage_diverged():
+    rows = 24
+    features = pd.DataFrame(
+        {
+            "x0": np.linspace(-2.0, 2.0, rows),
+            "x1": np.linspace(1.0, 3.0, rows),
+        }
+    )
+    targets = np.linspace(10.0, 30.0, rows)
+    task = OpenMLTaskData(
+        task_id=4,
+        dataset_id=5,
+        dataset_name="regression_parity_diagnostic",
+        problem_type="regression",
+        n_classes=None,
+        x_train=features.iloc[:16].reset_index(drop=True),
+        y_train=targets[:16],
+        x_test=features.iloc[16:].reset_index(drop=True),
+        y_test=targets[16:],
+        outer_split_hash="test",
+    )
+    config = {
+        **standard_direct_spline_config(train_context_rows=4),
+        "adapter_steps": 1,
+        "query_batch_rows": 4,
+        "cross_column_mixing_rank": 0,
+    }
+
+    with pytest.raises(RuntimeError) as captured:
+        _fit_one_bag_standard(
+            task=task,
+            fit_indices=np.arange(12),
+            validation_indices=np.arange(12, 16),
+            bag=0,
+            config=config,
+            protocol_seed=0,
+            backbone=_OffsetPublicRegressionBackbone(),
+            device=torch.device("cpu"),
+            run_fingerprint_hash="test",
+            progress=None,
+            requested_bags=8,
+            effective_bags=8,
+        )
+
+    message = str(captured.value)
+    assert "parity_diagnostics=" in message
+    assert '"views": {"left_shape"' in message
+    assert '"member_predictions"' in message
+    assert '"public_replay_vs_reconstructed_replay"' in message
