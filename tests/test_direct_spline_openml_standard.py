@@ -7,6 +7,7 @@ import tabicl._experiments.direct_spline_openml_standard as standard_openml
 from tabicl._experiments.direct_spline_openml import OpenMLTaskData
 from tabicl._experiments.direct_spline_openml_standard import (
     _apply_adapter,
+    _fit_standard_bag,
     _fit_one_bag_standard,
     standard_direct_spline_config,
 )
@@ -88,6 +89,48 @@ class _OffsetPublicRegressionBackbone(torch.nn.Module):
 def test_standard_config_uses_all_fit_rows_unless_explicitly_capped():
     assert standard_direct_spline_config()["max_context_rows"] is None
     assert standard_direct_spline_config(context_cap=128)["max_context_rows"] == 128
+
+
+def test_standard_regression_reuses_public_estimator_scaled_labels_exactly():
+    rows = 16
+    features = pd.DataFrame(
+        {
+            "x0": np.linspace(-2.0, 2.0, rows),
+            "x1": np.linspace(10.0, 20.0, rows),
+        }
+    )
+    # Keep the caller-side representation float64, as it is for OpenML
+    # regression tasks, while the public regressor casts to float32 in fit().
+    targets = np.linspace(326.123456789, 18_823.987654321, rows, dtype=np.float64)
+    task = OpenMLTaskData(
+        task_id=5,
+        dataset_id=6,
+        dataset_name="regression_label_parity",
+        problem_type="regression",
+        n_classes=None,
+        x_train=features,
+        y_train=targets,
+        x_test=features.iloc[:4].reset_index(drop=True),
+        y_test=targets[:4],
+        outer_split_hash="test",
+    )
+
+    bundle = _fit_standard_bag(
+        task=task,
+        fit_indices=np.arange(rows),
+        config=standard_direct_spline_config(),
+        protocol_seed=0,
+        bag=0,
+        backbone=_OffsetPublicRegressionBackbone(),
+        device=torch.device("cpu"),
+    )
+
+    public_labels = np.asarray(bundle.estimator.ensemble_generator_.y_, dtype=np.float32)
+    caller_recomputed = (
+        bundle.estimator.y_scaler_.transform(targets.reshape(-1, 1)).ravel().astype(np.float32)
+    )
+    assert np.array_equal(bundle.fit_labels, public_labels)
+    assert not np.array_equal(caller_recomputed, public_labels)
 
 
 def test_standard_adapter_identity_changes_only_numeric_positions():
@@ -315,6 +358,7 @@ def test_regression_parity_failure_reports_which_stage_diverged():
         "cross_column_mixing_rank": 0,
     }
 
+    events = []
     with pytest.raises(RuntimeError) as captured:
         _fit_one_bag_standard(
             task=task,
@@ -326,7 +370,7 @@ def test_regression_parity_failure_reports_which_stage_diverged():
             backbone=_OffsetPublicRegressionBackbone(),
             device=torch.device("cpu"),
             run_fingerprint_hash="test",
-            progress=None,
+            progress=events.append,
             requested_bags=8,
             effective_bags=8,
         )
@@ -336,3 +380,7 @@ def test_regression_parity_failure_reports_which_stage_diverged():
     assert '"views": {"left_shape"' in message
     assert '"member_predictions"' in message
     assert '"public_replay_vs_reconstructed_replay"' in message
+    assert len(events) == 1
+    assert events[0]["event"] == "identity_parity_failed"
+    assert events[0]["split"] == "validation"
+    assert events[0]["diagnostics"]["branches"]

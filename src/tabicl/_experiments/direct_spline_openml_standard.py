@@ -219,12 +219,13 @@ def _fit_standard_bag(
     for parameter in backbone.parameters():
         parameter.requires_grad_(False)
 
-    if task.problem_type == "regression":
-        scaled = estimator.y_scaler_.transform(raw_labels.reshape(-1, 1)).ravel().astype(np.float32)
-    else:
-        # The ensemble generator owns the label-encoded values used by the
-        # normal classifier, so use that exact representation for episodes.
-        scaled = np.asarray(estimator.ensemble_generator_.y_, dtype=np.float32)
+    # The public estimators cast/encode labels inside ``fit`` before handing
+    # them to the ensemble generator.  Re-transforming the caller's regression
+    # targets here can therefore differ by a few float32 ULPs (the caller may
+    # still hold float64 values).  With a long in-context sequence those tiny
+    # label changes can measurably alter predictions.  Reuse the exact labels
+    # consumed by the public path for both regression and classification.
+    scaled = np.asarray(estimator.ensemble_generator_.y_, dtype=np.float32)
     context_cap = config.get("max_context_rows")
     if context_cap is None or int(context_cap) >= len(scaled):
         support_indices = np.arange(len(scaled), dtype=int)
@@ -670,6 +671,10 @@ def _identity_parity(
     query_x: Any,
     device: torch.device,
     config: dict[str, Any],
+    progress: Any,
+    task_id: int,
+    bag: int,
+    split: str,
 ) -> tuple[np.ndarray, float, str]:
     """Build the matched identity control and verify the zero spline.
 
@@ -717,6 +722,17 @@ def _identity_parity(
                 device=device,
                 reconstructed_prediction=matched_public_probe,
                 public_prediction=public_identity,
+            )
+            _emit(
+                progress,
+                event="identity_parity_failed",
+                task_id=task_id,
+                bag=bag,
+                split=split,
+                problem_type=bundle.problem_type,
+                public_parity_rows=public_parity_rows,
+                max_abs=max_public_abs,
+                diagnostics=diagnostics,
             )
             raise RuntimeError(
                 "standard-pipeline identity parity failed: the reconstructed normal TabICL path differs from "
@@ -855,6 +871,10 @@ def _fit_one_bag_standard(
             query_x=validation_x,
             device=device,
             config=config,
+            progress=progress,
+            task_id=task.task_id,
+            bag=bag,
+            split="validation",
         )
         identity_test, parity_test, parity_reference_test = _identity_parity(
             bundle=bundle,
@@ -862,6 +882,10 @@ def _fit_one_bag_standard(
             query_x=test_x,
             device=device,
             config=config,
+            progress=progress,
+            task_id=task.task_id,
+            bag=bag,
+            split="test",
         )
     _emit(
         progress,

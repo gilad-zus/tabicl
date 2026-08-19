@@ -283,6 +283,12 @@ def _event_reporter(path: Path):
                 f"peak={event['peak_allocated_gib']:.2f}GiB{parity}",
                 flush=True,
             )
+        elif event_name == "identity_parity_failed":
+            print(
+                f"[{task_prefix} bag={event['bag']}] {event['split']} identity parity failed "
+                f"(max_abs={event['max_abs']:.6g}); diagnostics saved to {path}",
+                flush=True,
+            )
         elif event_name == "config_started":
             detail = (
                 f"using {event['effective_bags']}/{event['requested_bags']} stratified bags"
