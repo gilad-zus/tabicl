@@ -400,13 +400,19 @@ class ColEmbedding(nn.Module):
                 bases = self._compute_mixed_radix_bases(num_classes)
                 num_digits = len(bases)
                 src_accum = torch.zeros_like(src)
-                src_with_y = src.clone()
 
                 # Run the set transformer for each digit, accumulate, and average
                 for digit_idx in range(num_digits):
                     y_digit = self._extract_mixed_radix_digit(y_train, digit_idx, bases)
                     y_emb = self.y_encoder(y_digit.float())
-                    src_with_y[..., :train_size, :] = src[..., :train_size, :] + y_emb
+                    # Build a fresh tensor for each digit.  Reusing one tensor
+                    # and assigning its training prefix in-place invalidated
+                    # autograd's saved values when an upstream DirectSpline
+                    # needed gradients through mixed-radix embedding.
+                    src_with_y = torch.cat(
+                        (src[..., :train_size, :] + y_emb, src[..., train_size:, :]),
+                        dim=-2,
+                    )
                     src_accum = src_accum + self.tf_col(src_with_y, train_size=None if embed_with_test else train_size)
 
                 src = src_accum / num_digits

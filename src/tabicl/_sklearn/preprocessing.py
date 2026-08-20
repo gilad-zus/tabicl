@@ -1166,7 +1166,11 @@ class EnsembleGenerator(TransformerMixin, BaseEstimator):
         shuffle_norm_configs = shuffle_norm_configs[: self.n_estimators]
 
         # Reorganize configs so that those with the same normalization method are grouped together
-        used_methods = list(set([config[1] for config in shuffle_norm_configs]))
+        # Preserve the first-seen normalization order.  A set made this order
+        # depend on PYTHONHASHSEED, which in turn changed float32 ensemble
+        # accumulation and assigned seeded DirectSpline initializations to
+        # different branches after a resume in a new process.
+        used_methods = list(dict.fromkeys(config[1] for config in shuffle_norm_configs))
 
         ensemble_configs = OrderedDict()
         X_shuffle_dict = OrderedDict()

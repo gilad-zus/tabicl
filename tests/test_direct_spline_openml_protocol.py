@@ -13,7 +13,9 @@ from tabicl._experiments.direct_spline_openml import (
     _bag_splits,
     effective_inner_bag_count,
     greedy_validation_ensemble,
+    run_standard_tabarena_baseline,
     summarize_experiment,
+    summarize_task_tuning,
     tabarena_v0pt1_task_ids,
 )
 import tabicl._experiments.direct_spline_openml as direct_spline_openml
@@ -122,6 +124,59 @@ def test_tabarena_suite_lookup_retries_a_transient_openml_failure(monkeypatch):
     assert delays == [0.25, 0.5]
 
 
+def test_standard_baseline_uses_existing_preprocessing_and_does_not_mutate_test_data(
+    monkeypatch, tmp_path
+):
+    checkpoint = tmp_path / "fake.ckpt"
+    checkpoint.write_bytes(b"checkpoint")
+    observed: dict[str, object] = {}
+
+    class FakeClassifier:
+        def __init__(self, **kwargs):
+            observed["kwargs"] = kwargs
+            self.model_path_ = checkpoint
+
+        def fit(self, features, labels):
+            observed["fit_features"] = features
+            observed["fit_labels"] = labels
+            return self
+
+        def predict_proba(self, features):
+            observed["prediction_input"] = features
+            features.iloc[:, 0] = 0.0
+            return np.tile(np.array([[0.75, 0.25]]), (len(features), 1))
+
+    monkeypatch.setattr(sys.modules["tabicl"], "TabICLClassifier", FakeClassifier)
+    task = OpenMLTaskData(
+        task_id=1,
+        dataset_id=2,
+        dataset_name="tiny",
+        problem_type="binary",
+        n_classes=2,
+        x_train=pd.DataFrame({"all_nan_at_test": [0.0, 1.0], "x": [1.0, 2.0]}),
+        y_train=np.array([0, 1]),
+        x_test=pd.DataFrame({"all_nan_at_test": [np.nan, np.nan], "x": [3.0, 4.0]}),
+        y_test=np.array([0, 1]),
+        outer_split_hash="split",
+    )
+
+    metadata = run_standard_tabarena_baseline(
+        task=task,
+        output_dir=tmp_path,
+        device=torch.device("cpu"),
+        classifier_checkpoint=None,
+        regressor_checkpoint=None,
+        resume=False,
+        run_fingerprint_hash="fingerprint",
+    )
+
+    assert observed["kwargs"]["numerical_preprocessing"] == "existing"
+    assert observed["prediction_input"] is not task.x_test
+    assert task.x_test["all_nan_at_test"].isna().all()
+    assert "test" not in metadata
+    assert metadata["test_metrics_deferred_to_task_summary"] is True
+
+
 def test_identity_guard_requires_full_half_percent_relative_improvement():
     rejected = choose_identity_guard(identity_error=0.20, adapted_error=0.1991)
     selected = choose_identity_guard(identity_error=0.20, adapted_error=0.1990)
@@ -161,8 +216,27 @@ def test_paired_elo_is_symmetric_and_bootstrapped():
     assert result["candidate_wins"] == 2
     assert result["identity_wins"] == 1
     assert result["ties"] == 1
+    assert result["rating_kind"] == "paired_head_to_head_elo_equivalent"
+    assert result["paired_head_to_head_elo_equivalent"] == result["paired_elo_delta"]
     assert result["paired_elo_delta"] == pytest.approx(-inverse["paired_elo_delta"])
     assert interval["lower_95"] <= interval["upper_95"]
+
+
+def test_invalid_candidate_prediction_is_retained_as_a_paired_loss():
+    result = direct_spline_openml._paired_comparison_summary(
+        reference=np.asarray([0.2, 0.3]),
+        candidate=np.asarray([np.inf, 0.1]),
+        problem_types=np.asarray(["binary", "binary"], dtype=object),
+        bootstrap_rounds=20,
+        bootstrap_seed=0,
+        reference_label="identity",
+        candidate_label="adapted",
+    )
+
+    assert result["n_tasks"] == 2
+    assert result["n_invalid_candidate_predictions"] == 1
+    assert result["candidate_wins"] == 1
+    assert result["identity_wins"] == 1
 
 
 def test_greedy_ensemble_uses_validation_to_select_the_better_candidate():
@@ -279,14 +353,106 @@ def test_one_bag_is_train_only_and_returns_complete_prediction_artifacts():
     assert result.metadata["backbone_activation_checkpointing"] is True
 
 
-def test_summary_keeps_standard_tabarena_baseline_out_of_internal_paired_elo(tmp_path):
+def test_single_default_task_summary_marks_tuning_and_ensemble_as_aliases(tmp_path):
+    labels = np.array([0, 1, 0, 1])
+    identity = np.array([[0.7, 0.3], [0.4, 0.6], [0.6, 0.4], [0.3, 0.7]])
+    adapted = np.array([[0.8, 0.2], [0.3, 0.7], [0.7, 0.3], [0.2, 0.8]])
+    task = OpenMLTaskData(
+        task_id=1,
+        dataset_id=2,
+        dataset_name="tiny",
+        problem_type="binary",
+        n_classes=2,
+        x_train=pd.DataFrame({"x": np.arange(4)}),
+        y_train=labels,
+        x_test=pd.DataFrame({"x": np.arange(4, 8)}),
+        y_test=labels,
+        outer_split_hash="split",
+    )
+    identity_metrics = {
+        "benchmark_error": benchmark_error("binary", labels, identity),
+        "deployment_error": deployment_error("binary", labels, identity),
+    }
+    adapted_metrics = {
+        "benchmark_error": benchmark_error("binary", labels, adapted),
+        "deployment_error": deployment_error("binary", labels, adapted),
+    }
+    config_dir = tmp_path / "raw" / "task_1_tiny" / "config_D"
+    config_dir.mkdir(parents=True)
+    direct_spline_openml._json_dump(
+        config_dir / "config_summary.json",
+        {
+            "pipeline": "standard",
+            "identity_definition": "matched",
+            "validation": {
+                "identity": identity_metrics,
+                "adapted": adapted_metrics,
+                "guarded": adapted_metrics,
+            },
+            "test_metrics_deferred_to_task_summary": True,
+            "guard_selected_adapted_fraction": 1.0,
+            "requested_bags": 8,
+            "effective_bags": 8,
+        },
+    )
+    np.savez_compressed(
+        config_dir / "config_predictions.npz",
+        identity_validation=identity,
+        adapted_validation=adapted,
+        guarded_validation=adapted,
+        identity_test=identity,
+        adapted_test=adapted,
+        guarded_test=adapted,
+    )
+
+    result = summarize_task_tuning(
+        task=task,
+        config_labels=["D"],
+        output_dir=tmp_path,
+        ensemble_rounds=10,
+    )
+
+    assert result["default"] == result["guarded_default"]
+    assert result["tuned"] == result["guarded_default"]
+    assert result["tuned_ensemble"] == result["guarded_default"]
+    assert result["raw_adapted_tuned"] == result["raw_adapted_default"]
+    assert result["tuned_ensemble_selected_config_labels"] == ["D"]
+    assert result["distinct_reported_arms"] == ["raw_adapted_default", "guarded_default"]
+    assert result["reported_arm_aliases"]["guarded_tuned_ensemble"] == "guarded_default"
+
+
+def test_summary_separates_raw_guarded_and_end_to_end_standard_comparisons(tmp_path):
     task_summary = {
+        "report_schema_version": 2,
         "task_id": 1,
         "dataset_id": 2,
         "dataset_name": "tiny",
         "problem_type": "binary",
         "outer_split_hash": "split",
         "identity": {"benchmark_error": 0.30, "deployment_error": 0.30},
+        "raw_adapted_default": {"benchmark_error": 0.32, "deployment_error": 0.32},
+        "raw_adapted_tuned": {"benchmark_error": 0.21, "deployment_error": 0.21},
+        "raw_adapted_tuned_config_label": "T1",
+        "raw_adapted_tuned_validation_deployment_error": 0.20,
+        "guarded_default": {"benchmark_error": 0.25, "deployment_error": 0.25},
+        "guarded_tuned": {"benchmark_error": 0.24, "deployment_error": 0.24},
+        "guarded_tuned_config_label": "T2",
+        "guarded_tuned_validation_deployment_error": 0.22,
+        "guarded_tuned_ensemble": {"benchmark_error": 0.23, "deployment_error": 0.23},
+        "guarded_tuned_ensemble_validation": {"benchmark_error": 0.22, "deployment_error": 0.22},
+        "guarded_tuned_ensemble_selected_config_labels": ["D", "T2"],
+        "reported_arm_aliases": {
+            "default": "guarded_default",
+            "tuned": "guarded_tuned",
+            "tuned_ensemble": "guarded_tuned_ensemble",
+        },
+        "distinct_reported_arms": [
+            "raw_adapted_default",
+            "raw_adapted_tuned",
+            "guarded_default",
+            "guarded_tuned",
+            "guarded_tuned_ensemble",
+        ],
         "default": {"benchmark_error": 0.25, "deployment_error": 0.25},
         "tuned": {"benchmark_error": 0.24, "deployment_error": 0.24},
         "tuned_ensemble": {"benchmark_error": 0.23, "deployment_error": 0.23},
@@ -315,10 +481,22 @@ def test_summary_keeps_standard_tabarena_baseline_out_of_internal_paired_elo(tmp
         task_eligibility={"max_features": 100},
     )
     row = (tmp_path / "task_results.csv").read_text(encoding="utf-8").splitlines()[1]
-    assert summary["standard_tabarena"]["mean_benchmark_error"] == pytest.approx(0.20)
+    assert summary["standard_tabarena"]["n_tasks_available"] == 1
+    assert "mean_benchmark_error" not in summary["standard_tabarena"]
     assert "standard_tabarena_benchmark_error" in (tmp_path / "task_results.csv").read_text(encoding="utf-8").splitlines()[0]
     assert "0.2" in row
-    assert set(summary["paired_results"]) == {"default", "tuned", "tuned_ensemble"}
+    assert summary["distinct_paired_result_keys"] == task_summary["distinct_reported_arms"]
+    assert summary["paired_results"]["default"]["alias_of"] == "guarded_default"
+    assert summary["paired_results"]["raw_adapted_default"]["candidate_wins"] == 0
+    assert summary["paired_results"]["raw_adapted_tuned"]["candidate_wins"] == 1
+    assert "mean_benchmark_error" not in summary["paired_results"]["guarded_default"]
+    assert summary["paired_results"]["guarded_default"]["median_relative_error_change"] == pytest.approx(
+        (0.25 - 0.30) / 0.30
+    )
+    assert summary["paired_results"]["guarded_default"]["by_problem_type"]["binary"]["n_tasks"] == 1
+    end_to_end = summary["end_to_end_vs_standard_tabarena"]
+    assert end_to_end["results"]["guarded_default"]["identity_wins"] == 1
+    assert "not an isolated spline effect" in end_to_end["note"]
     assert summary["n_skipped_tasks"] == 1
     assert summary["skipped_tasks"][0]["dataset_name"] == "wide"
     assert summary["task_eligibility"] == {"max_features": 100}

@@ -30,4 +30,4 @@ from direct_spline_openml_lite import main
 
 
 if __name__ == "__main__":
-    main(default_pipeline="standard")
+    main(default_pipeline="standard", required_pipeline="standard")

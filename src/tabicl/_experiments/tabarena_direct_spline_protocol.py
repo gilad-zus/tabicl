@@ -121,7 +121,7 @@ def paired_elo_delta(
     candidate_errors: np.ndarray,
     *,
     tie_atol: float = 1e-12,
-) -> dict[str, float | int]:
+) -> dict[str, float | int | str]:
     """Compute a transparent two-method Elo-equivalent difference.
 
     This is intentionally not the absolute Elo value on TabArena's published
@@ -149,6 +149,10 @@ def paired_elo_delta(
         "identity_wins": identity_wins,
         "ties": ties,
         "candidate_score": float(score),
+        "rating_kind": "paired_head_to_head_elo_equivalent",
+        "paired_head_to_head_elo_equivalent": float(delta),
+        # Compatibility alias for existing report readers.  This is not a
+        # TabArena/Retouche multi-method Elo rating.
         "paired_elo_delta": float(delta),
     }
 

@@ -60,6 +60,7 @@ STANDARD_TABICL_CONFIG: dict[str, Any] = {
     "support_many_classes": True,
     "batch_size": 8,
     "kv_cache": False,
+    "numerical_preprocessing": "existing",
     "random_state": 0,
 }
 
@@ -168,6 +169,24 @@ def _resolve_checkpoint(path: str | Path | None, version: str) -> Path:
     return Path(hf_hub_download(repo_id="jingang/TabICL", filename=version))
 
 
+def _set_frozen_autograd_routing(backbone: TabICL) -> None:
+    """Select TabICL's differentiable math without enabling stochastic layers.
+
+    CUDA inference managers intentionally run under ``no_grad``.  Upstream
+    spline optimisation therefore needs the direct mathematical route in all
+    four top-level stages.  Recursively calling ``train()`` is not equivalent:
+    it also enables attention/dropout behavior that regular prediction does
+    not use.
+    """
+
+    backbone.eval()
+    for module_name in ("col_embedder", "row_interactor", "icl_predictor"):
+        module = getattr(backbone, module_name, None)
+        if module is not None:
+            module.training = True
+    backbone.training = True
+
+
 def load_frozen_backbone(
     *,
     problem_type: ProblemType,
@@ -192,14 +211,10 @@ def load_frozen_backbone(
         raise ValueError(f"regression checkpoint {path.name} is not a regression backbone")
     if problem_type != "regression" and backbone.max_classes <= 0:
         raise ValueError(f"classification checkpoint {path.name} is not a classifier backbone")
-    # ``train`` selects TabICL's differentiable forward path.  The backbone is
-    # still frozen, and dropout remains disabled to make adaptation deterministic.
-    backbone.to(device).train()
+    backbone.to(device)
     for parameter in backbone.parameters():
         parameter.requires_grad_(False)
-    for module in backbone.modules():
-        if isinstance(module, torch.nn.Dropout):
-            module.eval()
+    _set_frozen_autograd_routing(backbone)
     return backbone, path, _checkpoint_metadata(path)
 
 
@@ -513,6 +528,31 @@ def _metric_bundle(
     return {"deployment_error": float(deploy), "benchmark_error": float(bench)}
 
 
+def _candidate_metric_bundle(
+    problem_type: ProblemType,
+    labels: np.ndarray,
+    prediction: np.ndarray,
+    n_classes: int | None,
+) -> dict[str, float | bool | str | None]:
+    """Score an adapted outer-test prediction without aborting the whole run.
+
+    A learned checkpoint that was finite on its validation fold can still be
+    invalid on a particular test table.  Preserve that result as an explicit
+    failed candidate so a single numerical failure cannot hide the completed
+    task or terminate the remaining benchmark.
+    """
+
+    try:
+        return {**_metric_bundle(problem_type, labels, prediction, n_classes), "prediction_valid": True}
+    except (TypeError, ValueError, FloatingPointError) as error:
+        return {
+            "deployment_error": float("inf"),
+            "benchmark_error": float("inf"),
+            "prediction_valid": False,
+            "invalid_prediction_error": f"{type(error).__name__}: {error}",
+        }
+
+
 def effective_inner_bag_count(task: OpenMLTaskData, *, requested_bags: int) -> int:
     """Return the largest valid stratified OOF bag count up to the request.
 
@@ -823,9 +863,11 @@ def run_standard_tabarena_baseline(
     """Run normal public TabICLv2 inference on the full outer-training split.
 
     This does not take part in DirectSpline guarding, HPO, or ensembling.  It
-    is intentionally stored separately because it uses TabICL's normal eight
-    estimator preprocessing ensemble, whereas the DirectSpline arm needs a
-    differentiable, one-context raw-backbone path.
+    is intentionally stored separately because it fits one ordinary public
+    eight-estimator TabICLv2 model on every outer-training row.  DirectSpline
+    is evaluated through inner-bag fits and then averages their predictions,
+    so this baseline is an end-to-end reference rather than the matched
+    identity control that isolates the spline change.
     """
     directory = _standard_baseline_dir(output_dir, task)
     summary_path = directory / "summary.json"
@@ -852,6 +894,7 @@ def run_standard_tabarena_baseline(
         "outlier_threshold": float(STANDARD_TABICL_CONFIG["outlier_threshold"]),
         "batch_size": int(STANDARD_TABICL_CONFIG["batch_size"]),
         "kv_cache": bool(STANDARD_TABICL_CONFIG["kv_cache"]),
+        "numerical_preprocessing": str(STANDARD_TABICL_CONFIG["numerical_preprocessing"]),
         "random_state": int(STANDARD_TABICL_CONFIG["random_state"]),
         "device": str(device),
         "verbose": False,
@@ -874,7 +917,15 @@ def run_standard_tabarena_baseline(
             checkpoint_version=CLASSIFIER_CHECKPOINT,
         )
     estimator.fit(task.x_train, task.y_train)
-    prediction = estimator.predict(task.x_test) if task.problem_type == "regression" else estimator.predict_proba(task.x_test)
+    # Public predict deliberately fills all-NaN query columns in-place before
+    # applying its feature mask.  Keep the task object immutable because the
+    # DirectSpline path consumes the same outer-test data afterwards.
+    prediction_input = task.x_test.copy()
+    prediction = (
+        estimator.predict(prediction_input)
+        if task.problem_type == "regression"
+        else estimator.predict_proba(prediction_input)
+    )
     checkpoint_path = Path(estimator.model_path_)
     metadata = {
         "task_id": task.task_id,
@@ -886,7 +937,7 @@ def run_standard_tabarena_baseline(
         "standard_tabarena_config": STANDARD_TABICL_CONFIG,
         "checkpoint": _checkpoint_metadata(checkpoint_path),
         "run_fingerprint_hash": run_fingerprint_hash,
-        "test": _metric_bundle(task.problem_type, task.y_test, prediction, task.n_classes),
+        "test_metrics_deferred_to_task_summary": True,
         "elapsed_seconds": float(time.perf_counter() - started),
         "peak_allocated_gib": float(
             0.0 if device.type != "cuda" else torch.cuda.max_memory_allocated(device) / 2**30
@@ -1016,11 +1067,8 @@ def run_task_config(
             "adapted": _metric_bundle(task.problem_type, task.y_train, adapted_validation, task.n_classes),
             "guarded": _metric_bundle(task.problem_type, task.y_train, guarded_validation, task.n_classes),
         },
-        "test": {
-            "identity": _metric_bundle(task.problem_type, task.y_test, identity_test, task.n_classes),
-            "adapted": _metric_bundle(task.problem_type, task.y_test, adapted_test, task.n_classes),
-            "guarded": _metric_bundle(task.problem_type, task.y_test, guarded_test, task.n_classes),
-        },
+        "test_metrics_deferred_to_task_summary": True,
+        "guard_protocol": "retouche_per_bag_validation_guard_then_test_ensemble",
         "guard_selected_adapted_fraction": float(
             np.mean([bool(result.metadata["guard_selected_adapted"]) for result in bag_results])
         ),
@@ -1035,7 +1083,6 @@ def run_task_config(
         task_id=task.task_id,
         config_label=label,
         guarded_validation_error=summary["validation"]["guarded"]["deployment_error"],
-        guarded_test_error=summary["test"]["guarded"]["benchmark_error"],
     )
     del backbone
     if device.type == "cuda":
@@ -1080,25 +1127,103 @@ def summarize_task_tuning(
     ensemble_rounds: int,
     standard_tabarena: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Use OOF validation only to create D, T, and T+E outer-test outputs."""
+    """Use OOF validation only to create raw and guarded outer-test outputs.
+
+    The historical ``default``, ``tuned``, and ``tuned_ensemble`` keys are
+    retained as aliases of the guarded deployment arms.  Raw adapted outputs
+    are reported separately so the identity guard cannot hide either spline
+    gains or spline regressions when measuring adaptation headroom.
+    """
+    if not config_labels:
+        raise ValueError("task tuning needs at least one DirectSpline configuration")
     summaries = [_json_load(_config_dir(output_dir, task, label) / "config_summary.json") for label in config_labels]
     prediction_paths = [_config_dir(output_dir, task, label) / "config_predictions.npz" for label in config_labels]
-    validation_predictions = [_load_config_prediction(path, "guarded_validation") for path in prediction_paths]
-    test_predictions = [_load_config_prediction(path, "guarded_test") for path in prediction_paths]
-    selected_index = int(
+    guarded_validation_predictions = [
+        _load_config_prediction(path, "guarded_validation") for path in prediction_paths
+    ]
+    guarded_test_predictions = [_load_config_prediction(path, "guarded_test") for path in prediction_paths]
+    raw_adapted_test_predictions = [
+        _load_config_prediction(path, "adapted_test") for path in prediction_paths
+    ]
+    guarded_selected_index = int(
         np.argmin([float(summary["validation"]["guarded"]["deployment_error"]) for summary in summaries])
     )
-    ensemble_indices, ensemble_validation = greedy_validation_ensemble(
-        predictions=validation_predictions,
-        labels=task.y_train,
-        problem_type=task.problem_type,
-        n_classes=task.n_classes,
-        rounds=ensemble_rounds,
+    raw_selected_index = int(
+        np.argmin([float(summary["validation"]["adapted"]["deployment_error"]) for summary in summaries])
     )
-    ensemble_test = np.mean([test_predictions[index] for index in ensemble_indices], axis=0)
+    only_default = len(config_labels) == 1
+    if only_default:
+        # Repeating the sole D prediction for every greedy round produces the
+        # exact same arm.  Record an explicit alias instead of presenting it
+        # as extra tuning or ensemble evidence.
+        ensemble_indices = [0]
+        ensemble_validation = guarded_validation_predictions[0]
+        ensemble_test = guarded_test_predictions[0]
+    else:
+        ensemble_indices, ensemble_validation = greedy_validation_ensemble(
+            predictions=guarded_validation_predictions,
+            labels=task.y_train,
+            problem_type=task.problem_type,
+            n_classes=task.n_classes,
+            rounds=ensemble_rounds,
+        )
+        ensemble_test = np.mean([guarded_test_predictions[index] for index in ensemble_indices], axis=0)
     default = summaries[0]
     identity_test = _load_config_prediction(prediction_paths[0], "identity_test")
+    # Config choice is now frozen. Only from this point onward may the outer
+    # test labels be used to score the saved predictions.
+    raw_adapted_default = _candidate_metric_bundle(
+        task.problem_type, task.y_test, raw_adapted_test_predictions[0], task.n_classes
+    )
+    raw_adapted_tuned = _candidate_metric_bundle(
+        task.problem_type,
+        task.y_test,
+        raw_adapted_test_predictions[raw_selected_index],
+        task.n_classes,
+    )
+    guarded_default = _candidate_metric_bundle(
+        task.problem_type, task.y_test, guarded_test_predictions[0], task.n_classes
+    )
+    guarded_tuned = _candidate_metric_bundle(
+        task.problem_type,
+        task.y_test,
+        guarded_test_predictions[guarded_selected_index],
+        task.n_classes,
+    )
+    guarded_tuned_ensemble = _candidate_metric_bundle(
+        task.problem_type, task.y_test, ensemble_test, task.n_classes
+    )
+    if standard_tabarena is None:
+        standard_tabarena_test = None
+    else:
+        standard_prediction = _load_config_prediction(
+            _standard_baseline_dir(output_dir, task) / "predictions.npz", "prediction"
+        )
+        standard_tabarena_test = _metric_bundle(
+            task.problem_type, task.y_test, standard_prediction, task.n_classes
+        )
+    reported_arm_aliases = {
+        # Backward-compatible artifact names.
+        "default": "guarded_default",
+        "tuned": "guarded_default" if only_default else "guarded_tuned",
+        "tuned_ensemble": "guarded_default" if only_default else "guarded_tuned_ensemble",
+    }
+    if only_default:
+        reported_arm_aliases.update(
+            {
+                "raw_adapted_tuned": "raw_adapted_default",
+                "guarded_tuned": "guarded_default",
+                "guarded_tuned_ensemble": "guarded_default",
+            }
+        )
+    distinct_reported_arms = ["raw_adapted_default", "guarded_default"]
+    if not only_default:
+        distinct_reported_arms.extend(
+            ["raw_adapted_tuned", "guarded_tuned", "guarded_tuned_ensemble"]
+        )
     result = {
+        "report_schema_version": 2,
+        "outer_test_scored_after_validation_selection": True,
         "task_id": task.task_id,
         "dataset_id": task.dataset_id,
         "dataset_name": task.dataset_name,
@@ -1111,26 +1236,141 @@ def summarize_task_tuning(
             "Raw frozen TabICL identity path used by the legacy lite DirectSpline runner.",
         ),
         "identity": _metric_bundle(task.problem_type, task.y_test, identity_test, task.n_classes),
-        "default": default["test"]["guarded"],
-        "tuned": summaries[selected_index]["test"]["guarded"],
-        "tuned_config_label": config_labels[selected_index],
-        "tuned_validation_deployment_error": summaries[selected_index]["validation"]["guarded"]["deployment_error"],
-        "tuned_ensemble": _metric_bundle(task.problem_type, task.y_test, ensemble_test, task.n_classes),
+        "raw_adapted_default": raw_adapted_default,
+        "raw_adapted_tuned": raw_adapted_tuned,
+        "raw_adapted_tuned_config_label": config_labels[raw_selected_index],
+        "raw_adapted_tuned_validation_deployment_error": summaries[raw_selected_index]["validation"][
+            "adapted"
+        ]["deployment_error"],
+        "guarded_default": guarded_default,
+        "guarded_tuned": guarded_tuned,
+        "guarded_tuned_config_label": config_labels[guarded_selected_index],
+        "guarded_tuned_validation_deployment_error": summaries[guarded_selected_index]["validation"][
+            "guarded"
+        ]["deployment_error"],
+        "guarded_tuned_ensemble": guarded_tuned_ensemble,
+        "guarded_tuned_ensemble_validation": _metric_bundle(
+            task.problem_type, task.y_train, ensemble_validation, task.n_classes
+        ),
+        "guarded_tuned_ensemble_selected_config_labels": [
+            config_labels[index] for index in ensemble_indices
+        ],
+        "reported_arm_aliases": reported_arm_aliases,
+        "distinct_reported_arms": distinct_reported_arms,
+        # Historical names remain guarded-arm aliases for artifact consumers.
+        "default": guarded_default,
+        "tuned": guarded_tuned,
+        "tuned_config_label": config_labels[guarded_selected_index],
+        "tuned_validation_deployment_error": summaries[guarded_selected_index]["validation"]["guarded"][
+            "deployment_error"
+        ],
+        "tuned_ensemble": guarded_tuned_ensemble,
         "tuned_ensemble_validation": _metric_bundle(
             task.problem_type, task.y_train, ensemble_validation, task.n_classes
         ),
         "tuned_ensemble_selected_config_labels": [config_labels[index] for index in ensemble_indices],
         "default_guard_selected_adapted_fraction": default["guard_selected_adapted_fraction"],
+        "default_adapter_valid_learned_checkpoint_fraction": default.get(
+            "adapter_valid_learned_checkpoint_fraction"
+        ),
+        "guard_protocol": default.get(
+            "guard_protocol", "retouche_per_bag_validation_guard_then_test_ensemble"
+        ),
         "direct_spline_requested_bags": default["requested_bags"],
         "direct_spline_effective_bags": default["effective_bags"],
-        "standard_tabarena": None if standard_tabarena is None else standard_tabarena["test"],
+        "standard_tabarena": standard_tabarena_test,
         "standard_tabarena_note": (
-            "Normal full-outer-training TabICLv2 inference; it is a separate public baseline, "
-            "not the matched inner-bag identity control used by DirectSpline."
+            "Normal TabICLv2 fitted once on every outer-training row. DirectSpline uses inner-bag "
+            "fits and averages their predictions, so this is an end-to-end pipeline reference, "
+            "not the matched identity control that isolates the spline change."
         ),
     }
     _json_dump(output_dir / "task_summaries" / f"task_{task.task_id}_{_safe_name(task.dataset_name)}.json", result)
     return result
+
+
+_EXPLICIT_REPORT_ARM_ORDER = (
+    "raw_adapted_default",
+    "raw_adapted_tuned",
+    "guarded_default",
+    "guarded_tuned",
+    "guarded_tuned_ensemble",
+)
+_LEGACY_GUARDED_ARM_ALIASES = {
+    "default": "guarded_default",
+    "tuned": "guarded_tuned",
+    "tuned_ensemble": "guarded_tuned_ensemble",
+}
+
+
+def _relative_error_change(reference: np.ndarray, candidate: np.ndarray) -> np.ndarray:
+    reference = np.asarray(reference, dtype=float)
+    candidate = np.asarray(candidate, dtype=float)
+    return (candidate - reference) / np.maximum(np.abs(reference), 1e-12)
+
+
+def _paired_comparison_summary(
+    *,
+    reference: np.ndarray,
+    candidate: np.ndarray,
+    problem_types: np.ndarray,
+    bootstrap_rounds: int,
+    bootstrap_seed: int,
+    reference_label: str,
+    candidate_label: str,
+) -> dict[str, Any]:
+    """Summarize paired outcomes without averaging incomparable raw errors."""
+    reference = np.asarray(reference, dtype=float)
+    candidate = np.asarray(candidate, dtype=float)
+    problem_types = np.asarray(problem_types, dtype=object)
+    valid_reference = np.isfinite(reference)
+    if not np.any(valid_reference):
+        raise ValueError("at least one finite reference result is required")
+    invalid_candidate = valid_reference & ~np.isfinite(candidate)
+    n_invalid_reference = int(np.sum(~valid_reference))
+    n_invalid_candidate = int(np.sum(invalid_candidate))
+    reference = reference[valid_reference]
+    candidate = candidate[valid_reference]
+    problem_types = problem_types[valid_reference]
+    if n_invalid_candidate:
+        # A malformed candidate prediction is an observed loss, not a missing
+        # comparison. Use a finite, task-relative penalty solely for paired
+        # win/loss and bootstrap arithmetic; the per-task metric remains inf
+        # and carries the explicit invalid-prediction diagnostic.
+        candidate[~np.isfinite(candidate)] = (
+            reference[~np.isfinite(candidate)]
+            + np.maximum(np.abs(reference[~np.isfinite(candidate)]), 1.0) * 1_000_000.0
+        )
+    relative = _relative_error_change(reference, candidate)
+    by_problem_type: dict[str, dict[str, Any]] = {}
+    for problem_type in sorted(set(str(value) for value in problem_types)):
+        mask = problem_types == problem_type
+        grouped_reference = reference[mask]
+        grouped_candidate = candidate[mask]
+        grouped = paired_elo_delta(grouped_reference, grouped_candidate)
+        grouped["median_relative_error_change"] = float(
+            np.median(_relative_error_change(grouped_reference, grouped_candidate))
+        )
+        by_problem_type[problem_type] = grouped
+    return {
+        **paired_elo_delta(reference, candidate),
+        "bootstrap": bootstrap_paired_elo(
+            reference,
+            candidate,
+            rounds=bootstrap_rounds,
+            seed=bootstrap_seed,
+        ),
+        "reference_label": reference_label,
+        "candidate_label": candidate_label,
+        "n_invalid_candidate_predictions": n_invalid_candidate,
+        "n_invalid_reference_predictions": n_invalid_reference,
+        "median_relative_error_change": float(np.median(relative)),
+        "by_problem_type": by_problem_type,
+    }
+
+
+def _copy_paired_alias(result: dict[str, Any], *, alias_of: str) -> dict[str, Any]:
+    return {**result, "alias_of": alias_of}
 
 
 def summarize_experiment(
@@ -1152,23 +1392,57 @@ def summarize_experiment(
     if not task_summaries:
         raise ValueError("cannot summarise an empty experiment")
     skipped_tasks = [] if skipped_tasks is None else skipped_tasks
-    methods = ("default", "tuned", "tuned_ensemble")
+    has_explicit_arms = all(
+        all(arm in item for arm in _EXPLICIT_REPORT_ARM_ORDER) for item in task_summaries
+    )
+    if has_explicit_arms:
+        candidate_arms = list(_EXPLICIT_REPORT_ARM_ORDER)
+        global_aliases: dict[str, str] = {}
+        for arm in candidate_arms:
+            targets = {
+                str(item.get("reported_arm_aliases", {}).get(arm, arm)) for item in task_summaries
+            }
+            if len(targets) == 1:
+                target = next(iter(targets))
+                if target != arm:
+                    global_aliases[arm] = target
+        distinct_arms = []
+        for arm in candidate_arms:
+            target = global_aliases.get(arm, arm)
+            if target not in distinct_arms:
+                distinct_arms.append(target)
+    else:
+        # Old task-summary artifacts remain readable. They did not retain raw
+        # adapted metrics, so only their historical guarded arms can be shown.
+        candidate_arms = ["default", "tuned", "tuned_ensemble"]
+        global_aliases = {}
+        distinct_arms = list(candidate_arms)
     identity = np.asarray(
         [float(item["identity"]["benchmark_error"]) for item in task_summaries], dtype=float
     )
+    problem_types = np.asarray([str(item["problem_type"]) for item in task_summaries], dtype=object)
     paired: dict[str, dict[str, Any]] = {}
-    for offset, method in enumerate(methods):
+    for offset, method in enumerate(distinct_arms):
         candidate = np.asarray(
             [float(item[method]["benchmark_error"]) for item in task_summaries], dtype=float
         )
-        paired[method] = {
-            **paired_elo_delta(identity, candidate),
-            "bootstrap": bootstrap_paired_elo(
-                identity, candidate, rounds=bootstrap_rounds, seed=bootstrap_seed + offset
-            ),
-            "mean_benchmark_error": float(np.mean(candidate)),
-            "mean_relative_error_change": float(np.mean((candidate - identity) / np.maximum(identity, 1e-12))),
-        }
+        paired[method] = _paired_comparison_summary(
+            reference=identity,
+            candidate=candidate,
+            problem_types=problem_types,
+            bootstrap_rounds=bootstrap_rounds,
+            bootstrap_seed=bootstrap_seed + offset,
+            reference_label="matched_inner_bag_identity",
+            candidate_label=method,
+        )
+    for method, target in global_aliases.items():
+        paired[method] = _copy_paired_alias(paired[target], alias_of=target)
+    paired_result_aliases = dict(global_aliases)
+    if has_explicit_arms:
+        for legacy, explicit in _LEGACY_GUARDED_ARM_ALIASES.items():
+            target = global_aliases.get(explicit, explicit)
+            paired_result_aliases[legacy] = target
+            paired[legacy] = _copy_paired_alias(paired[target], alias_of=target)
     rows: list[dict[str, Any]] = []
     for item in task_summaries:
         row: dict[str, Any] = {
@@ -1183,22 +1457,54 @@ def summarize_experiment(
             "tuned_config_label": item["tuned_config_label"],
             "tuned_validation_deployment_error": item["tuned_validation_deployment_error"],
             "default_guard_selected_adapted_fraction": item["default_guard_selected_adapted_fraction"],
+            "default_adapter_valid_learned_checkpoint_fraction": item.get(
+                "default_adapter_valid_learned_checkpoint_fraction"
+            ),
+            "guard_protocol": item.get("guard_protocol"),
             "direct_spline_requested_bags": item["direct_spline_requested_bags"],
             "direct_spline_effective_bags": item["direct_spline_effective_bags"],
             "tuned_ensemble_selected_config_labels": ";".join(item["tuned_ensemble_selected_config_labels"]),
         }
+        if has_explicit_arms:
+            row.update(
+                {
+                    "raw_adapted_tuned_config_label": item["raw_adapted_tuned_config_label"],
+                    "raw_adapted_tuned_validation_deployment_error": item[
+                        "raw_adapted_tuned_validation_deployment_error"
+                    ],
+                    "guarded_tuned_config_label": item["guarded_tuned_config_label"],
+                    "guarded_tuned_validation_deployment_error": item[
+                        "guarded_tuned_validation_deployment_error"
+                    ],
+                    "reported_arm_aliases": json.dumps(item["reported_arm_aliases"], sort_keys=True),
+                    "distinct_reported_arms": ";".join(item["distinct_reported_arms"]),
+                }
+            )
         if item["standard_tabarena"] is not None:
             row["standard_tabarena_benchmark_error"] = item["standard_tabarena"]["benchmark_error"]
             row["standard_tabarena_deployment_error"] = item["standard_tabarena"]["deployment_error"]
-        for method in methods:
+        csv_methods = list(dict.fromkeys(["default", "tuned", "tuned_ensemble", *candidate_arms]))
+        for method in csv_methods:
             row[f"{method}_benchmark_error"] = item[method]["benchmark_error"]
             row[f"{method}_deployment_error"] = item[method]["deployment_error"]
             row[f"{method}_minus_identity_benchmark_error"] = (
                 item[method]["benchmark_error"] - item["identity"]["benchmark_error"]
             )
+            row[f"{method}_relative_error_change_vs_identity"] = float(
+                _relative_error_change(
+                    np.asarray([item["identity"]["benchmark_error"]], dtype=float),
+                    np.asarray([item[method]["benchmark_error"]], dtype=float),
+                )[0]
+            )
             if item["standard_tabarena"] is not None:
                 row[f"{method}_minus_standard_tabarena_benchmark_error"] = (
                     item[method]["benchmark_error"] - item["standard_tabarena"]["benchmark_error"]
+                )
+                row[f"{method}_relative_error_change_vs_standard_tabarena"] = float(
+                    _relative_error_change(
+                        np.asarray([item["standard_tabarena"]["benchmark_error"]], dtype=float),
+                        np.asarray([item[method]["benchmark_error"]], dtype=float),
+                    )[0]
                 )
         rows.append(row)
     csv_path = output_dir / "task_results.csv"
@@ -1207,6 +1513,32 @@ def summarize_experiment(
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
+    standard_available = [item["standard_tabarena"] is not None for item in task_summaries]
+    end_to_end_results: dict[str, dict[str, Any]] = {}
+    for offset, method in enumerate(distinct_arms):
+        selected_items = [item for item in task_summaries if item["standard_tabarena"] is not None]
+        if not selected_items:
+            break
+        standard_errors = np.asarray(
+            [float(item["standard_tabarena"]["benchmark_error"]) for item in selected_items],
+            dtype=float,
+        )
+        candidate_errors = np.asarray(
+            [float(item[method]["benchmark_error"]) for item in selected_items],
+            dtype=float,
+        )
+        selected_problem_types = np.asarray(
+            [str(item["problem_type"]) for item in selected_items], dtype=object
+        )
+        end_to_end_results[method] = _paired_comparison_summary(
+            reference=standard_errors,
+            candidate=candidate_errors,
+            problem_types=selected_problem_types,
+            bootstrap_rounds=bootstrap_rounds,
+            bootstrap_seed=bootstrap_seed + 10_000 + offset,
+            reference_label="full_outer_training_standard_tabicl",
+            candidate_label=method,
+        )
     summary = {
         "n_tasks": len(task_summaries),
         "n_skipped_tasks": len(skipped_tasks),
@@ -1214,21 +1546,38 @@ def summarize_experiment(
         "skipped_tasks": skipped_tasks,
         "paired_elo_note": (
             "Elo deltas are paired DirectSpline-versus-identity values on this run only; "
-            "they are not absolute ratings on Retouche's published multi-method pool."
+            "they are not absolute ratings on Retouche's published multi-method pool. Raw-adapted "
+            "arms show spline headroom without the identity guard; guarded arms show deployment behavior. "
+            "If a bag never produces a finite learned checkpoint, its raw prediction conservatively falls "
+            "back to identity and the per-task valid-checkpoint fraction records that fallback."
         ),
         "metric_note": "Binary: 1-AUC; multiclass: log loss; regression: RMSE for comparison, MSE for guard/HPO.",
+        "guard_protocol": "retouche_per_bag_validation_guard_then_test_ensemble",
         "paired_results": paired,
+        "distinct_paired_result_keys": distinct_arms,
+        "paired_result_aliases": paired_result_aliases,
         "standard_tabarena": {
-            "available": all(item["standard_tabarena"] is not None for item in task_summaries),
+            "available": all(standard_available),
+            "n_tasks_available": int(sum(standard_available)),
+            "n_tasks_missing": int(len(standard_available) - sum(standard_available)),
             "note": (
-                "This is the normal full-outer-training TabICLv2 baseline. It is reported as task metrics "
-                "and mean error only, not folded into the internal paired-Elo scale."
+                "This is normal TabICLv2 fitted once on every outer-training row. Cross-task raw error "
+                "is intentionally not averaged because binary 1-AUC, multiclass log loss, and regression "
+                "RMSE have incomparable scales."
             ),
-            "mean_benchmark_error": (
-                None
-                if any(item["standard_tabarena"] is None for item in task_summaries)
-                else float(np.mean([item["standard_tabarena"]["benchmark_error"] for item in task_summaries]))
+        },
+        "end_to_end_vs_standard_tabarena": {
+            "available": bool(end_to_end_results),
+            "n_tasks_available": int(sum(standard_available)),
+            "causal_interpretation": "none_end_to_end_protocols_are_confounded",
+            "primary_spline_effect_comparison": "paired_results_vs_matched_inner_bag_identity",
+            "note": (
+                "These dataset-paired results compare complete pipelines, not an isolated spline effect: "
+                "the standard model fits once on all outer-training rows, while DirectSpline fits inner "
+                "bags, uses OOF guard/tuning decisions, and averages bag predictions. Use the matched "
+                "identity paired results above to attribute changes specifically to the spline."
             ),
+            "results": end_to_end_results,
         },
         "task_results_csv": str(csv_path),
     }

@@ -7,9 +7,10 @@ useful diagnostic, but its identity path is not the normal TabICLv2 estimator.
 
 This module keeps the DirectSpline adapter as the *only* learned addition while
 using the normal estimator's per-bag preprocessing views, feature/class
-shuffles, temperature, and logit averaging.  Before training an adapter, it
-checks that a freshly initialised (therefore exact-identity) spline reproduces
-the same predictions as the normal estimator fitted on the same bag.
+shuffles, temperature, and logit averaging.  Adapted arrays are evaluated by
+the public estimator's own batching/inference functions rather than a second
+reimplementation.  Before training, every full-query public input view and
+label is checked bit-for-bit against both the no-spline and fresh-spline view.
 
 The outer OpenML test labels are never used for preprocessing fitting, adapter
 optimisation, identity guarding, or configuration selection.
@@ -18,7 +19,9 @@ optimisation, identity guarding, or configuration selection.
 from __future__ import annotations
 
 from collections import OrderedDict
+from contextlib import nullcontext
 from dataclasses import dataclass
+import gc
 import json
 from pathlib import Path
 import time
@@ -29,6 +32,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.utils.checkpoint import checkpoint
+from sklearn.utils.validation import validate_data
 
 from tabicl import TabICLClassifier, TabICLRegressor
 from tabicl._experiments.direct_spline_openml import (
@@ -46,6 +50,7 @@ from tabicl._experiments.direct_spline_openml import (
     _prediction_shape,
     _save_bag,
     _seed,
+    _set_frozen_autograd_routing,
     effective_inner_bag_count,
     load_frozen_backbone,
 )
@@ -57,6 +62,7 @@ from tabicl._experiments.direct_spline_protocol import (
     sample_prediction_context,
 )
 from tabicl._hyperspline import DirectSplineTransform
+from tabicl._model.attention import flash_attn3_toggle
 from tabicl._model.tabicl import TabICL
 
 
@@ -68,7 +74,10 @@ STANDARD_DIRECT_SPLINE_CONFIG: dict[str, Any] = {
     "adapter_patience": 10,
     "validation_interval": 10,
     "max_context_rows": None,
-    "train_context_rows": 1024,
+    # Match deployment as closely as a labelled training episode permits:
+    # every non-query fitting row is context.  The launcher still exposes an
+    # explicit positive cap for hardware-constrained diagnostic runs.
+    "train_context_rows": None,
     "query_batch_rows": 256,
     "n_control_points": 20,
     "learning_rate": 0.005,
@@ -79,17 +88,8 @@ STANDARD_DIRECT_SPLINE_CONFIG: dict[str, Any] = {
     "cross_column_mixing_rank": 4,
     "cross_column_mixing_bound": 0.10,
     "guard_relative_improvement": 0.005,
-    "identity_parity_atol": 5e-5,
-    "identity_parity_rtol": 1e-5,
     "random_state": 0,
 }
-
-# The public estimator and the reconstructed path both delegate large-query
-# inference to automatic memory managers.  Their numerical execution plans can
-# diverge solely because live GPU memory differs between the two sequential
-# calls.  A fixed probe keeps the public-path audit deterministic.  The matched
-# no-spline versus fresh-spline audit still covers every validation/test row.
-PUBLIC_IDENTITY_PARITY_MAX_ROWS = 8_192
 
 
 @dataclass
@@ -143,10 +143,14 @@ def standard_direct_spline_config(
         if context_cap <= 0:
             raise ValueError("context_cap must be positive when provided")
         config["max_context_rows"] = int(context_cap)
+        # Unless separately overridden, a hardware diagnostic should train at
+        # the same context scale that it deploys.
+        if train_context_rows is None:
+            config["train_context_rows"] = int(context_cap)
     if train_context_rows is not None:
-        if train_context_rows <= 0:
-            raise ValueError("train_context_rows must be positive when provided")
-        config["train_context_rows"] = int(train_context_rows)
+        if train_context_rows < 0:
+            raise ValueError("train_context_rows must be zero (all available rows) or positive")
+        config["train_context_rows"] = None if train_context_rows == 0 else int(train_context_rows)
     return config
 
 
@@ -160,9 +164,11 @@ def shared_standard_direct_spline_configs(n_configs: int, *, seed: int, context_
     configs = shared_random_direct_spline_configs(n_configs, seed=seed)
     for config in configs:
         config["max_context_rows"] = context_cap
-        config["train_context_rows"] = STANDARD_DIRECT_SPLINE_CONFIG["train_context_rows"]
-        config["identity_parity_atol"] = STANDARD_DIRECT_SPLINE_CONFIG["identity_parity_atol"]
-        config["identity_parity_rtol"] = STANDARD_DIRECT_SPLINE_CONFIG["identity_parity_rtol"]
+        config["train_context_rows"] = (
+            STANDARD_DIRECT_SPLINE_CONFIG["train_context_rows"]
+            if context_cap is None
+            else int(context_cap)
+        )
     return configs
 
 
@@ -195,7 +201,8 @@ def _fit_standard_bag(
         "feat_shuffle_method": str(STANDARD_TABICL_CONFIG["feat_shuffle_method"]),
         "outlier_threshold": float(STANDARD_TABICL_CONFIG["outlier_threshold"]),
         "batch_size": int(STANDARD_TABICL_CONFIG["batch_size"]),
-        "kv_cache": False,
+        "kv_cache": bool(STANDARD_TABICL_CONFIG["kv_cache"]),
+        "numerical_preprocessing": "existing",
         "random_state": int(STANDARD_TABICL_CONFIG["random_state"]),
         "device": str(device),
         "verbose": False,
@@ -252,14 +259,18 @@ def _make_adapters(bundle: _StandardBag, config: dict[str, Any], device: torch.d
     if bundle.numerical_indices.size == 0:
         return None
     adapters: OrderedDict[str, DirectSplineTransform] = OrderedDict()
-    for method, preprocessor in bundle.estimator.ensemble_generator_.preprocessors_.items():
-        support = torch.as_tensor(
-            preprocessor.X_transformed_[bundle.support_indices][:, bundle.numerical_indices],
-            dtype=torch.float32,
-            device=device,
-        ).unsqueeze(0)
+    n_numerical = int(bundle.numerical_indices.size)
+    # Standard preprocessing already defines the coordinates consumed by
+    # TabICL.  DirectSpline's context statistics are therefore deliberately
+    # replaced by location=0/scale=1 below.  Feeding tens of thousands of rows
+    # into ``summarize_context`` only to discard its quantiles wasted VRAM and
+    # caused avoidable OOMs.  A shape-only dummy constructs the identical
+    # uniform-knot adapter.
+    coordinate_dummy = torch.zeros((1, 1, n_numerical), dtype=torch.float32, device=device)
+    identity_probe = torch.linspace(-5.0, 5.0, 17, device=device).view(1, 17, 1).expand(-1, -1, n_numerical)
+    for method in bundle.estimator.ensemble_generator_.preprocessors_:
         adapter = DirectSplineTransform(
-            support,
+            coordinate_dummy,
             n_control_points=int(config["n_control_points"]),
             trainable_shape=True,
             trainable_location_scale=bool(config["trainable_location_scale"]),
@@ -274,8 +285,8 @@ def _make_adapters(bundle: _StandardBag, config: dict[str, Any], device: torch.d
         with torch.no_grad():
             adapter.location.zero_()
             adapter.scale.fill_(1.0)
-            if not torch.allclose(adapter.transform(support), support, atol=2e-5, rtol=2e-5):
-                raise RuntimeError("standard-pipeline DirectSpline did not initialise to identity")
+            if not torch.equal(adapter.transform(identity_probe), identity_probe):
+                raise RuntimeError("standard-pipeline DirectSpline did not initialise to bit-exact identity")
         adapters[method] = adapter
     return _AdapterSet(adapters)
 
@@ -319,6 +330,7 @@ def _apply_adapter(
     *,
     numerical_indices: np.ndarray,
     adapter: DirectSplineTransform | None,
+    filtered_feature_mask: np.ndarray | None = None,
 ) -> torch.Tensor:
     if canonical.ndim != 2:
         raise ValueError("canonical standard-preprocessed features must have shape (rows, features)")
@@ -327,13 +339,94 @@ def _apply_adapter(
     indices = torch.as_tensor(numerical_indices, dtype=torch.long, device=canonical.device)
     transformed = canonical.clone()
     values = canonical.index_select(-1, indices).unsqueeze(0)
-    transformed[..., indices] = adapter.transform(values).squeeze(0)
+    effective_mixing = adapter.effective_mixing_matrix()
+    if filtered_feature_mask is None or effective_mixing is None:
+        adapted_values = adapter.transform(values)
+    else:
+        # Public feature masking removes an all-NaN feature from the table.  A
+        # learned cross-column residual must not smuggle that feature back into
+        # the remaining outputs.  Keep the learned submatrix on unmasked
+        # numerical columns and zero only masked input contributions.
+        unmixed = adapter.unmixed_transform(values)
+        masked_numerical = torch.as_tensor(
+            np.asarray(filtered_feature_mask, dtype=bool)[numerical_indices],
+            dtype=torch.bool,
+            device=canonical.device,
+        )
+        mixing_input = unmixed.masked_fill(masked_numerical.view(1, 1, -1), 0.0)
+        adapted_values = unmixed + torch.matmul(mixing_input, effective_mixing)
+        adapted_values = adapted_values.to(values.dtype)
+    transformed[..., indices] = adapted_values.squeeze(0)
     return transformed
 
 
-def _encoded_query(bundle: _StandardBag, query_x: Any) -> np.ndarray:
-    encoded = bundle.estimator.X_encoder_.transform(query_x)
-    return bundle.estimator.ensemble_generator_.unique_filter_.transform(encoded)
+@dataclass(frozen=True)
+class _PreparedQuery:
+    """Public-estimator-equivalent query representation without input mutation."""
+
+    encoded: np.ndarray
+    filtered: np.ndarray
+    feature_mask: np.ndarray | None
+    filtered_feature_mask: np.ndarray | None
+
+
+def _prepare_query(bundle: _StandardBag, query_x: Any) -> _PreparedQuery:
+    """Validate, copy, encode, and mask a query exactly as public predict does."""
+
+    validated = validate_data(bundle.estimator, query_x, reset=False, dtype=None, skip_check_array=True)
+    if hasattr(validated, "copy"):
+        try:
+            prepared = validated.copy(deep=True)
+        except TypeError:
+            prepared = validated.copy()
+    else:
+        prepared = np.array(validated, copy=True)
+
+    if hasattr(prepared, "columns"):
+        feature_mask = prepared.isna().all(axis=0).to_numpy(dtype=bool)
+    else:
+        values = np.asarray(prepared)
+        if np.issubdtype(values.dtype, np.number):
+            feature_mask = np.isnan(values).all(axis=0)
+        else:
+            feature_mask = np.asarray(
+                [all(value != value for value in values[:, index]) for index in range(values.shape[1])],
+                dtype=bool,
+            )
+    if not np.any(feature_mask):
+        feature_mask = None
+    elif hasattr(prepared, "iloc"):
+        prepared.iloc[:, feature_mask] = 0.0
+    else:
+        prepared[:, feature_mask] = 0.0
+
+    encoded = bundle.estimator.X_encoder_.transform(prepared)
+    generator = bundle.estimator.ensemble_generator_
+    filtered = generator.unique_filter_.transform(encoded)
+    filtered_feature_mask = None
+    if feature_mask is not None:
+        filtered_feature_mask = np.asarray(
+            feature_mask[np.asarray(generator.unique_filter_.features_to_keep_, dtype=bool)],
+            dtype=bool,
+        )
+        filtered = np.asarray(filtered, dtype=np.float64).copy()
+        filtered[:, filtered_feature_mask] = 0.0
+    return _PreparedQuery(
+        encoded=np.asarray(encoded),
+        filtered=np.asarray(filtered),
+        feature_mask=feature_mask,
+        filtered_feature_mask=filtered_feature_mask,
+    )
+
+
+def _masked_feature_shuffles(
+    shuffles: list[list[int]], filtered_feature_mask: np.ndarray | None
+) -> list[list[int]]:
+    if filtered_feature_mask is None:
+        return shuffles
+    kept = np.flatnonzero(~filtered_feature_mask)
+    remap = {int(old): new for new, old in enumerate(kept)}
+    return [[remap[index] for index in shuffle if index in remap] for shuffle in shuffles]
 
 
 def _build_method_batch(
@@ -345,6 +438,7 @@ def _build_method_batch(
     context_labels: np.ndarray,
     adapters: _AdapterSet | None,
     device: torch.device,
+    filtered_feature_mask: np.ndarray | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, list[list[int]], list[np.ndarray | None]]:
     """Create normal TabICL ensemble views after an optional spline nudge."""
 
@@ -354,8 +448,21 @@ def _build_method_batch(
         np.concatenate((context_canonical, query_canonical), axis=0), dtype=torch.float32, device=device
     )
     adapter = None if adapters is None else adapters.for_method(method)
-    canonical = _apply_adapter(canonical, numerical_indices=bundle.numerical_indices, adapter=adapter)
-    views = torch.stack([canonical[:, feature_shuffle] for feature_shuffle, _ in configs], dim=0)
+    canonical = _apply_adapter(
+        canonical,
+        numerical_indices=bundle.numerical_indices,
+        adapter=adapter,
+        filtered_feature_mask=filtered_feature_mask,
+    )
+    feature_shuffles = _masked_feature_shuffles(
+        [feature_shuffle for feature_shuffle, _ in configs], filtered_feature_mask
+    )
+    if filtered_feature_mask is not None:
+        kept = torch.as_tensor(
+            np.flatnonzero(~filtered_feature_mask), dtype=torch.long, device=canonical.device
+        )
+        canonical = canonical.index_select(-1, kept)
+    views = torch.stack([canonical[:, feature_shuffle] for feature_shuffle in feature_shuffles], dim=0)
     class_patterns = [pattern for _feature_shuffle, pattern in configs]
     if bundle.problem_type == "regression":
         labels = torch.as_tensor(context_labels, dtype=torch.float32, device=device).unsqueeze(0)
@@ -366,7 +473,77 @@ def _build_method_batch(
             dtype=torch.float32,
             device=device,
         )
-    return views, labels, generator.feature_shuffles_[method], class_patterns
+    return views, labels, feature_shuffles, class_patterns
+
+
+def _build_public_method_arrays(
+    *,
+    bundle: _StandardBag,
+    method: str,
+    context_canonical: np.ndarray,
+    query_canonical: np.ndarray,
+    context_labels: np.ndarray,
+    adapters: _AdapterSet | None,
+    device: torch.device,
+    filtered_feature_mask: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, list[list[int]], list[np.ndarray | None]]:
+    """Build public inference arrays without materialising every view on GPU.
+
+    Ordinary TabICL creates shuffled ensemble views in host memory and lets
+    ``_batch_forward`` transfer only its current member batch.  The adapter
+    needs a device tensor for its canonical table, but stacking eight copies
+    there first needlessly multiplied peak VRAM and disadvantaged this path.
+    """
+
+    generator = bundle.estimator.ensemble_generator_
+    configs = generator.ensemble_configs_[method]
+    canonical = np.asarray(
+        np.concatenate((context_canonical, query_canonical), axis=0),
+        dtype=np.float32,
+    )
+    adapter = None if adapters is None else adapters.for_method(method)
+    if adapter is not None:
+        with torch.no_grad():
+            canonical_tensor = torch.as_tensor(canonical, dtype=torch.float32, device=device)
+            canonical_tensor = _apply_adapter(
+                canonical_tensor,
+                numerical_indices=bundle.numerical_indices,
+                adapter=adapter,
+                filtered_feature_mask=filtered_feature_mask,
+            )
+            if filtered_feature_mask is not None:
+                kept = torch.as_tensor(
+                    np.flatnonzero(~filtered_feature_mask),
+                    dtype=torch.long,
+                    device=canonical_tensor.device,
+                )
+                canonical_tensor = canonical_tensor.index_select(-1, kept)
+            canonical = canonical_tensor.cpu().numpy()
+            del canonical_tensor
+    elif filtered_feature_mask is not None:
+        canonical = canonical[:, ~np.asarray(filtered_feature_mask, dtype=bool)]
+
+    feature_shuffles = _masked_feature_shuffles(
+        [feature_shuffle for feature_shuffle, _ in configs], filtered_feature_mask
+    )
+    views = np.stack(
+        [canonical[:, feature_shuffle] for feature_shuffle in feature_shuffles],
+        axis=0,
+    )
+    class_patterns = [pattern for _feature_shuffle, pattern in configs]
+    if bundle.problem_type == "regression":
+        labels = np.broadcast_to(
+            np.asarray(context_labels, dtype=np.float32)[None, :],
+            (len(configs), len(context_labels)),
+        ).copy()
+    else:
+        labels = np.asarray(
+            np.stack(
+                [np.asarray(pattern)[context_labels.astype(int)] for pattern in class_patterns]
+            ),
+            dtype=np.float32,
+        )
+    return views, labels, feature_shuffles, class_patterns
 
 
 def _forward_method(
@@ -382,20 +559,46 @@ def _forward_method(
     backbone = bundle.backbone
 
     def run(features: torch.Tensor) -> torch.Tensor:
+        # Checkpoint recomputation re-enters this closure during backward, so
+        # establish the deterministic autograd routing inside the closure.
+        _enable_frozen_training_path(backbone)
         backbone.clear_cache()
-        return backbone(
-            X=features,
-            y_train=labels,
-            # The public classifier supplies shuffle metadata so its column
-            # embedder can share work across equivalent tables.  The public
-            # regressor instead forwards its already-shuffled views without
-            # that metadata.  Preserve that small but real pipeline
-            # difference for the eval/parity path.
-            feature_shuffles=feature_shuffles if bundle.problem_type != "regression" else None,
-            return_logits=True,
-            softmax_temperature=float(STANDARD_TABICL_CONFIG["softmax_temperature"]),
-            inference_config=bundle.estimator.inference_config_,
+        manager_configs = (
+            bundle.estimator.inference_config_.COL_CONFIG,
+            bundle.estimator.inference_config_.ROW_CONFIG,
+            bundle.estimator.inference_config_.ICL_CONFIG,
         )
+        use_amp = bool(manager_configs[0].get("use_amp", False)) and features.device.type == "cuda"
+        use_fa3 = any(bool(config.get("use_fa3", False)) for config in manager_configs)
+        autocast = torch.autocast(device_type="cuda") if use_amp else nullcontext()
+        with flash_attn3_toggle(use_fa3), autocast:
+            if not all(
+                hasattr(backbone, name)
+                for name in ("col_embedder", "row_interactor", "icl_predictor")
+            ):
+                # Lightweight test doubles do not expose TabICL's stages.
+                return backbone(
+                    X=features,
+                    y_train=labels,
+                    feature_shuffles=(
+                        feature_shuffles if bundle.problem_type != "regression" else None
+                    ),
+                    return_logits=True,
+                    softmax_temperature=float(
+                        getattr(bundle.estimator, "softmax_temperature", 0.9)
+                    ),
+                    inference_config=bundle.estimator.inference_config_,
+                )
+            embeddings = _differentiable_public_column_embeddings(
+                backbone=backbone,
+                views=features,
+                labels=labels,
+                feature_shuffles=(
+                    feature_shuffles if bundle.problem_type != "regression" else None
+                ),
+            )
+            representations = backbone.row_interactor(embeddings)
+            return backbone.icl_predictor(representations, y_train=labels)
 
     if checkpoint_activations:
         return checkpoint(run, views, use_reentrant=False)
@@ -410,17 +613,72 @@ def _enable_frozen_training_path(backbone: TabICL) -> None:
     prediction and is exactly what the parity checks exercise, but cannot
     train an upstream spline.  TabICL's train-mode path computes the same
     supplied ensemble views directly and retains the input gradient.  Keep all
-    backbone parameters frozen and force Dropout back to evaluation mode, just
-    as the legacy DirectSpline runner does.
+    backbone parameters and stochastic child layers in evaluation mode while
+    changing only the modules whose ``training`` flag selects mathematical
+    routing.
     """
 
-    backbone.train()
-    for module in backbone.modules():
-        if isinstance(module, torch.nn.Dropout):
-            module.eval()
+    _set_frozen_autograd_routing(backbone)
 
 
-def _aggregate_classification_logits(
+def _differentiable_public_column_embeddings(
+    *,
+    backbone: TabICL,
+    views: torch.Tensor,
+    labels: torch.Tensor,
+    feature_shuffles: list[list[int]] | None,
+) -> torch.Tensor:
+    """Reproduce public column embedding while retaining the input gradient.
+
+    For a non-feature-grouped classifier, public inference embeds the first
+    ensemble table once and obtains later feature-shuffled members by exactly
+    remapping those embeddings.  Calling TabICL's ordinary training route
+    instead embeds every member independently (and uses each member's class
+    shuffle in the target-aware column encoder), which is a different model.
+    This is the same public first-view/remapping mathematics without the
+    inference manager's intentional ``no_grad`` wrapper.
+    """
+
+    embedder = backbone.col_embedder
+    train_size = labels.shape[1]
+    if embedder.feature_group:
+        return embedder._train_forward_with_feature_group(
+            views, labels, embed_with_test=False
+        )
+    if feature_shuffles is None:
+        return embedder._train_forward_without_feature_group(
+            views, labels, d=None, embed_with_test=False
+        )
+    if len(feature_shuffles) != views.shape[0]:
+        raise RuntimeError("feature-shuffle count does not match ensemble views")
+
+    first_table = views[0]
+    if embedder.reserve_cls_tokens > 0:
+        first_table = F.pad(first_table, (embedder.reserve_cls_tokens, 0), value=-100.0)
+    features = first_table.transpose(0, 1).unsqueeze(-1)
+    if embedder.target_aware:
+        first_labels = labels[0].unsqueeze(0).expand(features.shape[0], -1)
+    else:
+        first_labels = None
+    first_embeddings = embedder._compute_embeddings(
+        features,
+        train_size,
+        first_labels,
+        embed_with_test=False,
+    )
+
+    first_pattern = feature_shuffles[0]
+    member_embeddings = [first_embeddings]
+    for pattern in feature_shuffles[1:]:
+        mapping = embedder.map_feature_shuffle(first_pattern, pattern)
+        if embedder.reserve_cls_tokens > 0:
+            mapping = [index + embedder.reserve_cls_tokens for index in mapping]
+            mapping = list(range(embedder.reserve_cls_tokens)) + mapping
+        member_embeddings.append(first_embeddings[mapping])
+    return torch.stack(member_embeddings, dim=0).transpose(1, 2)
+
+
+def _aggregate_training_classification_logits(
     outputs: list[tuple[torch.Tensor, list[np.ndarray | None]]],
     *,
     n_classes: int,
@@ -441,7 +699,38 @@ def _aggregate_classification_logits(
             corrected.append(raw[index, :, permutation][:, :n_classes])
     if not corrected:
         raise RuntimeError("normal classifier produced no ensemble outputs")
-    return torch.stack(corrected, dim=0).mean(dim=0)
+    average = torch.zeros_like(corrected[0])
+    for member in corrected:
+        average = average + member
+    return average / len(corrected)
+
+
+def _aggregate_public_classification_members(
+    bundle: _StandardBag,
+    members: list[np.ndarray],
+    class_patterns: list[np.ndarray | None],
+) -> np.ndarray:
+    """Use the classifier's exact float32 NumPy aggregation order."""
+
+    outputs = np.concatenate(members, axis=0)
+    if len(class_patterns) != outputs.shape[0]:
+        raise RuntimeError("classification member/shuffle count mismatch")
+    average = np.zeros_like(outputs[0])
+    for output, pattern in zip(outputs, class_patterns, strict=True):
+        if pattern is None:
+            raise RuntimeError("classification ensemble member is missing its class shuffle")
+        average += output[..., np.asarray(pattern, dtype=int)]
+    average /= len(class_patterns)
+    estimator = bundle.estimator
+    if not isinstance(estimator, TabICLClassifier):
+        raise TypeError("classification aggregation requires TabICLClassifier")
+    if not estimator.average_logits:
+        raise RuntimeError("the standard DirectSpline path requires average_logits=True")
+    average = estimator.softmax(
+        average, axis=-1, temperature=float(estimator.softmax_temperature)
+    )
+    average = average / average.sum(axis=1, keepdims=True)
+    return average.astype(np.float64)
 
 
 def _normal_prediction(
@@ -454,19 +743,20 @@ def _normal_prediction(
 ) -> np.ndarray:
     """Predict with normal ensemble views and an optional DirectSpline set."""
 
-    # This is the public-inference-equivalent side of the comparison.  In
-    # particular, evaluation mode uses TabICL's shuffled-view optimization
-    # and no-grad inference manager.
+    # Adapter-modified arrays are deliberately handed back to the public
+    # estimator's own batching/inference implementation.  There is only one
+    # no-grad prediction engine; the experiment no longer reconstructs it.
     bundle.backbone.eval()
     generator = bundle.estimator.ensemble_generator_
-    query_encoded = _encoded_query(bundle, query_x)
-    outputs: list[tuple[torch.Tensor, list[np.ndarray | None]]] = []
-    regression_outputs: list[torch.Tensor] = []
-    with torch.no_grad():
-        for method, preprocessor in generator.preprocessors_.items():
-            context = preprocessor.X_transformed_[context_indices]
-            query = preprocessor.transform(query_encoded)
-            views, labels, feature_shuffles, class_patterns = _build_method_batch(
+    prepared = _prepare_query(bundle, query_x)
+    classification_members: list[np.ndarray] = []
+    class_patterns: list[np.ndarray | None] = []
+    regression_members: list[np.ndarray] = []
+    for method, preprocessor in generator.preprocessors_.items():
+        context = preprocessor.X_transformed_[context_indices]
+        query = preprocessor.transform(prepared.filtered)
+        public_views, public_labels, feature_shuffles, method_patterns = (
+            _build_public_method_arrays(
                 bundle=bundle,
                 method=method,
                 context_canonical=context,
@@ -474,42 +764,74 @@ def _normal_prediction(
                 context_labels=bundle.fit_labels[context_indices],
                 adapters=adapters,
                 device=device,
+                filtered_feature_mask=prepared.filtered_feature_mask,
             )
-            raw = _forward_method(
-                bundle=bundle,
-                views=views,
-                labels=labels,
-                feature_shuffles=feature_shuffles,
-                checkpoint_activations=False,
+        )
+        if device.type == "cuda":
+            # The canonical adapter tensor has already moved back to host
+            # memory. Release its free cache so public auto-batching sees the
+            # same available VRAM for identity and adapted calls.
+            torch.cuda.empty_cache()
+        if bundle.problem_type == "regression":
+            estimator = bundle.estimator
+            if not isinstance(estimator, TabICLRegressor):
+                raise TypeError("regression prediction requires TabICLRegressor")
+            regression_members.append(
+                np.asarray(
+                    estimator._batch_forward(public_views, public_labels, output_type="mean"),
+                    dtype=np.float32,
+                )
             )
-            if bundle.problem_type == "regression":
-                # The public regressor likewise promotes each member's final
-                # statistic before the cross-estimator mean.
-                regression_outputs.append(bundle.backbone.quantile_dist(raw).quantiles.mean(dim=-1).float())
-            else:
-                outputs.append((raw, class_patterns))
+        else:
+            estimator = bundle.estimator
+            if not isinstance(estimator, TabICLClassifier):
+                raise TypeError("classification prediction requires TabICLClassifier")
+            classification_members.append(
+                np.asarray(
+                    estimator._batch_forward(public_views, public_labels, feature_shuffles),
+                    dtype=np.float32,
+                )
+            )
+            class_patterns.extend(method_patterns)
+        del public_views, public_labels
     if bundle.problem_type == "regression":
-        if not regression_outputs:
+        if not regression_members:
             raise RuntimeError("normal regressor produced no ensemble outputs")
-        # Match TabICLRegressor.predict exactly: move each float32 member to
-        # NumPy, inverse-transform every member, and only then take the mean.
-        # Inverse scaling is algebraically linear, but changing this operation
-        # order creates avoidable last-bit differences.
-        members = [output.cpu().numpy() for output in regression_outputs]
-        return _aggregate_public_regression_members(bundle, members)
+        return _aggregate_public_regression_members(bundle, regression_members)
     if bundle.n_classes is None:
         raise RuntimeError("classification bag has no class count")
-    logits = _aggregate_classification_logits(outputs, n_classes=bundle.n_classes)
-    probabilities = torch.softmax(logits / float(STANDARD_TABICL_CONFIG["softmax_temperature"]), dim=-1)
-    return probabilities.cpu().numpy().astype(np.float64)
+    return _aggregate_public_classification_members(bundle, classification_members, class_patterns)
 
 
 def _identity_prediction(bundle: _StandardBag, query_x: Any) -> np.ndarray:
     """Use the public estimator itself as the authoritative identity control."""
 
+    if hasattr(query_x, "copy"):
+        try:
+            safe_query = query_x.copy(deep=True)
+        except TypeError:
+            safe_query = query_x.copy()
+    else:
+        safe_query = np.array(query_x, copy=True)
     if bundle.problem_type == "regression":
-        return np.asarray(bundle.estimator.predict(query_x), dtype=np.float64)
-    return np.asarray(bundle.estimator.predict_proba(query_x), dtype=np.float64)
+        return np.asarray(bundle.estimator.predict(safe_query), dtype=np.float64)
+    return np.asarray(bundle.estimator.predict_proba(safe_query), dtype=np.float64)
+
+
+def _candidate_deployment_error(
+    problem_type: ProblemType,
+    labels: np.ndarray,
+    prediction: np.ndarray,
+    *,
+    n_classes: int | None,
+) -> float:
+    """Score an adapted candidate, mapping invalid output to a guarded loss."""
+
+    try:
+        value = deployment_error(problem_type, labels, prediction, n_classes=n_classes)
+    except (TypeError, ValueError):
+        return float("inf")
+    return float(value) if np.isfinite(value) else float("inf")
 
 
 def _difference_summary(left: Any, right: Any) -> dict[str, Any]:
@@ -548,279 +870,211 @@ def _aggregate_public_regression_members(bundle: _StandardBag, members: list[np.
     return np.mean(unscaled.reshape(n_estimators, n_rows), axis=0).astype(np.float64)
 
 
-def _difference_is_exact(summary: Any) -> bool:
-    """Whether a diagnostic comparison proves elementwise equality."""
-
-    return bool(
-        isinstance(summary, dict)
-        and summary.get("shape_match") is True
-        and summary.get("nonfinite_differences") == 0
-        and summary.get("max_abs") == 0.0
-    )
-
-
-def _diagnostics_prove_exact_regression_replay(diagnostics: dict[str, Any]) -> bool:
-    """Accept only an exact public/reconstructed branch replay.
-
-    A prior ``estimator.predict`` call can choose a different automatic GPU
-    batching plan from a later call.  That repeat drift is not a reconstruction
-    error.  This fallback is deliberately strict: every public input view,
-    label, member prediction, and final replay aggregation must be bit exact.
-    """
-
-    if "diagnostic_error" in diagnostics:
-        return False
-    branches = diagnostics.get("branches")
-    if not isinstance(branches, dict) or not branches:
-        return False
-    for branch in branches.values():
-        if not isinstance(branch, dict) or not all(
-            _difference_is_exact(branch.get(key))
-            for key in ("views", "labels", "member_predictions")
-        ):
-            return False
-    return _difference_is_exact(diagnostics.get("public_replay_vs_reconstructed_replay"))
-
-
-def _regression_parity_diagnostics(
-    *,
-    bundle: _StandardBag,
-    query_x: Any,
-    device: torch.device,
-    reconstructed_prediction: np.ndarray,
-    public_prediction: np.ndarray,
-) -> dict[str, Any]:
-    """Localise a public-versus-reconstructed regression parity failure.
-
-    This is intentionally executed only after parity has already failed.  It
-    independently checks the public ensemble arrays, each branch's model
-    outputs, and the final inverse-scaling aggregation.  That tells us whether
-    to fix preprocessing, inference execution, or regression aggregation
-    instead of weakening the parity check.
-    """
-
-    diagnostics: dict[str, Any] = {
-        "existing_reconstructed_vs_public": _difference_summary(
-            reconstructed_prediction, public_prediction
-        )
-    }
-    if bundle.problem_type != "regression":
-        diagnostics["detail"] = "branch diagnostics are currently implemented for regression"
-        return diagnostics
-
-    generator = bundle.estimator.ensemble_generator_
-    encoded = bundle.estimator.X_encoder_.transform(query_x)
-    public_data = generator.transform(encoded, mode="both")
-    filtered_query = generator.unique_filter_.transform(encoded)
-    public_members: list[np.ndarray] = []
-    reconstructed_members: list[np.ndarray] = []
-    branches: dict[str, Any] = {}
-
-    # The inference managers expose their chosen batch/offload plans only in
-    # verbose mode.  Enable it for these failure-only replay calls so the
-    # server log records whether the two paths selected different plans.
-    manager_configs = [
-        bundle.estimator.inference_config_.COL_CONFIG,
-        bundle.estimator.inference_config_.ROW_CONFIG,
-        bundle.estimator.inference_config_.ICL_CONFIG,
-    ]
-    previous_verbose = [bool(config.get("verbose", False)) for config in manager_configs]
-    for manager_config in manager_configs:
-        manager_config.update({"verbose": True})
-
-    try:
-        for method, (public_views, public_labels) in public_data.items():
-            preprocessor = generator.preprocessors_[method]
-            views, labels, feature_shuffles, _patterns = _build_method_batch(
-                bundle=bundle,
-                method=method,
-                context_canonical=preprocessor.X_transformed_[bundle.support_indices],
-                query_canonical=preprocessor.transform(filtered_query),
-                context_labels=bundle.fit_labels[bundle.support_indices],
-                adapters=None,
-                device=device,
-            )
-            reconstructed_views = views.detach().cpu().numpy()
-            reconstructed_labels = labels.detach().cpu().numpy()
-            branch: dict[str, Any] = {
-                "views": _difference_summary(public_views.astype(np.float32), reconstructed_views),
-                "labels": _difference_summary(public_labels.astype(np.float32), reconstructed_labels),
-            }
-
-            print(f"[parity diagnostic method={method}] replaying public regression branch", flush=True)
-            public_output = np.asarray(
-                bundle.estimator._batch_forward(public_views, public_labels, output_type="mean"),
-                dtype=np.float64,
-            )
-            print(f"[parity diagnostic method={method}] replaying reconstructed regression branch", flush=True)
-            reconstructed_raw = _forward_method(
-                bundle=bundle,
-                views=views,
-                labels=labels,
-                feature_shuffles=feature_shuffles,
-                checkpoint_activations=False,
-            )
-            reconstructed_output = (
-                bundle.backbone.quantile_dist(reconstructed_raw)
-                .quantiles.mean(dim=-1)
-                .float()
-                .cpu()
-                .numpy()
-                .astype(np.float64)
-            )
-            branch["member_predictions"] = _difference_summary(public_output, reconstructed_output)
-            branches[str(method)] = branch
-            public_members.append(public_output)
-            reconstructed_members.append(reconstructed_output)
-
-        public_replay = _aggregate_public_regression_members(bundle, public_members)
-        reconstructed_replay = _aggregate_public_regression_members(bundle, reconstructed_members)
-        diagnostics.update(
-            {
-                "branches": branches,
-                "public_replay_vs_public_predict": _difference_summary(public_replay, public_prediction),
-                "reconstructed_replay_vs_existing_reconstructed": _difference_summary(
-                    reconstructed_replay, reconstructed_prediction
-                ),
-                "public_replay_vs_reconstructed_replay": _difference_summary(
-                    public_replay, reconstructed_replay
-                ),
-            }
-        )
-    except Exception as diagnostic_error:  # diagnostics must not hide the original parity failure
-        diagnostics["diagnostic_error"] = f"{type(diagnostic_error).__name__}: {diagnostic_error}"
-    finally:
-        for manager_config, verbose in zip(manager_configs, previous_verbose, strict=True):
-            manager_config.update({"verbose": verbose})
-    return diagnostics
-
-
-def _leading_rows(query_x: Any, n_rows: int) -> Any:
-    """Return a positional prefix without losing DataFrame column metadata."""
-    if hasattr(query_x, "iloc"):
-        return query_x.iloc[:n_rows].reset_index(drop=True)
-    return query_x[:n_rows]
-
-
-def _identity_parity(
+def _identity_view_parity(
     *,
     bundle: _StandardBag,
     adapters: _AdapterSet | None,
     query_x: Any,
     device: torch.device,
-    config: dict[str, Any],
     progress: Any,
     task_id: int,
     bag: int,
     split: str,
-) -> tuple[np.ndarray, float, str, float]:
-    """Build the matched identity control and verify the zero spline.
+) -> tuple[float, str, bool]:
+    """Require bit-exact public/no-spline/fresh-spline inputs on every row.
 
-    With all fit rows as context, this additionally checks the custom
-    differentiable implementation against the public sklearn estimator.  A
-    deliberately capped run cannot make that claim: its matched control uses
-    the same capped rows as its spline arm, and is checked only against its
-    own no-adapter path.
+    Evaluation itself uses the estimator's own ``_batch_forward`` method, so
+    comparing two separate GPU predictions is both redundant and vulnerable
+    to memory-plan drift.  The only custom boundary is construction of the
+    adapter-modified arrays; that boundary is audited here in float32, exactly
+    as the public estimator consumes it.
     """
 
-    matched_identity = _normal_prediction(
-        bundle=bundle,
-        query_x=query_x,
-        context_indices=bundle.support_indices,
-        adapters=None,
-        device=device,
-    )
-    parity_errors: list[float] = []
-    public_repeat_drift = 0.0
-    if bundle.support_indices.size == bundle.fit_labels.size:
-        query_rows = len(query_x)
-        public_parity_rows = min(query_rows, PUBLIC_IDENTITY_PARITY_MAX_ROWS)
-        if public_parity_rows == query_rows:
-            matched_public_probe = matched_identity
-            public_query = query_x
-        else:
-            public_query = _leading_rows(query_x, public_parity_rows)
-            matched_public_probe = _normal_prediction(
-                bundle=bundle,
-                query_x=public_query,
-                context_indices=bundle.support_indices,
-                adapters=None,
-                device=device,
-            )
-        public_identity = _identity_prediction(bundle, public_query)
-        max_public_abs = float(np.max(np.abs(matched_public_probe - public_identity)))
-        replay_verified = False
-        if not np.allclose(
-            matched_public_probe,
-            public_identity,
-            rtol=float(config["identity_parity_rtol"]),
-            atol=float(config["identity_parity_atol"]),
-        ):
-            diagnostics = _regression_parity_diagnostics(
-                bundle=bundle,
-                query_x=public_query,
-                device=device,
-                reconstructed_prediction=matched_public_probe,
-                public_prediction=public_identity,
-            )
-            replay_verified = _diagnostics_prove_exact_regression_replay(diagnostics)
-            event = "identity_parity_replay_verified" if replay_verified else "identity_parity_failed"
-            _emit(
-                progress,
-                event=event,
-                task_id=task_id,
-                bag=bag,
-                split=split,
-                problem_type=bundle.problem_type,
-                public_parity_rows=public_parity_rows,
-                public_repeat_drift_max_abs=max_public_abs,
-                diagnostics=diagnostics,
-            )
-            if not replay_verified:
-                raise RuntimeError(
-                    "standard-pipeline identity parity failed: the reconstructed normal TabICL path differs from "
-                    f"the public estimator on its {public_parity_rows}-row parity probe "
-                    f"(max_abs={max_public_abs:.3g}). Refuse to train against a mismatched baseline. "
-                    f"parity_diagnostics={json.dumps(diagnostics, sort_keys=True)}"
-                )
-        if replay_verified:
-            public_repeat_drift = max_public_abs
-            replay_error = float(
-                diagnostics["public_replay_vs_reconstructed_replay"]["max_abs"]
-            )
-            parity_errors.append(replay_error)
-            reference = f"public_exact_branch_replay_after_repeat_drift_{public_parity_rows}_rows"
-        else:
-            parity_errors.append(max_public_abs)
-            reference = (
-                "public_full_context_estimator"
-                if public_parity_rows == query_rows
-                else f"public_full_context_estimator_probe_{public_parity_rows}_of_{query_rows}"
-            )
-    else:
-        reference = "matched_capped_standard_views"
-    if adapters is None:
-        return matched_identity, max(parity_errors, default=0.0), reference, public_repeat_drift
-    spline_identity = _normal_prediction(
-        bundle=bundle,
-        query_x=query_x,
-        context_indices=bundle.support_indices,
-        adapters=adapters,
-        device=device,
-    )
-    max_abs = float(np.max(np.abs(spline_identity - matched_identity)))
-    if not np.allclose(
-        spline_identity,
-        matched_identity,
-        rtol=float(config["identity_parity_rtol"]),
-        atol=float(config["identity_parity_atol"]),
-    ):
-        raise RuntimeError(
-            "standard-pipeline identity parity failed: a fresh DirectSpline changed normal TabICL predictions "
-            f"(max_abs={max_abs:.3g}). Refuse to train against a mismatched baseline."
+    prepared = _prepare_query(bundle, query_x)
+    generator = bundle.estimator.ensemble_generator_
+    public_data = None
+    full_public_context = bundle.support_indices.size == bundle.fit_labels.size
+    if full_public_context:
+        public_data = generator.transform(
+            prepared.encoded, mode="both", feature_mask=prepared.feature_mask
         )
-    parity_errors.append(max_abs)
-    return matched_identity, max(parity_errors), reference, public_repeat_drift
+
+    diagnostics: dict[str, Any] = {}
+    maximum = 0.0
+    for method, preprocessor in generator.preprocessors_.items():
+        common = {
+            "bundle": bundle,
+            "method": method,
+            "context_canonical": preprocessor.X_transformed_[bundle.support_indices],
+            "query_canonical": preprocessor.transform(prepared.filtered),
+            "context_labels": bundle.fit_labels[bundle.support_indices],
+            "device": device,
+            "filtered_feature_mask": prepared.filtered_feature_mask,
+        }
+        plain_views_array, plain_labels_array, plain_shuffles, plain_patterns = _build_public_method_arrays(
+            **common, adapters=None
+        )
+        branch: dict[str, Any] = {}
+        if public_data is not None:
+            public_views, public_labels = public_data[method]
+            branch["public_views_vs_no_spline"] = _difference_summary(
+                np.asarray(public_views, dtype=np.float32), plain_views_array
+            )
+            branch["public_labels_vs_no_spline"] = _difference_summary(
+                np.asarray(public_labels, dtype=np.float32), plain_labels_array
+            )
+            public_shuffles = (
+                generator.feature_shuffles_[method]
+                if prepared.feature_mask is None
+                else generator.masked_feature_shuffles_[method]
+            )
+            branch["public_feature_shuffles_vs_no_spline"] = _difference_summary(
+                np.asarray(public_shuffles, dtype=np.int64),
+                np.asarray(plain_shuffles, dtype=np.int64),
+            )
+            if bundle.problem_type != "regression":
+                public_patterns = generator.class_shuffles_[method]
+                branch["public_class_shuffles_vs_no_spline"] = _difference_summary(
+                    np.asarray(public_patterns, dtype=np.int64),
+                    np.asarray(plain_patterns, dtype=np.int64),
+                )
+        if adapters is not None:
+            spline_views, spline_labels, _shuffles, _patterns = _build_public_method_arrays(
+                **common, adapters=adapters
+            )
+            branch["fresh_spline_views_vs_no_spline"] = _difference_summary(
+                spline_views, plain_views_array
+            )
+            branch["fresh_spline_labels_vs_no_spline"] = _difference_summary(
+                spline_labels, plain_labels_array
+            )
+            del spline_views, spline_labels
+        diagnostics[str(method)] = branch
+
+        for comparison in branch.values():
+            if comparison.get("shape_match") is not True or comparison.get("nonfinite_differences") != 0:
+                maximum = float("inf")
+                break
+            maximum = max(maximum, float(comparison.get("max_abs", 0.0)))
+
+    if maximum != 0.0:
+        _emit(
+            progress,
+            event="identity_view_parity_failed",
+            task_id=task_id,
+            bag=bag,
+            split=split,
+            problem_type=bundle.problem_type,
+            query_rows=len(query_x),
+            diagnostics=diagnostics,
+        )
+        raise RuntimeError(
+            "standard-pipeline identity parity failed: public, no-spline, and fresh-spline input views "
+            f"must be bit exact on all {len(query_x)} {split} rows. "
+            f"parity_diagnostics={json.dumps(diagnostics, sort_keys=True)}"
+        )
+    reference = (
+        "public_exact_input_views_full_query"
+        if full_public_context
+        else "matched_capped_exact_input_views_full_query"
+    )
+    return maximum, reference, full_public_context
+
+
+def _many_class_training_logits(
+    *,
+    bundle: _StandardBag,
+    views: torch.Tensor,
+    labels: torch.Tensor,
+    feature_shuffles: list[list[int]],
+) -> torch.Tensor:
+    """Differentiable counterpart of TabICL's public hierarchical classifier."""
+
+    backbone = bundle.backbone
+    _enable_frozen_training_path(backbone)
+    manager_configs = (
+        bundle.estimator.inference_config_.COL_CONFIG,
+        bundle.estimator.inference_config_.ROW_CONFIG,
+        bundle.estimator.inference_config_.ICL_CONFIG,
+    )
+    use_amp = bool(manager_configs[0].get("use_amp", False)) and views.device.type == "cuda"
+    use_fa3 = any(bool(config.get("use_fa3", False)) for config in manager_configs)
+    autocast = torch.autocast(device_type="cuda") if use_amp else nullcontext()
+    temperature = float(bundle.estimator.softmax_temperature)
+
+    with flash_attn3_toggle(use_fa3), autocast:
+        # Bypass only the no-grad inference managers.  These are the same
+        # frozen embedding/row/ICL modules and the same mixed-radix and
+        # hierarchical mathematics used by public prediction.
+        embeddings = _differentiable_public_column_embeddings(
+            backbone=backbone,
+            views=views,
+            labels=labels,
+            feature_shuffles=feature_shuffles,
+        )
+        representations = backbone.row_interactor(embeddings)
+        predictor = backbone.icl_predictor
+        train_size = labels.shape[1]
+        table_logits: list[torch.Tensor] = []
+
+        for representation, table_labels in zip(representations, labels, strict=True):
+            predictor._fit_hierarchical(representation[:train_size], table_labels)
+            root = predictor.root
+            n_classes = len(root.classes_)
+            query_representation = representation[train_size:]
+
+            def process_node(node: Any) -> torch.Tensor:
+                node_labels = node.y.to(query_representation.device)
+                node_context = node.R.to(query_representation.device)
+                node_input = torch.cat((node_context, query_representation), dim=0)
+                if node.is_leaf:
+                    local_labels = predictor._label_encoding(node_labels)
+                    raw = predictor._icl_predictions(
+                        node_input.unsqueeze(0).clone(), local_labels.unsqueeze(0)
+                    )
+                    local_count = len(node.classes_)
+                    local_probabilities = torch.softmax(
+                        raw[0, node_labels.shape[0] :, :local_count] / temperature,
+                        dim=-1,
+                    )
+                    global_probabilities = local_probabilities.new_zeros(
+                        (local_probabilities.shape[0], n_classes)
+                    )
+                    return global_probabilities.index_copy(
+                        1,
+                        node.classes_.to(query_representation.device, dtype=torch.long),
+                        local_probabilities,
+                    )
+
+                group_labels = node.group_indices.to(query_representation.device)
+                raw = predictor._icl_predictions(
+                    node_input.unsqueeze(0).clone(), group_labels.unsqueeze(0)
+                )
+                n_groups = len(node.child_nodes)
+                group_probabilities = torch.softmax(
+                    raw[0, node_labels.shape[0] :, :n_groups] / temperature,
+                    dim=-1,
+                )
+                # Match the public hierarchical predictor's left-to-right
+                # accumulation order. A stacked reduction can use a different
+                # tree under AMP and move pseudo-logits for 3+ child groups.
+                final_probabilities = group_probabilities.new_zeros(
+                    (query_representation.shape[0], n_classes)
+                )
+                for index, child in enumerate(node.child_nodes):
+                    weighted_child = (
+                        process_node(child)
+                        * group_probabilities[:, index : index + 1]
+                    )
+                    final_probabilities = final_probabilities + weighted_child
+                return final_probabilities
+
+            probabilities = process_node(root)
+            # Public inference converts hierarchical probabilities back to
+            # temperature-scaled pseudo-logits before estimator ensembling.
+            table_logits.append(temperature * torch.log(probabilities + 1e-6))
+
+    return torch.stack(table_logits, dim=0)
 
 
 def _training_logits(
@@ -833,7 +1087,6 @@ def _training_logits(
 ) -> torch.Tensor:
     """Return normal-ensemble logits/predictions for one sampled training episode."""
 
-    _enable_frozen_training_path(bundle.backbone)
     generator = bundle.estimator.ensemble_generator_
     classification_outputs: list[tuple[torch.Tensor, list[np.ndarray | None]]] = []
     regression_outputs: list[torch.Tensor] = []
@@ -847,22 +1100,48 @@ def _training_logits(
             adapters=adapters,
             device=device,
         )
-        raw = _forward_method(
-            bundle=bundle,
-            views=views,
-            labels=labels,
-            feature_shuffles=feature_shuffles,
-            checkpoint_activations=True,
-        )
+        if (
+            bundle.problem_type != "regression"
+            and bundle.n_classes is not None
+            and bundle.n_classes > bundle.backbone.max_classes
+        ):
+            # Bind the per-method tensors now.  Checkpoint recomputes this
+            # callback during backward, after the surrounding loop has
+            # advanced to the next normalization method.
+            def many_class_forward(
+                features: torch.Tensor,
+                method_labels: torch.Tensor = labels,
+                method_feature_shuffles: list[list[int]] = feature_shuffles,
+            ) -> torch.Tensor:
+                return _many_class_training_logits(
+                    bundle=bundle,
+                    views=features,
+                    labels=method_labels,
+                    feature_shuffles=method_feature_shuffles,
+                )
+
+            raw = checkpoint(
+                many_class_forward,
+                views,
+                use_reentrant=False,
+            )
+        else:
+            raw = _forward_method(
+                bundle=bundle,
+                views=views,
+                labels=labels,
+                feature_shuffles=feature_shuffles,
+                checkpoint_activations=True,
+            )
         if bundle.problem_type == "regression":
-            regression_outputs.append(bundle.backbone.quantile_dist(raw).quantiles.mean(dim=-1))
+            regression_outputs.append(bundle.backbone.quantile_dist(raw).quantiles.mean(dim=-1).float())
         else:
             classification_outputs.append((raw, patterns))
     if bundle.problem_type == "regression":
         return torch.cat(regression_outputs, dim=0).mean(dim=0)
     if bundle.n_classes is None:
         raise RuntimeError("classification bag has no class count")
-    return _aggregate_classification_logits(classification_outputs, n_classes=bundle.n_classes)
+    return _aggregate_training_classification_logits(classification_outputs, n_classes=bundle.n_classes)
 
 
 def _fit_one_bag_standard(
@@ -905,45 +1184,26 @@ def _fit_one_bag_standard(
     if device.type == "cuda":
         torch.cuda.manual_seed_all(adapter_seed)
     adapters = _make_adapters(bundle, config, device)
-    if adapters is None:
-        # A numerical spline cannot alter a categorical-only (or wholly
-        # constant-after-filtering) table.  Use the public estimator directly
-        # for all three arms, rather than requiring an unnecessary manual
-        # reconstruction to agree with it.  This is an explicit neutral tie,
-        # not a skipped or hidden task.
-        identity_validation = _identity_prediction(bundle, validation_x)
-        identity_test = _identity_prediction(bundle, test_x)
-        parity_validation = parity_test = 0.0
-        public_repeat_drift_validation = public_repeat_drift_test = 0.0
-        parity_reference = parity_reference_test = "public_no_trainable_numerical_features"
-    else:
-        (
-            identity_validation,
-            parity_validation,
-            parity_reference,
-            public_repeat_drift_validation,
-        ) = _identity_parity(
-            bundle=bundle,
-            adapters=adapters,
-            query_x=validation_x,
-            device=device,
-            config=config,
-            progress=progress,
-            task_id=task.task_id,
-            bag=bag,
-            split="validation",
-        )
-        identity_test, parity_test, parity_reference_test, public_repeat_drift_test = _identity_parity(
-            bundle=bundle,
-            adapters=adapters,
-            query_x=test_x,
-            device=device,
-            config=config,
-            progress=progress,
-            task_id=task.task_id,
-            bag=bag,
-            split="test",
-        )
+    parity_validation, parity_reference, public_parity_validation = _identity_view_parity(
+        bundle=bundle,
+        adapters=adapters,
+        query_x=validation_x,
+        device=device,
+        progress=progress,
+        task_id=task.task_id,
+        bag=bag,
+        split="validation",
+    )
+    parity_test, parity_reference_test, public_parity_test = _identity_view_parity(
+        bundle=bundle,
+        adapters=adapters,
+        query_x=test_x,
+        device=device,
+        progress=progress,
+        task_id=task.task_id,
+        bag=bag,
+        split="test",
+    )
     _emit(
         progress,
         event="bag_started",
@@ -957,27 +1217,56 @@ def _fit_one_bag_standard(
         pipeline="standard_ensemble",
         normal_estimators=int(STANDARD_TABICL_CONFIG["n_estimators"]),
     )
+    training_context_sizes: list[int] = []
     if adapters is None:
+        # A numerical spline cannot alter a categorical-only (or wholly
+        # constant-after-filtering) table.  Keep it as an explicit neutral tie.
+        identity_validation = _normal_prediction(
+            bundle=bundle,
+            query_x=validation_x,
+            context_indices=bundle.support_indices,
+            adapters=None,
+            device=device,
+        )
+        identity_test = _normal_prediction(
+            bundle=bundle,
+            query_x=test_x,
+            context_indices=bundle.support_indices,
+            adapters=None,
+            device=device,
+        )
         adapted_validation = identity_validation.copy()
         adapted_test = identity_test.copy()
         first_objective = final_objective = float("nan")
         executed_steps = 0
+        best_step = 0
+        has_valid_adapted_checkpoint = False
     else:
         optimizer = _optimizer(adapters, config)
         episode_rng = np.random.default_rng(_seed(int(config["random_state"]), task.task_id, bag, 203))
-        best_state = _cpu_state_dict(adapters)
+        identity_state = _cpu_state_dict(adapters)
+        best_state = identity_state
         best_error = float("inf")
+        best_step = 0
+        has_valid_adapted_checkpoint = False
         stale = 0
         first_objective = final_objective = float("nan")
         executed_steps = 0
         for step in range(1, int(config["adapter_steps"]) + 1):
+            configured_context_rows = config.get("train_context_rows")
+            context_row_limit = (
+                max(1, bundle.fit_labels.size - int(config["query_batch_rows"]))
+                if configured_context_rows is None
+                else int(configured_context_rows)
+            )
             context_rows, query_rows = sample_episode_indices(
                 bundle.fit_labels,
                 problem_type=task.problem_type,
-                context_rows=int(config["train_context_rows"]),
+                context_rows=context_row_limit,
                 query_rows=int(config["query_batch_rows"]),
                 rng=episode_rng,
             )
+            training_context_sizes.append(int(context_rows.size))
             optimizer.zero_grad(set_to_none=True)
             output = _training_logits(
                 bundle=bundle,
@@ -991,8 +1280,18 @@ def _fit_one_bag_standard(
                 objective = F.mse_loss(output.flatten(), target.float().flatten())
             else:
                 objective = F.cross_entropy(
-                    output / float(STANDARD_TABICL_CONFIG["softmax_temperature"]), target.long().flatten()
+                    output / float(bundle.estimator.softmax_temperature), target.long().flatten()
                 )
+            if not torch.isfinite(objective):
+                _emit(
+                    progress,
+                    event="adapter_nonfinite_objective",
+                    task_id=task.task_id,
+                    bag=bag,
+                    step=step,
+                )
+                del output, target, objective
+                break
             if step == 1:
                 first_objective = float(objective.detach())
             objective.backward()
@@ -1000,7 +1299,18 @@ def _fit_one_bag_standard(
             optimizer.step()
             final_objective = float(objective.detach())
             executed_steps = step
+            del output, target, objective
             if step % int(config["validation_interval"]) == 0 or step == int(config["adapter_steps"]):
+                # Score identity and adapted back-to-back while the live GPU
+                # state is the same.  This prevents automatic inference-plan
+                # changes from entering checkpoint selection as spline signal.
+                paired_identity = _normal_prediction(
+                    bundle=bundle,
+                    query_x=validation_x,
+                    context_indices=bundle.support_indices,
+                    adapters=None,
+                    device=device,
+                )
                 candidate = _normal_prediction(
                     bundle=bundle,
                     query_x=validation_x,
@@ -1008,17 +1318,20 @@ def _fit_one_bag_standard(
                     adapters=adapters,
                     device=device,
                 )
-                candidate_error = deployment_error(
+                paired_identity_error = deployment_error(
+                    task.problem_type, raw_validation_y, paired_identity, n_classes=task.n_classes
+                )
+                candidate_error = _candidate_deployment_error(
                     task.problem_type, raw_validation_y, candidate, n_classes=task.n_classes
                 )
                 if candidate_error < best_error:
                     best_error = candidate_error
                     best_state = _cpu_state_dict(adapters)
+                    best_step = step
+                    has_valid_adapted_checkpoint = True
                     stale = 0
                 else:
                     stale += 1
-                    if stale >= int(config["adapter_patience"]):
-                        break
                 _emit(
                     progress,
                     event="adapter_validation",
@@ -1026,16 +1339,40 @@ def _fit_one_bag_standard(
                     bag=bag,
                     step=step,
                     validation_error=float(candidate_error),
+                    identity_validation_error=float(paired_identity_error),
                     best_validation_error=float(best_error),
                     stale_validations=stale,
                     elapsed_seconds=float(time.perf_counter() - started),
                 )
+                del paired_identity, candidate
+                if stale >= int(config["adapter_patience"]):
+                    break
         adapters.load_state_dict(best_state, strict=True)
+        del optimizer
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        # Recompute both arms after training cleanup, under the same execution
+        # conditions used by the final guard.
+        identity_validation = _normal_prediction(
+            bundle=bundle,
+            query_x=validation_x,
+            context_indices=bundle.support_indices,
+            adapters=None,
+            device=device,
+        )
         adapted_validation = _normal_prediction(
             bundle=bundle,
             query_x=validation_x,
             context_indices=bundle.support_indices,
             adapters=adapters,
+            device=device,
+        )
+        identity_test = _normal_prediction(
+            bundle=bundle,
+            query_x=test_x,
+            context_indices=bundle.support_indices,
+            adapters=None,
             device=device,
         )
         adapted_test = _normal_prediction(
@@ -1045,7 +1382,6 @@ def _fit_one_bag_standard(
             adapters=adapters,
             device=device,
         )
-        del optimizer
     identity_error = deployment_error(task.problem_type, raw_validation_y, identity_validation, n_classes=task.n_classes)
     adapted_error = deployment_error(task.problem_type, raw_validation_y, adapted_validation, n_classes=task.n_classes)
     decision = choose_identity_guard(
@@ -1075,11 +1411,17 @@ def _fit_one_bag_standard(
         ),
         "identity_parity_max_abs_validation": parity_validation,
         "identity_parity_max_abs_test": parity_test,
-        "identity_parity_passed": True,
+        "public_path_input_parity_checked_validation": bool(public_parity_validation),
+        "public_path_input_parity_checked_test": bool(public_parity_test),
+        # ``None`` means this is an intentionally capped-context diagnostic;
+        # a capped input-view comparison must never be reported as a failed
+        # full public-estimator parity check.
+        "public_path_input_parity_passed": (
+            True if public_parity_validation and public_parity_test else None
+        ),
+        "fresh_spline_view_identity_passed": bool(adapters is None or (parity_validation == 0.0 and parity_test == 0.0)),
         "identity_parity_reference": parity_reference,
         "identity_parity_reference_test": parity_reference_test,
-        "identity_public_repeat_drift_max_abs_validation": float(public_repeat_drift_validation),
-        "identity_public_repeat_drift_max_abs_test": float(public_repeat_drift_test),
         "identity_error": float(identity_error),
         "adapted_error": float(adapted_error),
         "relative_improvement": float(decision.relative_improvement),
@@ -1087,6 +1429,29 @@ def _fit_one_bag_standard(
         "adapter_first_objective": first_objective,
         "adapter_final_objective": final_objective,
         "adapter_steps_executed": executed_steps,
+        "adapter_best_step": int(best_step),
+        "adapter_has_valid_learned_checkpoint": bool(has_valid_adapted_checkpoint),
+        "adapter_configured_train_context_rows": config.get("train_context_rows"),
+        "adapter_train_context_policy": (
+            "all_non_query_fit_rows"
+            if config.get("train_context_rows") is None
+            else "sampled_context_cap"
+        ),
+        "adapter_observed_train_context_rows_min": (
+            None if not training_context_sizes else int(min(training_context_sizes))
+        ),
+        "adapter_observed_train_context_rows_max": (
+            None if not training_context_sizes else int(max(training_context_sizes))
+        ),
+        "adapter_observed_train_context_rows_mean": (
+            None if not training_context_sizes else float(np.mean(training_context_sizes))
+        ),
+        "adapter_deployment_context_rows": int(bundle.support_indices.size),
+        "adapter_train_to_deployment_context_ratio": (
+            None
+            if not training_context_sizes
+            else float(np.mean(training_context_sizes) / bundle.support_indices.size)
+        ),
         "train_seconds": float(time.perf_counter() - started),
         "peak_allocated_gib": float(peak_gib),
         "run_fingerprint_hash": run_fingerprint_hash,
@@ -1184,11 +1549,30 @@ def run_task_config_standard(
         identity_validation[result.validation_indices] = result.identity_validation
         adapted_validation[result.validation_indices] = result.adapted_validation
         guarded_validation[result.validation_indices] = result.guarded_validation
-    if not np.isfinite(guarded_validation).all():
+    if not (
+        np.isfinite(identity_validation).all()
+        and np.isfinite(adapted_validation).all()
+        and np.isfinite(guarded_validation).all()
+    ):
         raise RuntimeError(f"task {task.task_id} config {label} did not produce complete OOF predictions")
     identity_test = np.mean([result.identity_test for result in bag_results], axis=0)
     adapted_test = np.mean([result.adapted_test for result in bag_results], axis=0)
+    # Retouche applies its identity guard independently to every bag-fold and
+    # deploys the mean of those eight selected members.  Preserve that exact
+    # protocol for the guarded comparison; the raw adapted ensemble above
+    # remains available to expose the full magnitude of wins and failures.
     guarded_test = np.mean([result.guarded_test for result in bag_results], axis=0)
+    identity_oof_error = deployment_error(
+        task.problem_type, task.y_train, identity_validation, n_classes=task.n_classes
+    )
+    adapted_oof_error = _candidate_deployment_error(
+        task.problem_type, task.y_train, adapted_validation, n_classes=task.n_classes
+    )
+    config_guard = choose_identity_guard(
+        identity_error=identity_oof_error,
+        adapted_error=adapted_oof_error,
+        required_relative_improvement=float(config["guard_relative_improvement"]),
+    )
     np.savez_compressed(
         predictions_path,
         identity_validation=identity_validation,
@@ -1226,13 +1610,22 @@ def run_task_config_standard(
             "adapted": _metric_bundle(task.problem_type, task.y_train, adapted_validation, task.n_classes),
             "guarded": _metric_bundle(task.problem_type, task.y_train, guarded_validation, task.n_classes),
         },
-        "test": {
-            "identity": _metric_bundle(task.problem_type, task.y_test, identity_test, task.n_classes),
-            "adapted": _metric_bundle(task.problem_type, task.y_test, adapted_test, task.n_classes),
-            "guarded": _metric_bundle(task.problem_type, task.y_test, guarded_test, task.n_classes),
-        },
+        "test_metrics_deferred_to_task_summary": True,
+        "guard_protocol": "retouche_per_bag_validation_guard_then_test_ensemble",
         "guard_selected_adapted_fraction": float(
             np.mean([bool(result.metadata["guard_selected_adapted"]) for result in bag_results])
+        ),
+        "adapter_valid_learned_checkpoint_fraction": float(
+            np.mean(
+                [
+                    bool(result.metadata["adapter_has_valid_learned_checkpoint"])
+                    for result in bag_results
+                ]
+            )
+        ),
+        "global_oof_guard_selected_adapted_diagnostic": bool(config_guard.use_adapted),
+        "global_oof_guard_relative_improvement_diagnostic": float(
+            config_guard.relative_improvement
         ),
         "mean_train_seconds_per_bag": float(np.mean([float(result.metadata["train_seconds"]) for result in bag_results])),
         "max_peak_allocated_gib": float(np.max([float(result.metadata["peak_allocated_gib"]) for result in bag_results])),
@@ -1256,7 +1649,6 @@ def run_task_config_standard(
         task_id=task.task_id,
         config_label=label,
         guarded_validation_error=summary["validation"]["guarded"]["deployment_error"],
-        guarded_test_error=summary["test"]["guarded"]["benchmark_error"],
     )
     del backbone, checkpoint_path
     if device.type == "cuda":
