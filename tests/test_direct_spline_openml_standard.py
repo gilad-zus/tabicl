@@ -86,6 +86,21 @@ class _OffsetPublicRegressionBackbone(torch.nn.Module):
         return {"mean": self.forward(X, y_train).mean(dim=-1) + 0.25}
 
 
+class _TransientPublicRegressionBackbone(_OffsetPublicRegressionBackbone):
+    """Model public repeat drift that disappears in an exact branch replay."""
+
+    def __init__(self):
+        super().__init__()
+        self.public_calls = 0
+
+    def predict_stats(self, X, y_train, output_type="mean", alphas=None, inference_config=None):
+        del alphas, inference_config
+        assert output_type == ["mean"]
+        self.public_calls += 1
+        drift = 0.25 if self.public_calls <= 2 else 0.0
+        return {"mean": self.forward(X, y_train).mean(dim=-1) + drift}
+
+
 def test_standard_config_uses_all_fit_rows_unless_explicitly_capped():
     assert standard_direct_spline_config()["max_context_rows"] is None
     assert standard_direct_spline_config(context_cap=128)["max_context_rows"] == 128
@@ -384,3 +399,58 @@ def test_regression_parity_failure_reports_which_stage_diverged():
     assert events[0]["event"] == "identity_parity_failed"
     assert events[0]["split"] == "validation"
     assert events[0]["diagnostics"]["branches"]
+
+
+def test_regression_parity_accepts_only_an_exact_branch_replay_after_repeat_drift():
+    rows = 24
+    features = pd.DataFrame(
+        {
+            "x0": np.linspace(-2.0, 2.0, rows),
+            "x1": np.linspace(1.0, 3.0, rows),
+        }
+    )
+    targets = np.linspace(10.0, 30.0, rows)
+    task = OpenMLTaskData(
+        task_id=6,
+        dataset_id=7,
+        dataset_name="regression_repeat_drift",
+        problem_type="regression",
+        n_classes=None,
+        x_train=features.iloc[:16].reset_index(drop=True),
+        y_train=targets[:16],
+        x_test=features.iloc[16:].reset_index(drop=True),
+        y_test=targets[16:],
+        outer_split_hash="test",
+    )
+    config = {
+        **standard_direct_spline_config(train_context_rows=4),
+        "adapter_steps": 1,
+        "adapter_patience": 1,
+        "validation_interval": 1,
+        "query_batch_rows": 4,
+        "cross_column_mixing_rank": 0,
+    }
+    events = []
+
+    result = _fit_one_bag_standard(
+        task=task,
+        fit_indices=np.arange(12),
+        validation_indices=np.arange(12, 16),
+        bag=0,
+        config=config,
+        protocol_seed=0,
+        backbone=_TransientPublicRegressionBackbone(),
+        device=torch.device("cpu"),
+        run_fingerprint_hash="test",
+        progress=events.append,
+        requested_bags=8,
+        effective_bags=8,
+    )
+
+    replay_events = [event for event in events if event["event"] == "identity_parity_replay_verified"]
+    assert len(replay_events) == 1
+    assert replay_events[0]["public_repeat_drift_max_abs"] > 0
+    assert result.metadata["identity_parity_reference"].startswith("public_exact_branch_replay_after_repeat_drift_")
+    assert result.metadata["identity_parity_max_abs_validation"] == 0.0
+    assert result.metadata["identity_public_repeat_drift_max_abs_validation"] > 0
+    assert result.metadata["identity_public_repeat_drift_max_abs_test"] == 0.0

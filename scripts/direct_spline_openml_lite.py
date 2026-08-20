@@ -283,10 +283,12 @@ def _event_reporter(path: Path):
                 f"peak={event['peak_allocated_gib']:.2f}GiB{parity}",
                 flush=True,
             )
-        elif event_name == "identity_parity_failed":
+        elif event_name in {"identity_parity_failed", "identity_parity_replay_verified"}:
+            outcome = "exact branch replay verified" if event_name.endswith("verified") else "failed"
             print(
-                f"[{task_prefix} bag={event['bag']}] {event['split']} identity parity failed "
-                f"(max_abs={event['max_abs']:.6g}); diagnostics saved to {path}",
+                f"[{task_prefix} bag={event['bag']}] {event['split']} identity parity {outcome} "
+                f"after public repeat drift={event['public_repeat_drift_max_abs']:.6g}; "
+                f"diagnostics saved to {path}",
                 flush=True,
             )
         elif event_name == "config_started":

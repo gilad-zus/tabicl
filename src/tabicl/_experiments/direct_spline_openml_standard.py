@@ -491,8 +491,12 @@ def _normal_prediction(
     if bundle.problem_type == "regression":
         if not regression_outputs:
             raise RuntimeError("normal regressor produced no ensemble outputs")
-        scaled = torch.cat(regression_outputs, dim=0).mean(dim=0).cpu().numpy()
-        return bundle.estimator.y_scaler_.inverse_transform(scaled.reshape(-1, 1)).ravel().astype(np.float64)
+        # Match TabICLRegressor.predict exactly: move each float32 member to
+        # NumPy, inverse-transform every member, and only then take the mean.
+        # Inverse scaling is algebraically linear, but changing this operation
+        # order creates avoidable last-bit differences.
+        members = [output.cpu().numpy() for output in regression_outputs]
+        return _aggregate_public_regression_members(bundle, members)
     if bundle.n_classes is None:
         raise RuntimeError("classification bag has no class count")
     logits = _aggregate_classification_logits(outputs, n_classes=bundle.n_classes)
@@ -542,6 +546,40 @@ def _aggregate_public_regression_members(bundle: _StandardBag, members: list[np.
     n_estimators, n_rows = values.shape
     unscaled = bundle.estimator.y_scaler_.inverse_transform(values.reshape(-1, 1))
     return np.mean(unscaled.reshape(n_estimators, n_rows), axis=0).astype(np.float64)
+
+
+def _difference_is_exact(summary: Any) -> bool:
+    """Whether a diagnostic comparison proves elementwise equality."""
+
+    return bool(
+        isinstance(summary, dict)
+        and summary.get("shape_match") is True
+        and summary.get("nonfinite_differences") == 0
+        and summary.get("max_abs") == 0.0
+    )
+
+
+def _diagnostics_prove_exact_regression_replay(diagnostics: dict[str, Any]) -> bool:
+    """Accept only an exact public/reconstructed branch replay.
+
+    A prior ``estimator.predict`` call can choose a different automatic GPU
+    batching plan from a later call.  That repeat drift is not a reconstruction
+    error.  This fallback is deliberately strict: every public input view,
+    label, member prediction, and final replay aggregation must be bit exact.
+    """
+
+    if "diagnostic_error" in diagnostics:
+        return False
+    branches = diagnostics.get("branches")
+    if not isinstance(branches, dict) or not branches:
+        return False
+    for branch in branches.values():
+        if not isinstance(branch, dict) or not all(
+            _difference_is_exact(branch.get(key))
+            for key in ("views", "labels", "member_predictions")
+        ):
+            return False
+    return _difference_is_exact(diagnostics.get("public_replay_vs_reconstructed_replay"))
 
 
 def _regression_parity_diagnostics(
@@ -675,7 +713,7 @@ def _identity_parity(
     task_id: int,
     bag: int,
     split: str,
-) -> tuple[np.ndarray, float, str]:
+) -> tuple[np.ndarray, float, str, float]:
     """Build the matched identity control and verify the zero spline.
 
     With all fit rows as context, this additionally checks the custom
@@ -693,6 +731,7 @@ def _identity_parity(
         device=device,
     )
     parity_errors: list[float] = []
+    public_repeat_drift = 0.0
     if bundle.support_indices.size == bundle.fit_labels.size:
         query_rows = len(query_x)
         public_parity_rows = min(query_rows, PUBLIC_IDENTITY_PARITY_MAX_ROWS)
@@ -710,6 +749,7 @@ def _identity_parity(
             )
         public_identity = _identity_prediction(bundle, public_query)
         max_public_abs = float(np.max(np.abs(matched_public_probe - public_identity)))
+        replay_verified = False
         if not np.allclose(
             matched_public_probe,
             public_identity,
@@ -723,33 +763,44 @@ def _identity_parity(
                 reconstructed_prediction=matched_public_probe,
                 public_prediction=public_identity,
             )
+            replay_verified = _diagnostics_prove_exact_regression_replay(diagnostics)
+            event = "identity_parity_replay_verified" if replay_verified else "identity_parity_failed"
             _emit(
                 progress,
-                event="identity_parity_failed",
+                event=event,
                 task_id=task_id,
                 bag=bag,
                 split=split,
                 problem_type=bundle.problem_type,
                 public_parity_rows=public_parity_rows,
-                max_abs=max_public_abs,
+                public_repeat_drift_max_abs=max_public_abs,
                 diagnostics=diagnostics,
             )
-            raise RuntimeError(
-                "standard-pipeline identity parity failed: the reconstructed normal TabICL path differs from "
-                f"the public estimator on its {public_parity_rows}-row parity probe "
-                f"(max_abs={max_public_abs:.3g}). Refuse to train against a mismatched baseline. "
-                f"parity_diagnostics={json.dumps(diagnostics, sort_keys=True)}"
+            if not replay_verified:
+                raise RuntimeError(
+                    "standard-pipeline identity parity failed: the reconstructed normal TabICL path differs from "
+                    f"the public estimator on its {public_parity_rows}-row parity probe "
+                    f"(max_abs={max_public_abs:.3g}). Refuse to train against a mismatched baseline. "
+                    f"parity_diagnostics={json.dumps(diagnostics, sort_keys=True)}"
+                )
+        if replay_verified:
+            public_repeat_drift = max_public_abs
+            replay_error = float(
+                diagnostics["public_replay_vs_reconstructed_replay"]["max_abs"]
             )
-        parity_errors.append(max_public_abs)
-        reference = (
-            "public_full_context_estimator"
-            if public_parity_rows == query_rows
-            else f"public_full_context_estimator_probe_{public_parity_rows}_of_{query_rows}"
-        )
+            parity_errors.append(replay_error)
+            reference = f"public_exact_branch_replay_after_repeat_drift_{public_parity_rows}_rows"
+        else:
+            parity_errors.append(max_public_abs)
+            reference = (
+                "public_full_context_estimator"
+                if public_parity_rows == query_rows
+                else f"public_full_context_estimator_probe_{public_parity_rows}_of_{query_rows}"
+            )
     else:
         reference = "matched_capped_standard_views"
     if adapters is None:
-        return matched_identity, max(parity_errors, default=0.0), reference
+        return matched_identity, max(parity_errors, default=0.0), reference, public_repeat_drift
     spline_identity = _normal_prediction(
         bundle=bundle,
         query_x=query_x,
@@ -769,7 +820,7 @@ def _identity_parity(
             f"(max_abs={max_abs:.3g}). Refuse to train against a mismatched baseline."
         )
     parity_errors.append(max_abs)
-    return matched_identity, max(parity_errors), reference
+    return matched_identity, max(parity_errors), reference, public_repeat_drift
 
 
 def _training_logits(
@@ -863,9 +914,15 @@ def _fit_one_bag_standard(
         identity_validation = _identity_prediction(bundle, validation_x)
         identity_test = _identity_prediction(bundle, test_x)
         parity_validation = parity_test = 0.0
+        public_repeat_drift_validation = public_repeat_drift_test = 0.0
         parity_reference = parity_reference_test = "public_no_trainable_numerical_features"
     else:
-        identity_validation, parity_validation, parity_reference = _identity_parity(
+        (
+            identity_validation,
+            parity_validation,
+            parity_reference,
+            public_repeat_drift_validation,
+        ) = _identity_parity(
             bundle=bundle,
             adapters=adapters,
             query_x=validation_x,
@@ -876,7 +933,7 @@ def _fit_one_bag_standard(
             bag=bag,
             split="validation",
         )
-        identity_test, parity_test, parity_reference_test = _identity_parity(
+        identity_test, parity_test, parity_reference_test, public_repeat_drift_test = _identity_parity(
             bundle=bundle,
             adapters=adapters,
             query_x=test_x,
@@ -1021,6 +1078,8 @@ def _fit_one_bag_standard(
         "identity_parity_passed": True,
         "identity_parity_reference": parity_reference,
         "identity_parity_reference_test": parity_reference_test,
+        "identity_public_repeat_drift_max_abs_validation": float(public_repeat_drift_validation),
+        "identity_public_repeat_drift_max_abs_test": float(public_repeat_drift_test),
         "identity_error": float(identity_error),
         "adapted_error": float(adapted_error),
         "relative_improvement": float(decision.relative_improvement),
