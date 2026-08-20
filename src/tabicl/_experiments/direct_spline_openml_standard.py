@@ -78,6 +78,11 @@ STANDARD_DIRECT_SPLINE_CONFIG: dict[str, Any] = {
     # every non-query fitting row is context.  The launcher still exposes an
     # explicit positive cap for hardware-constrained diagnostic runs.
     "train_context_rows": None,
+    # Row interaction attends across features within each row, not across
+    # dataset rows.  Keep its differentiable execution in conservative row
+    # batches: the public inference manager does the equivalent batching under
+    # no_grad, while adapter training must retain the input gradient.
+    "row_interaction_chunk_rows": 2_048,
     "query_batch_rows": 256,
     "n_control_points": 20,
     "learning_rate": 0.005,
@@ -102,6 +107,7 @@ class _StandardBag:
     numerical_indices: np.ndarray
     problem_type: ProblemType
     n_classes: int | None
+    row_interaction_chunk_rows: int = 2_048
 
     @property
     def backbone(self) -> TabICL:
@@ -250,6 +256,7 @@ def _fit_standard_bag(
         numerical_indices=_filtered_numerical_indices(estimator),
         problem_type=task.problem_type,
         n_classes=task.n_classes,
+        row_interaction_chunk_rows=int(config["row_interaction_chunk_rows"]),
     )
 
 
@@ -597,12 +604,50 @@ def _forward_method(
                     feature_shuffles if bundle.problem_type != "regression" else None
                 ),
             )
-            representations = backbone.row_interactor(embeddings)
+            representations = _differentiable_row_interaction(
+                backbone=backbone,
+                embeddings=embeddings,
+                chunk_rows=bundle.row_interaction_chunk_rows,
+            )
             return backbone.icl_predictor(representations, y_train=labels)
 
     if checkpoint_activations:
         return checkpoint(run, views, use_reentrant=False)
     return run(views)
+
+
+def _differentiable_row_interaction(
+    *,
+    backbone: TabICL,
+    embeddings: torch.Tensor,
+    chunk_rows: int,
+) -> torch.Tensor:
+    """Run the row-wise feature interaction in gradient-preserving row chunks.
+
+    ``RowInteraction`` applies attention between a row's feature tokens; it
+    has no interaction across the table's row dimension.  Sending every row
+    at once to PyTorch SDPA creates a flattened batch of
+    ``n_ensemble_members * n_rows``.  On large tables that can exceed a CUDA
+    kernel launch limit even when the ordinary inference manager succeeds by
+    auto-batching the same work.  Chunks therefore preserve the exact
+    mathematical result while retaining the adapter gradient and the full
+    context for the subsequent in-context-learning stage.
+
+    The clone avoids ``RowInteraction``'s internal class-token assignment
+    mutating a view of the complete embedding tensor.  It is differentiable
+    and only holds one row chunk at a time.
+    """
+
+    if chunk_rows <= 0:
+        raise ValueError("row_interaction_chunk_rows must be positive")
+    total_rows = int(embeddings.shape[1])
+    if total_rows <= chunk_rows:
+        return backbone.row_interactor(embeddings)
+    chunks: list[torch.Tensor] = []
+    for start in range(0, total_rows, chunk_rows):
+        stop = min(total_rows, start + chunk_rows)
+        chunks.append(backbone.row_interactor(embeddings[:, start:stop].clone()))
+    return torch.cat(chunks, dim=1)
 
 
 def _enable_frozen_training_path(backbone: TabICL) -> None:
@@ -1012,7 +1057,11 @@ def _many_class_training_logits(
             labels=labels,
             feature_shuffles=feature_shuffles,
         )
-        representations = backbone.row_interactor(embeddings)
+        representations = _differentiable_row_interaction(
+            backbone=backbone,
+            embeddings=embeddings,
+            chunk_rows=bundle.row_interaction_chunk_rows,
+        )
         predictor = backbone.icl_predictor
         train_size = labels.shape[1]
         table_logits: list[torch.Tensor] = []
@@ -1431,6 +1480,7 @@ def _fit_one_bag_standard(
         "adapter_steps_executed": executed_steps,
         "adapter_best_step": int(best_step),
         "adapter_has_valid_learned_checkpoint": bool(has_valid_adapted_checkpoint),
+        "adapter_row_interaction_chunk_rows": int(bundle.row_interaction_chunk_rows),
         "adapter_configured_train_context_rows": config.get("train_context_rows"),
         "adapter_train_context_policy": (
             "all_non_query_fit_rows"

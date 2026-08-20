@@ -97,7 +97,7 @@ from tabicl._experiments.direct_spline_openml_standard import (
 # Increment this whenever a code change can alter predictions, validation
 # selection, or persisted artifact semantics.  Unlike the source hashes, this
 # value is deliberately *not* ignored by --allow-compatible-code-resume.
-EXPERIMENT_SEMANTICS_VERSION = 2
+EXPERIMENT_SEMANTICS_VERSION = 3
 
 
 def parse_args(

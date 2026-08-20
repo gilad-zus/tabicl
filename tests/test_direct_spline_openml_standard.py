@@ -11,6 +11,7 @@ from tabicl._experiments.direct_spline_openml import BagPredictions, OpenMLTaskD
 from tabicl._experiments.direct_spline_openml_standard import (
     _apply_adapter,
     _aggregate_public_classification_members,
+    _differentiable_row_interaction,
     _enable_frozen_training_path,
     _fit_standard_bag,
     _forward_method,
@@ -119,6 +120,7 @@ class _TransientPublicRegressionBackbone(_OffsetPublicRegressionBackbone):
 def test_standard_config_uses_all_fit_rows_unless_explicitly_capped():
     assert standard_direct_spline_config()["max_context_rows"] is None
     assert standard_direct_spline_config()["train_context_rows"] is None
+    assert standard_direct_spline_config()["row_interaction_chunk_rows"] == 2_048
     assert standard_direct_spline_config(train_context_rows=0)["train_context_rows"] is None
     assert standard_direct_spline_config(train_context_rows=128)["train_context_rows"] == 128
     assert standard_direct_spline_config(context_cap=128)["max_context_rows"] == 128
@@ -889,6 +891,70 @@ def test_differentiable_standard_forward_matches_public_eval_without_dropout():
     assert not any(
         module.training for module in backbone.modules() if id(module) not in routing_modules
     )
+
+
+def test_differentiable_row_chunking_matches_unbatched_forward_and_input_gradient():
+    """Large-table row batching is mathematically exact and retains gradients."""
+
+    torch.manual_seed(17)
+    backbone = TabICL(
+        max_classes=3,
+        embed_dim=8,
+        col_num_blocks=1,
+        col_nhead=1,
+        col_num_inds=2,
+        col_feature_group=False,
+        row_num_blocks=1,
+        row_nhead=1,
+        row_num_cls=1,
+        icl_num_blocks=1,
+        icl_nhead=1,
+        col_ssmax=False,
+        icl_ssmax=False,
+        dropout=0.0,
+        zero_init=False,
+    )
+    for parameter in backbone.parameters():
+        parameter.requires_grad_(False)
+    _enable_frozen_training_path(backbone)
+
+    # The column encoder produces a non-leaf embedding tensor. RowInteraction
+    # writes its learned CLS token into that tensor, so model the real path
+    # rather than passing it a leaf test fixture.
+    embedding_source = torch.randn(3, 23, 4, 8, requires_grad=True)
+    embeddings = embedding_source * 1
+    calls: list[int] = []
+    hook = backbone.row_interactor.register_forward_hook(
+        lambda _module, inputs, _output: calls.append(int(inputs[0].shape[1]))
+    )
+    try:
+        unbatched = _differentiable_row_interaction(
+            backbone=backbone,
+            embeddings=embeddings,
+            chunk_rows=64,
+        )
+        unbatched.sum().backward()
+        unbatched_gradient = embedding_source.grad.detach().clone()
+        assert calls == [23]
+
+        embedding_source_chunked = embedding_source.detach().clone().requires_grad_()
+        embeddings_chunked = embedding_source_chunked * 1
+        calls.clear()
+        chunked = _differentiable_row_interaction(
+            backbone=backbone,
+            embeddings=embeddings_chunked,
+            chunk_rows=5,
+        )
+        chunked.sum().backward()
+        assert calls == [5, 5, 5, 5, 3]
+    finally:
+        hook.remove()
+
+    assert torch.allclose(chunked, unbatched, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(
+        embedding_source_chunked.grad, unbatched_gradient, atol=1e-6, rtol=1e-6
+    )
+    assert torch.isfinite(embedding_source_chunked.grad).all()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA AMP parity requires a GPU")
