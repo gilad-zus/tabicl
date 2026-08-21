@@ -97,7 +97,7 @@ from tabicl._experiments.direct_spline_openml_standard import (
 # Increment this whenever a code change can alter predictions, validation
 # selection, or persisted artifact semantics.  Unlike the source hashes, this
 # value is deliberately *not* ignored by --allow-compatible-code-resume.
-EXPERIMENT_SEMANTICS_VERSION = 3
+EXPERIMENT_SEMANTICS_VERSION = 4
 
 
 def parse_args(
@@ -156,6 +156,33 @@ def parse_args(
             "Standard pipeline only: labelled non-query context rows per adapter training episode. "
             "0 (the default) matches the deployment context scale: every available non-query row "
             "when uncapped, or --context-cap rows in a capped diagnostic."
+        ),
+    )
+    parser.add_argument(
+        "--adapter-steps",
+        type=int,
+        default=None,
+        help=(
+            "Standard pipeline only: maximum DirectSpline optimisation steps per bag. "
+            "Omit to use the configuration default (150 for D)."
+        ),
+    )
+    parser.add_argument(
+        "--adapter-patience",
+        type=int,
+        default=None,
+        help=(
+            "Standard pipeline only: consecutive validation checks without improvement before early stopping. "
+            "Omit to use the configuration default (10 for D)."
+        ),
+    )
+    parser.add_argument(
+        "--validation-interval",
+        type=int,
+        default=None,
+        help=(
+            "Standard pipeline only: evaluate held-out bag validation every N optimisation steps. "
+            "Omit to use the configuration default (10 for D)."
         ),
     )
     parser.add_argument("--device", default="cuda")
@@ -524,14 +551,23 @@ def _configs(args: argparse.Namespace) -> tuple[list[str], list[dict[str, Any]]]
     if args.pipeline == "standard":
         context_cap = None if args.context_cap == 0 else args.context_cap
         train_context_rows = None if args.train_context_rows == 0 else args.train_context_rows
+        adapter_steps = getattr(args, "adapter_steps", None)
+        adapter_patience = getattr(args, "adapter_patience", None)
+        validation_interval = getattr(args, "validation_interval", None)
         default = standard_direct_spline_config(
             context_cap=context_cap,
             train_context_rows=train_context_rows,
+            adapter_steps=adapter_steps,
+            adapter_patience=adapter_patience,
+            validation_interval=validation_interval,
         )
         random = shared_standard_direct_spline_configs(
             args.n_random_configs,
             seed=args.tuning_seed,
             context_cap=context_cap,
+            adapter_steps=adapter_steps,
+            adapter_patience=adapter_patience,
+            validation_interval=validation_interval,
         )
         if train_context_rows is not None:
             for config in random:
@@ -555,6 +591,18 @@ def _validate(args: argparse.Namespace) -> None:
         raise ValueError("--context-cap must be zero (all rows) or positive")
     if args.train_context_rows < 0:
         raise ValueError("--train-context-rows must be zero (all available rows) or positive")
+    standard_schedule_options = {
+        "--adapter-steps": getattr(args, "adapter_steps", None),
+        "--adapter-patience": getattr(args, "adapter_patience", None),
+        "--validation-interval": getattr(args, "validation_interval", None),
+    }
+    for option, value in standard_schedule_options.items():
+        if value is not None and value <= 0:
+            raise ValueError(f"{option} must be positive when provided")
+    if getattr(args, "pipeline", "lite") != "standard" and any(
+        value is not None for value in standard_schedule_options.values()
+    ):
+        raise ValueError("--adapter-steps, --adapter-patience, and --validation-interval require --pipeline standard")
     if min(args.outer_repeat, args.outer_fold, args.outer_sample) < 0:
         raise ValueError("outer repeat/fold/sample values must be non-negative")
     if args.allow_compatible_code_resume and not args.resume:

@@ -266,6 +266,34 @@ def test_zero_train_context_rows_matches_an_explicit_deployment_cap():
     assert all(config["train_context_rows"] == 512 for config in configs)
 
 
+def test_standard_launcher_forwards_explicit_adapter_schedule(monkeypatch, tmp_path):
+    from scripts.direct_spline_openml_lite import parse_args
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "direct_spline_openml_standard.py",
+            "--output-dir",
+            str(tmp_path),
+            "--adapter-steps",
+            "500",
+            "--adapter-patience",
+            "10",
+            "--validation-interval",
+            "10",
+        ],
+    )
+
+    args = parse_args(default_pipeline="standard", required_pipeline="standard")
+    _validate(args)
+    labels, configs = _configs(args)
+
+    assert labels == ["D"]
+    assert configs[0]["adapter_steps"] == 500
+    assert configs[0]["adapter_patience"] == 10
+    assert configs[0]["validation_interval"] == 10
+
+
 def test_standard_launcher_pipeline_can_be_enforced(monkeypatch, tmp_path):
     from scripts.direct_spline_openml_lite import parse_args
 

@@ -127,6 +127,18 @@ def test_standard_config_uses_all_fit_rows_unless_explicitly_capped():
     assert standard_direct_spline_config(context_cap=128)["train_context_rows"] == 128
 
 
+def test_standard_config_accepts_explicit_adapter_schedule():
+    config = standard_direct_spline_config(
+        adapter_steps=500,
+        adapter_patience=10,
+        validation_interval=10,
+    )
+
+    assert config["adapter_steps"] == 500
+    assert config["adapter_patience"] == 10
+    assert config["validation_interval"] == 10
+
+
 def test_standard_regression_reuses_public_estimator_scaled_labels_exactly():
     rows = 16
     features = pd.DataFrame(

@@ -136,6 +136,9 @@ def standard_direct_spline_config(
     *,
     context_cap: int | None = None,
     train_context_rows: int | None = None,
+    adapter_steps: int | None = None,
+    adapter_patience: int | None = None,
+    validation_interval: int | None = None,
 ) -> dict[str, Any]:
     """Return the default strong-pipeline DirectSpline configuration.
 
@@ -157,10 +160,27 @@ def standard_direct_spline_config(
         if train_context_rows < 0:
             raise ValueError("train_context_rows must be zero (all available rows) or positive")
         config["train_context_rows"] = None if train_context_rows == 0 else int(train_context_rows)
+    for name, value in (
+        ("adapter_steps", adapter_steps),
+        ("adapter_patience", adapter_patience),
+        ("validation_interval", validation_interval),
+    ):
+        if value is not None:
+            if value <= 0:
+                raise ValueError(f"{name} must be positive when provided")
+            config[name] = int(value)
     return config
 
 
-def shared_standard_direct_spline_configs(n_configs: int, *, seed: int, context_cap: int | None = None) -> list[dict[str, Any]]:
+def shared_standard_direct_spline_configs(
+    n_configs: int,
+    *,
+    seed: int,
+    context_cap: int | None = None,
+    adapter_steps: int | None = None,
+    adapter_patience: int | None = None,
+    validation_interval: int | None = None,
+) -> list[dict[str, Any]]:
     """The existing ten random DirectSpline draws, but on the strong path."""
 
     # Import lazily to keep this runner independent of the old runner's
@@ -175,6 +195,15 @@ def shared_standard_direct_spline_configs(n_configs: int, *, seed: int, context_
             if context_cap is None
             else int(context_cap)
         )
+        for name, value in (
+            ("adapter_steps", adapter_steps),
+            ("adapter_patience", adapter_patience),
+            ("validation_interval", validation_interval),
+        ):
+            if value is not None:
+                if value <= 0:
+                    raise ValueError(f"{name} must be positive when provided")
+                config[name] = int(value)
     return configs
 
 
