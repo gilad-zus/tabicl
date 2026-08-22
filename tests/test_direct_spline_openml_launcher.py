@@ -1,5 +1,6 @@
 import json
 from argparse import Namespace
+from pathlib import Path
 
 import pytest
 import torch
@@ -14,8 +15,10 @@ from scripts.direct_spline_openml_lite import (
     _is_cuda_out_of_memory,
     _persisted_cuda_oom_skips,
     _persisted_task_skips,
+    _repair_interrupted_config_summaries,
     _resolve_execution_environment,
     _restore_run_checkpoints,
+    _same_equivalent_hardware_resume_semantics,
     _same_experimental_semantics,
     _validate,
     _write_all_skipped_summary,
@@ -107,6 +110,31 @@ def test_cuda_oom_skip_event_is_logged_clearly(tmp_path, capsys):
     assert record["reason"] == "cuda_out_of_memory"
 
 
+def test_resume_quarantines_only_malformed_config_summaries(tmp_path):
+    config_dir = tmp_path / "raw" / "task_363612_example" / "config_D"
+    config_dir.mkdir(parents=True)
+    broken = config_dir / "config_summary.json"
+    broken.write_text("", encoding="utf-8")
+    valid_dir = tmp_path / "raw" / "task_363613_example" / "config_D"
+    valid_dir.mkdir(parents=True)
+    valid = valid_dir / "config_summary.json"
+    valid_payload = {"run_fingerprint_hash": "fixed", "validation": {}}
+    valid.write_text(json.dumps(valid_payload), encoding="utf-8")
+
+    recovered = _repair_interrupted_config_summaries(tmp_path)
+
+    assert len(recovered) == 1
+    assert not broken.exists()
+    quarantine = Path(recovered[0]["quarantine"])
+    assert quarantine.read_text(encoding="utf-8") == ""
+    assert json.loads(valid.read_text(encoding="utf-8")) == valid_payload
+    audit = [
+        json.loads(line)
+        for line in (tmp_path / "artifact_recoveries.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert audit == recovered
+
+
 def test_compatible_resume_ignores_only_revision_metadata_not_source_or_semantics():
     previous = {
         "experiment_semantics_version": EXPERIMENT_SEMANTICS_VERSION,
@@ -127,6 +155,70 @@ def test_compatible_resume_ignores_only_revision_metadata_not_source_or_semantic
     assert not _same_experimental_semantics(previous, current)
     legacy = {key: value for key, value in previous.items() if key != "experiment_semantics_version"}
     assert not _same_experimental_semantics(legacy, previous)
+
+
+def test_equivalent_hardware_resume_ignores_only_scheduler_allocation_identity():
+    previous = {
+        "experiment_semantics_version": EXPERIMENT_SEMANTICS_VERSION,
+        "repository_revision": "old",
+        "source_sha256": {
+            "scripts/direct_spline_openml_lite.py": "old-launcher",
+            "src/tabicl/_model/tabicl.py": "frozen-model",
+        },
+        "pipeline": "standard",
+        "configs": [{"adapter_steps": 500}],
+        "execution_environment": {
+            "requested_device": "cuda:0",
+            "resolved_device": "cuda:0",
+            "resolution_status": "resolved",
+            "resolution_error": None,
+            "cuda": {
+                "available": True,
+                "torch_cuda_runtime_version": "13.0",
+                "cudnn_version": 90100,
+                "visible_device_count": 1,
+                "selected_hardware": {
+                    "index": 0,
+                    "name": "NVIDIA A100",
+                    "total_memory_bytes": 80_000,
+                    "compute_capability": [8, 0],
+                    "multi_processor_count": 108,
+                    "uuid": "GPU-old",
+                },
+            },
+            "python_hash_seed": {"value": "0", "fixed_before_process_start": True},
+            "numeric_environment": {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"},
+            "precision": {"float32_matmul_precision": "high"},
+        },
+    }
+    current = {
+        **previous,
+        "repository_revision": "new",
+        "source_sha256": {
+            "scripts/direct_spline_openml_lite.py": "new-launcher",
+            "src/tabicl/_model/tabicl.py": "frozen-model",
+        },
+        "execution_environment": {
+            **previous["execution_environment"],
+            "cuda": {
+                **previous["execution_environment"]["cuda"],
+                "visible_device_count": 4,
+                "selected_hardware": {
+                    **previous["execution_environment"]["cuda"]["selected_hardware"],
+                    "index": 3,
+                    "uuid": "GPU-new",
+                },
+            },
+        },
+    }
+
+    assert _same_equivalent_hardware_resume_semantics(previous, current)
+
+    current["execution_environment"]["cuda"]["selected_hardware"]["compute_capability"] = [9, 0]
+    assert not _same_equivalent_hardware_resume_semantics(previous, current)
+    current["execution_environment"]["cuda"]["selected_hardware"]["compute_capability"] = [8, 0]
+    current["source_sha256"]["src/tabicl/_model/tabicl.py"] = "changed-model"
+    assert not _same_equivalent_hardware_resume_semantics(previous, current)
 
 
 def test_source_hashes_cover_public_model_and_spline_implementation():

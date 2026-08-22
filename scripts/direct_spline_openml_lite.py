@@ -1,7 +1,8 @@
-"""Run the TFM-Retouche-style DirectSpline experiment without TabArena.
+"""Run the TFM-Retouche-style DirectSpline experiment with only OpenML.
 
-Only the small OpenML client is required.  It downloads the public TabArena
-v0.1 suite (OpenML suite 457), uses each task's published split
+Only the small OpenML client is required.  By default it downloads the public
+TabArena v0.1 suite (OpenML suite 457); ``--task-id-file`` instead runs an
+explicit frozen OpenML task bank.  In either case it uses each task's published split
 ``repeat=0, fold=0, sample=0`` as the untouched outer test set, and performs
 up to eight guarded, stratified training bags locally.  A classification task
 with fewer than eight rows in its rarest training class uses fewer bags so
@@ -49,6 +50,7 @@ than public-estimator parity.
 from __future__ import annotations
 
 import argparse
+import copy
 import gc
 import hashlib
 import importlib.metadata
@@ -98,6 +100,7 @@ from tabicl._experiments.direct_spline_openml_standard import (
 # selection, or persisted artifact semantics.  Unlike the source hashes, this
 # value is deliberately *not* ignored by --allow-compatible-code-resume.
 EXPERIMENT_SEMANTICS_VERSION = 4
+_RESUME_LAUNCHER_SOURCE = "scripts/direct_spline_openml_lite.py"
 
 
 def parse_args(
@@ -111,7 +114,16 @@ def parse_args(
         "--task-id", action="append", type=int,
         help="OpenML task ID. Repeat for a pilot; omit to run the public 51-task suite.",
     )
-    parser.add_argument("--max-tasks", type=int, default=None, help="Take the first N suite tasks; for smoke tests only.")
+    parser.add_argument(
+        "--task-id-file",
+        type=Path,
+        default=None,
+        help=(
+            "A frozen JSON task bank (with selected_task_ids or task_ids) or a text file of positive "
+            "OpenML task IDs, one per line. Cannot be combined with --task-id."
+        ),
+    )
+    parser.add_argument("--max-tasks", type=int, default=None, help="Take the first N selected tasks; for smoke tests only.")
     parser.add_argument(
         "--max-features",
         type=int,
@@ -200,6 +212,15 @@ def parse_args(
         help=(
             "With --resume, reuse artifacts only when every source hash and experimental setting is "
             "identical and merely the Git revision metadata changed. The revision transition is recorded."
+        ),
+    )
+    parser.add_argument(
+        "--allow-equivalent-hardware-resume",
+        action="store_true",
+        help=(
+            "With --resume, explicitly allow a new Slurm/CUDA allocation only when all model, "
+            "data, numerical-software, and equivalent-GPU properties match. The physical GPU UUID, "
+            "CUDA index, and visible-device count may differ and are recorded in resume provenance."
         ),
     )
     parser.add_argument(
@@ -467,6 +488,70 @@ def _same_experimental_semantics(previous: dict[str, Any], current: dict[str, An
     )
 
 
+def _normalise_equivalent_hardware_environment(environment: Any) -> Any:
+    """Remove Slurm allocation identities while retaining numerical hardware identity."""
+
+    if not isinstance(environment, dict):
+        return environment
+    normalised = copy.deepcopy(environment)
+    cuda = normalised.get("cuda")
+    if not isinstance(cuda, dict):
+        return normalised
+    # These identify a scheduler allocation, not its numerical execution
+    # capability. A new Slurm allocation routinely changes all three.
+    cuda.pop("visible_device_count", None)
+    hardware = cuda.get("selected_hardware")
+    if isinstance(hardware, dict):
+        hardware.pop("index", None)
+        hardware.pop("uuid", None)
+    return normalised
+
+
+def _same_sources_except_resume_launcher(previous: dict[str, Any], current: dict[str, Any]) -> bool:
+    """Permit only the explicit resume-control change in this launcher file."""
+
+    previous_hashes = previous.get("source_sha256")
+    current_hashes = current.get("source_sha256")
+    if not isinstance(previous_hashes, dict) or not isinstance(current_hashes, dict):
+        return False
+    if set(previous_hashes) != set(current_hashes):
+        return False
+    return all(
+        previous_hashes[path] == current_hashes[path]
+        for path in previous_hashes
+        if path != _RESUME_LAUNCHER_SOURCE
+    )
+
+
+def _same_equivalent_hardware_resume_semantics(previous: dict[str, Any], current: dict[str, Any]) -> bool:
+    """Check a Slurm-safe resume without silently accepting model/code changes.
+
+    This is deliberately narrower than a broad fingerprint override: every
+    non-launcher source and every experiment field must match. Only the
+    scheduler allocation identity inside the execution environment may change.
+    """
+
+    if previous.get("experiment_semantics_version") != current.get("experiment_semantics_version"):
+        return False
+    if not _same_sources_except_resume_launcher(previous, current):
+        return False
+    ignored = {"repository_revision", "source_sha256", "execution_environment"}
+    if {key: value for key, value in previous.items() if key not in ignored} != {
+        key: value for key, value in current.items() if key not in ignored
+    }:
+        return False
+    return _normalise_equivalent_hardware_environment(previous.get("execution_environment")) == (
+        _normalise_equivalent_hardware_environment(current.get("execution_environment"))
+    )
+
+
+def _slurm_allocation_provenance() -> dict[str, str | None]:
+    return {
+        name: os.environ.get(name)
+        for name in ("SLURM_JOB_ID", "SLURM_CLUSTER_NAME", "SLURM_JOB_NODELIST", "CUDA_VISIBLE_DEVICES")
+    }
+
+
 def _event_reporter(path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -547,6 +632,61 @@ def _event_reporter(path: Path):
     return report
 
 
+def _interrupted_artifact_path(path: Path) -> Path:
+    """Choose a non-destructive quarantine name beside an interrupted artifact."""
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    for suffix in range(10_000):
+        disambiguator = "" if suffix == 0 else f"-{suffix}"
+        candidate = path.with_name(f"{path.name}.interrupted-{timestamp}{disambiguator}")
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError(f"could not choose a quarantine path for {path}")
+
+
+def _repair_interrupted_config_summaries(output_dir: Path) -> list[dict[str, Any]]:
+    """Quarantine malformed config summaries so --resume can rebuild them.
+
+    Completed bag files are independent checkpoints.  ``config_summary.json``
+    is only the small final aggregation written after every bag finishes.  If
+    an interruption leaves that write malformed, retaining the file makes the
+    normal resume shortcut fail.  Move only malformed summaries aside (never
+    delete them); resume then reuses valid bags and regenerates the aggregate.
+    """
+
+    raw_dir = output_dir / "raw"
+    if not raw_dir.is_dir():
+        return []
+    recovered: list[dict[str, Any]] = []
+    for summary_path in sorted(raw_dir.rglob("config_summary.json")):
+        try:
+            payload = json.loads(summary_path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("top-level JSON value is not an object")
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+            quarantine_path = _interrupted_artifact_path(summary_path)
+            summary_path.replace(quarantine_path)
+            recovered.append(
+                {
+                    "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                    "artifact": str(summary_path),
+                    "quarantine": str(quarantine_path),
+                    "reason": f"{type(error).__name__}: {error}",
+                }
+            )
+    if recovered:
+        recovery_log = output_dir / "artifact_recoveries.jsonl"
+        with recovery_log.open("a", encoding="utf-8") as handle:
+            for item in recovered:
+                handle.write(json.dumps(item, sort_keys=True) + "\n")
+        print(
+            f"Recovered {len(recovered)} interrupted config summary artifact(s); "
+            "resume will rebuild them from the completed bag checkpoints.",
+            flush=True,
+        )
+    return recovered
+
+
 def _configs(args: argparse.Namespace) -> tuple[list[str], list[dict[str, Any]]]:
     if args.pipeline == "standard":
         context_cap = None if args.context_cap == 0 else args.context_cap
@@ -585,6 +725,8 @@ def _validate(args: argparse.Namespace) -> None:
         raise ValueError("random-config and bootstrap counts must be non-negative/positive")
     if args.max_tasks is not None and args.max_tasks <= 0:
         raise ValueError("--max-tasks must be positive")
+    if getattr(args, "task_id", None) and getattr(args, "task_id_file", None) is not None:
+        raise ValueError("--task-id and --task-id-file cannot be combined")
     if args.max_features is not None and args.max_features <= 0:
         raise ValueError("--max-features must be positive")
     if args.context_cap < 0:
@@ -607,6 +749,8 @@ def _validate(args: argparse.Namespace) -> None:
         raise ValueError("outer repeat/fold/sample values must be non-negative")
     if args.allow_compatible_code_resume and not args.resume:
         raise ValueError("--allow-compatible-code-resume requires --resume")
+    if getattr(args, "allow_equivalent_hardware_resume", False) and not args.resume:
+        raise ValueError("--allow-equivalent-hardware-resume requires --resume")
     if args.retry_cuda_oom_skips and not args.resume:
         raise ValueError("--retry-cuda-oom-skips requires --resume")
     if getattr(args, "dry_run", False) and args.resume:
@@ -711,6 +855,63 @@ def _frozen_manifest_task_ids(manifest: dict[str, Any], manifest_path: Path) -> 
     return task_ids
 
 
+def _task_ids_from_file(path: Path) -> list[int]:
+    """Read an explicit, reviewable task bank without silently accepting malformed input."""
+
+    if not path.is_file():
+        raise FileNotFoundError(f"--task-id-file does not exist or is not a file: {path}")
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError(f"--task-id-file must be UTF-8 text: {path}") from error
+    if not text.strip():
+        raise ValueError(f"--task-id-file is empty: {path}")
+
+    raw_ids: Any
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        # Plain text is intentionally narrow: one positive integer per line.
+        # This makes a pasted command or a CSV header fail rather than changing
+        # the benchmark membership silently.
+        raw_ids = [line.strip() for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+    else:
+        if isinstance(payload, list):
+            raw_ids = payload
+        elif isinstance(payload, dict):
+            if payload.get("is_complete") is False:
+                raise ValueError(
+                    f"--task-id-file is an incomplete task bank; rebuild it with the requested number of eligible tasks: {path}"
+                )
+            raw_ids = payload.get("selected_task_ids", payload.get("task_ids"))
+        else:
+            raw_ids = None
+    if not isinstance(raw_ids, list) or not raw_ids:
+        raise ValueError(
+            f"--task-id-file must be a JSON list, a JSON object with selected_task_ids/task_ids, "
+            f"or one task ID per line: {path}"
+        )
+    try:
+        task_ids = [int(task_id) for task_id in raw_ids]
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"--task-id-file contains a non-integer OpenML task ID: {path}") from error
+    if any(task_id <= 0 for task_id in task_ids):
+        raise ValueError(f"--task-id-file task IDs must be positive: {path}")
+    if len(set(task_ids)) != len(task_ids):
+        raise ValueError(f"--task-id-file has duplicate OpenML task IDs: {path}")
+    return task_ids
+
+
+def _task_file_provenance(path: Path) -> dict[str, Any]:
+    """Record the reviewed task-bank bytes outside the prediction fingerprint."""
+
+    return {
+        "path": str(path.resolve()),
+        "bytes": int(path.stat().st_size),
+        "sha256": _sha256_file(path),
+    }
+
+
 def main(
     *,
     default_pipeline: str = "lite",
@@ -733,12 +934,18 @@ def main(
 
     if args.task_id:
         task_ids = list(args.task_id)
+        task_file_provenance = None
+    elif args.task_id_file is not None:
+        task_ids = _task_ids_from_file(args.task_id_file)
+        task_file_provenance = _task_file_provenance(args.task_id_file)
     elif previous is not None:
         # A resume must be reproducible even when OpenML is temporarily down.
         task_ids = _frozen_manifest_task_ids(previous, manifest_path)
+        task_file_provenance = None
         print(f"Resuming with {len(task_ids)} task ID(s) frozen in {manifest_path}; skipping OpenML suite lookup", flush=True)
     else:
         task_ids = tabarena_v0pt1_task_ids()
+        task_file_provenance = None
     if len(set(task_ids)) != len(task_ids):
         raise ValueError("task IDs must be unique")
     if args.max_tasks is not None:
@@ -750,6 +957,15 @@ def main(
     else:
         checkpoint_fingerprints = _resolve_run_checkpoints(args, task_ids)
     device, execution_environment = _resolve_execution_environment(args.device, dry_run=args.dry_run)
+    if previous is not None:
+        # Preserve the prior value exactly on resume.  In particular, an older
+        # explicit-task run recorded the historical suite ID even though it did
+        # not consume the full suite.
+        suite_id = previous.get("immutable_run", {}).get("data_source", {}).get(
+            "suite_id", TABARENA_V0PT1_OPENML_SUITE_ID
+        )
+    else:
+        suite_id = None if args.task_id_file is not None else TABARENA_V0PT1_OPENML_SUITE_ID
     immutable_run = {
         "schema_version": 5,
         "experiment_semantics_version": EXPERIMENT_SEMANTICS_VERSION,
@@ -760,7 +976,7 @@ def main(
         "execution_environment": execution_environment,
         "data_source": {
             "provider": "OpenML",
-            "suite_id": TABARENA_V0PT1_OPENML_SUITE_ID,
+            "suite_id": suite_id,
             "task_ids": task_ids,
             "outer_split": {
                 "repeat": args.outer_repeat,
@@ -815,44 +1031,75 @@ def main(
     if previous is not None:
         if previous.get("run_fingerprint_sha256") != run_fingerprint_hash or previous.get("immutable_run") != immutable_run:
             previous_run = previous.get("immutable_run")
-            if not (
+            compatible_code_resume = (
                 args.allow_compatible_code_resume
                 and isinstance(previous_run, dict)
                 and _same_experimental_semantics(previous_run, immutable_run)
-            ):
+            )
+            compatible_hardware_resume = (
+                args.allow_equivalent_hardware_resume
+                and isinstance(previous_run, dict)
+                and _same_equivalent_hardware_resume_semantics(previous_run, immutable_run)
+            )
+            if not (compatible_code_resume or compatible_hardware_resume):
+                if args.allow_equivalent_hardware_resume:
+                    raise ValueError(
+                        "refusing equivalent-hardware resume: the new allocation differs in model/training "
+                        "semantics or stable GPU/software/precision properties; choose a new --output-dir."
+                    )
                 raise ValueError(
                     "refusing to resume: the existing output directory has a different immutable run fingerprint; "
                     "choose a new --output-dir."
                 )
             prior_hash = str(previous["run_fingerprint_sha256"])
-            provenance_path = args.output_dir / "compatible_code_resumes.jsonl"
-            with provenance_path.open("a", encoding="utf-8") as handle:
-                handle.write(
-                    json.dumps(
-                        {
-                            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-                            "previous_run_fingerprint_sha256": prior_hash,
-                            "previous_source_sha256": previous_run.get("source_sha256"),
-                            "resumed_source_sha256": immutable_run["source_sha256"],
-                            "reason": "explicit revision-metadata-only resume with identical sources",
-                        },
-                        sort_keys=True,
-                    )
-                    + "\n"
+            if compatible_code_resume:
+                provenance_path = args.output_dir / "compatible_code_resumes.jsonl"
+                provenance = {
+                    "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                    "previous_run_fingerprint_sha256": prior_hash,
+                    "previous_source_sha256": previous_run.get("source_sha256"),
+                    "resumed_source_sha256": immutable_run["source_sha256"],
+                    "reason": "explicit revision-metadata-only resume with identical sources",
+                }
+                message = (
+                    "Resuming with identical source hashes and an explicitly recorded Git revision change; "
+                    f"retaining immutable run fingerprint {prior_hash[:12]}"
                 )
-            print(
-                "Resuming with identical source hashes and an explicitly recorded Git revision change; "
-                f"retaining immutable run fingerprint {prior_hash[:12]}",
-                flush=True,
-            )
+            else:
+                provenance_path = args.output_dir / "equivalent_hardware_resumes.jsonl"
+                provenance = {
+                    "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                    "previous_run_fingerprint_sha256": prior_hash,
+                    "proposed_resume_fingerprint_sha256": run_fingerprint_hash,
+                    "previous_repository_revision": previous_run.get("repository_revision"),
+                    "resumed_repository_revision": immutable_run.get("repository_revision"),
+                    "previous_source_sha256": previous_run.get("source_sha256"),
+                    "resumed_source_sha256": immutable_run["source_sha256"],
+                    "previous_execution_environment": previous_run.get("execution_environment"),
+                    "resumed_execution_environment": immutable_run["execution_environment"],
+                    "ignored_allocation_identity_fields": [
+                        "cuda.visible_device_count",
+                        "cuda.selected_hardware.index",
+                        "cuda.selected_hardware.uuid",
+                    ],
+                    "slurm_allocation": _slurm_allocation_provenance(),
+                    "reason": "explicit equivalent-hardware resume across a scheduler allocation",
+                }
+                message = (
+                    "Resuming across an explicitly recorded equivalent Slurm/CUDA allocation; "
+                    f"retaining immutable run fingerprint {prior_hash[:12]}"
+                )
+            with provenance_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(provenance, sort_keys=True) + "\n")
+            print(message, flush=True)
             run_fingerprint_hash = prior_hash
         manifest = previous
     else:
         manifest = {
             "experiment": (
-                "DirectSpline OpenML TabArena-v0.1 standard-ensemble experiment"
+                "DirectSpline OpenML standard-ensemble experiment"
                 if args.pipeline == "standard"
-                else "DirectSpline OpenML TabArena-v0.1 Lite reproduction"
+                else "DirectSpline OpenML Lite experiment"
             ),
             "created_at_utc": datetime.now(timezone.utc).isoformat(),
             "immutable_run": immutable_run,
@@ -863,6 +1110,11 @@ def main(
                 "Those deltas cannot be compared numerically with absolute ELO on TabArena's large published method pool."
             ),
         }
+        if task_file_provenance is not None:
+            # The immutable item is the exact ordered task-ID list above.  The
+            # file digest is retained as human-auditable provenance without
+            # making an absolute path part of the resume fingerprint.
+            manifest["task_selection_file"] = task_file_provenance
         if not args.dry_run:
             args.output_dir.mkdir(parents=True, exist_ok=True)
             _json_dump(manifest_path, manifest)
@@ -877,6 +1129,8 @@ def main(
     print(f"Using immutable run fingerprint {run_fingerprint_hash[:12]} for {len(task_ids)} task(s): {manifest_path}", flush=True)
     if device is None:  # pragma: no cover - real runs fail during resolution above
         raise RuntimeError(f"could not resolve requested execution device {args.device!r}")
+    if args.resume:
+        _repair_interrupted_config_summaries(args.output_dir)
     progress = _event_reporter(args.output_dir / "progress.jsonl")
     task_summaries: list[dict[str, Any]] = []
     persisted_task_skips = _persisted_task_skips(args.output_dir) if args.resume else {}
@@ -1015,13 +1269,47 @@ def main(
                     flush=True,
                 )
             stage = "task_summary"
-            task_summary = summarize_task_tuning(
-                task=task,
-                config_labels=labels,
-                output_dir=args.output_dir,
-                ensemble_rounds=immutable_run["ensemble_rounds"],
-                standard_tabarena=standard_tabarena,
-            )
+            try:
+                task_summary = summarize_task_tuning(
+                    task=task,
+                    config_labels=labels,
+                    output_dir=args.output_dir,
+                    ensemble_rounds=immutable_run["ensemble_rounds"],
+                    standard_tabarena=standard_tabarena,
+                )
+            except json.JSONDecodeError:
+                # A filesystem interruption can surface immediately after the
+                # configuration loop. Reuse the normal resume path: complete
+                # bags are retained and only the final aggregation is rebuilt.
+                recovered = _repair_interrupted_config_summaries(args.output_dir)
+                if not recovered:
+                    raise
+                print(
+                    f"[task={task.task_id}] rebuilding interrupted configuration aggregation from bag checkpoints",
+                    flush=True,
+                )
+                for label, config in zip(labels, configs, strict=True):
+                    run_config(
+                        task=task,
+                        label=label,
+                        config=config,
+                        output_dir=args.output_dir,
+                        bags=args.bags,
+                        protocol_seed=args.protocol_seed,
+                        device=device,
+                        classifier_checkpoint=args.classifier_checkpoint,
+                        regressor_checkpoint=args.regressor_checkpoint,
+                        resume=True,
+                        run_fingerprint_hash=run_fingerprint_hash,
+                        progress=progress,
+                    )
+                task_summary = summarize_task_tuning(
+                    task=task,
+                    config_labels=labels,
+                    output_dir=args.output_dir,
+                    ensemble_rounds=immutable_run["ensemble_rounds"],
+                    standard_tabarena=standard_tabarena,
+                )
         except RuntimeError as error:
             if not _is_cuda_out_of_memory(error):
                 raise
