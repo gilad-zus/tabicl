@@ -155,16 +155,17 @@ def _normalise_task_record(record: dict[str, Any]) -> dict[str, Any] | None:
         "listed_categorical_features": _as_int(
             _first_present(record, ("NumberOfSymbolicFeatures", "number_of_symbolic_features"))
         ),
+        "listed_classes": _as_int(_first_present(record, ("NumberOfClasses", "number_of_classes"))),
     }
 
 
-def _selection_key(candidate: dict[str, Any], *, seed: int) -> str:
+def _selection_key(candidate: dict[str, Any], *, seed: int, namespace: str) -> str:
     return hashlib.sha256(
-        f"{SELECTION_NAMESPACE}:{seed}:{candidate['task_id']}:{candidate['dataset_id']}".encode("utf-8")
+        f"{namespace}:{seed}:{candidate['task_id']}:{candidate['dataset_id']}".encode("utf-8")
     ).hexdigest()
 
 
-def select_distinct_regression_candidates(
+def select_distinct_openml_candidates(
     listed_records: Iterable[dict[str, Any]],
     *,
     excluded_task_ids: set[int],
@@ -173,6 +174,9 @@ def select_distinct_regression_candidates(
     max_total_rows: int,
     max_features: int,
     selection_seed: int,
+    selection_namespace: str = SELECTION_NAMESPACE,
+    min_listed_classes: int | None = None,
+    max_listed_classes: int | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     """Filter public metadata, then rank one task per unseen dataset deterministically.
 
@@ -220,7 +224,16 @@ def select_distinct_regression_candidates(
         if candidate["listed_numerical_features"] == 0:
             rejected["listed_no_numerical_features"] += 1
             continue
-        candidate["selection_key"] = _selection_key(candidate, seed=selection_seed)
+        listed_classes = candidate["listed_classes"]
+        if min_listed_classes is not None and listed_classes is not None and listed_classes < min_listed_classes:
+            rejected["too_few_listed_classes"] += 1
+            continue
+        if max_listed_classes is not None and listed_classes is not None and listed_classes > max_listed_classes:
+            rejected["too_many_listed_classes"] += 1
+            continue
+        candidate["selection_key"] = _selection_key(
+            candidate, seed=selection_seed, namespace=selection_namespace
+        )
         eligible.append(candidate)
 
     # Different OpenML tasks can point at the same dataset with another split.
@@ -235,6 +248,29 @@ def select_distinct_regression_candidates(
         seen_dataset_ids.add(candidate["dataset_id"])
         selected.append(candidate)
     return selected, dict(sorted(rejected.items()))
+
+
+def select_distinct_regression_candidates(
+    listed_records: Iterable[dict[str, Any]],
+    *,
+    excluded_task_ids: set[int],
+    excluded_dataset_ids: set[int],
+    min_total_rows: int,
+    max_total_rows: int,
+    max_features: int,
+    selection_seed: int,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Backward-compatible name for the regression confirmation selector."""
+
+    return select_distinct_openml_candidates(
+        listed_records,
+        excluded_task_ids=excluded_task_ids,
+        excluded_dataset_ids=excluded_dataset_ids,
+        min_total_rows=min_total_rows,
+        max_total_rows=max_total_rows,
+        max_features=max_features,
+        selection_seed=selection_seed,
+    )
 
 
 def _count_trainable_numerical_columns(frame: Any) -> tuple[int, list[str]]:
@@ -316,7 +352,7 @@ def audit_candidate_task(
         "outer_split_hash": str(task.outer_split_hash),
         "selection_key": candidate["selection_key"],
         "listed_metadata": {
-            key: candidate[key]
+            key: candidate.get(key)
             for key in (
                 "listed_dataset_name",
                 "listed_status",
@@ -324,36 +360,86 @@ def audit_candidate_task(
                 "listed_features",
                 "listed_numerical_features",
                 "listed_categorical_features",
+                "listed_classes",
             )
         },
     }
 
 
-def _openml_regression_listing() -> list[dict[str, Any]]:
+def _openml_task_listing(
+    *,
+    task_type_name: str,
+    fallback_task_type: int,
+    problem_description: str,
+) -> list[dict[str, Any]]:
+    """Retrieve one documented OpenML supervised task type as metadata records."""
+
     try:
         import openml
     except ModuleNotFoundError as error:
         raise ModuleNotFoundError(
-            "Install the lightweight OpenML client before building the regression bank: python -m pip install openml"
+            "Install the lightweight OpenML client before building an OpenML task bank: python -m pip install openml"
         ) from error
     try:
         from openml.tasks.task import TaskType
 
-        task_type: Any = TaskType.SUPERVISED_REGRESSION
+        task_type: Any = getattr(TaskType, task_type_name)
     except (ImportError, AttributeError):  # compatible with older OpenML clients.
-        task_type = 2  # OpenML's documented SUPERVISED_REGRESSION value.
+        task_type = fallback_task_type
     table = openml.tasks.list_tasks(task_type=task_type, output_format="dataframe")
     try:
         rows = table.to_dict(orient="records")
     except AttributeError as error:
         raise RuntimeError("OpenML list_tasks did not return the requested dataframe") from error
     if not rows:
-        raise RuntimeError("OpenML returned no supervised-regression tasks")
+        raise RuntimeError(f"OpenML returned no {problem_description} tasks")
     return [dict(row) for row in rows]
 
 
-def _tabarena_regression_dataset_ids(listed_records: Iterable[dict[str, Any]], suite_task_ids: set[int]) -> set[int]:
-    """Recover IDs from the same regression listing without downloading 51 datasets."""
+def _openml_regression_listing() -> list[dict[str, Any]]:
+    return _openml_task_listing(
+        task_type_name="SUPERVISED_REGRESSION",
+        fallback_task_type=2,  # OpenML's documented SUPERVISED_REGRESSION value.
+        problem_description="supervised-regression",
+    )
+
+
+def _dataset_ids_for_task_ids(task_ids: Iterable[int]) -> set[int]:
+    """Resolve every excluded task's underlying dataset without downloading its table.
+
+    A regression and a classification task can reference the same OpenML
+    dataset.  Filtering only the current task-type listing would therefore
+    leave a subtle same-dataset leak in a cross-problem confirmation bank.
+    """
+
+    try:
+        import openml
+    except ModuleNotFoundError as error:
+        raise ModuleNotFoundError("OpenML is required to resolve excluded task dataset IDs") from error
+    dataset_ids: set[int] = set()
+    failures: list[str] = []
+    for task_id in sorted({int(value) for value in task_ids}):
+        try:
+            task = openml.tasks.get_task(task_id)
+            raw_dataset_id = getattr(task, "dataset_id", None)
+            if raw_dataset_id is None:
+                raw_dataset_id = getattr(task, "data_set_id", None)
+            dataset_id = _as_int(raw_dataset_id)
+            if dataset_id is None or dataset_id <= 0:
+                raise ValueError(f"task metadata has invalid dataset ID {raw_dataset_id!r}")
+            dataset_ids.add(dataset_id)
+        except Exception as error:
+            failures.append(f"task={task_id}: {type(error).__name__}: {error}")
+    if failures:
+        raise RuntimeError(
+            "could not resolve every excluded OpenML task to a dataset ID; retry later rather than risk dataset overlap: "
+            + "; ".join(failures)
+        )
+    return dataset_ids
+
+
+def _tabarena_listed_dataset_ids(listed_records: Iterable[dict[str, Any]], suite_task_ids: set[int]) -> set[int]:
+    """Recover suite dataset IDs from an already-downloaded task-type listing."""
 
     result: set[int] = set()
     for raw in listed_records:
@@ -361,6 +447,12 @@ def _tabarena_regression_dataset_ids(listed_records: Iterable[dict[str, Any]], s
         if candidate is not None and candidate["task_id"] in suite_task_ids:
             result.add(candidate["dataset_id"])
     return result
+
+
+def _tabarena_regression_dataset_ids(listed_records: Iterable[dict[str, Any]], suite_task_ids: set[int]) -> set[int]:
+    """Backward-compatible name for the regression task-listing helper."""
+
+    return _tabarena_listed_dataset_ids(listed_records, suite_task_ids)
 
 
 def _atomic_json_dump(path: Path, payload: dict[str, Any], *, overwrite: bool) -> None:
@@ -441,7 +533,7 @@ def main() -> None:
             "kind": "reviewed task-ID file",
             **_file_provenance(args.exclude_task_id_file),
         }
-    suite_dataset_ids = _tabarena_regression_dataset_ids(listed_records, suite_task_ids)
+    suite_dataset_ids = _dataset_ids_for_task_ids(suite_task_ids)
     candidates, metadata_rejections = select_distinct_regression_candidates(
         listed_records,
         excluded_task_ids=suite_task_ids,
@@ -509,7 +601,7 @@ def main() -> None:
             "suite_id": TABARENA_V0PT1_OPENML_SUITE_ID,
             "source": exclusion_source,
             "task_ids": sorted(suite_task_ids),
-            "regression_dataset_ids_from_listing": sorted(suite_dataset_ids),
+            "dataset_ids": sorted(suite_dataset_ids),
         },
         "outer_split": {"repeat": args.outer_repeat, "fold": args.outer_fold, "sample": args.outer_sample},
         "eligibility": {

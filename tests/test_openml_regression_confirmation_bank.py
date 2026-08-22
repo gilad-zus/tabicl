@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import sys
+import types
 from types import SimpleNamespace
 
 import numpy as np
@@ -8,6 +10,7 @@ import pandas as pd
 import pytest
 
 from scripts.build_openml_regression_confirmation_bank import (
+    _dataset_ids_for_task_ids,
     _task_ids_from_exclusion_file,
     audit_candidate_task,
     select_distinct_regression_candidates,
@@ -37,6 +40,20 @@ def test_exclusion_file_reads_the_prior_experiment_manifest(tmp_path):
         json.dumps({"immutable_run": {"data_source": {"task_ids": [11, 12, 13]}}}), encoding="utf-8"
     )
     assert _task_ids_from_exclusion_file(manifest) == [11, 12, 13]
+
+
+def test_exclusion_dataset_lookup_is_cross_problem_and_metadata_only(monkeypatch):
+    calls = []
+
+    def get_task(task_id):
+        calls.append(task_id)
+        return SimpleNamespace(dataset_id={11: 101, 12: 102, 13: 101}[task_id])
+
+    fake_openml = types.SimpleNamespace(tasks=types.SimpleNamespace(get_task=get_task))
+    monkeypatch.setitem(sys.modules, "openml", fake_openml)
+
+    assert _dataset_ids_for_task_ids({13, 11, 12}) == {101, 102}
+    assert calls == [11, 12, 13]
 
 
 def test_candidate_selection_excludes_existing_and_deduplicates_datasets():
