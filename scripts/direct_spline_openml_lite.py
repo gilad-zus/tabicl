@@ -77,6 +77,7 @@ from tabicl._experiments.direct_spline_openml import (
     _json_dump,
     _resolve_checkpoint,
     _resolve_device,
+    _safe_name,
     effective_inner_bag_count,
     load_tabarena_openml_task,
     run_task_config,
@@ -90,16 +91,19 @@ from tabicl._experiments.direct_spline_protocol import (
     shared_random_direct_spline_configs,
 )
 from tabicl._experiments.direct_spline_openml_standard import (
+    run_task_unconditional_full_context_refit_standard,
     run_task_config_standard,
     shared_standard_direct_spline_configs,
     standard_direct_spline_config,
+    summarize_full_context_refit_experiment,
+    summarize_full_context_refit_task,
 )
 
 
 # Increment this whenever a code change can alter predictions, validation
 # selection, or persisted artifact semantics.  Unlike the source hashes, this
 # value is deliberately *not* ignored by --allow-compatible-code-resume.
-EXPERIMENT_SEMANTICS_VERSION = 4
+EXPERIMENT_SEMANTICS_VERSION = 5
 _RESUME_LAUNCHER_SOURCE = "scripts/direct_spline_openml_lite.py"
 
 
@@ -110,6 +114,17 @@ def parse_args(
 ) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--oof-source-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Full-context refit launcher only: optionally read completed standard-pipeline OOF bags from "
+            "this earlier run after each unconditional full-context spline has been fitted and frozen. "
+            "The old bags are used only for a post-hoc validation/test correlation diagnostic; they never "
+            "select a configuration, step count, guard, or prediction."
+        ),
+    )
     parser.add_argument(
         "--task-id", action="append", type=int,
         help="OpenML task ID. Repeat for a pilot; omit to run the public 51-task suite.",
@@ -277,6 +292,7 @@ def _experiment_source_hashes() -> dict[str, str]:
     paths = {
         Path(__file__).resolve(),
         root / "scripts" / "direct_spline_openml_standard.py",
+        root / "scripts" / "direct_spline_openml_full_refit.py",
         root / "src" / "tabicl" / "__init__.py",
     }
     experiment_dir = root / "src" / "tabicl" / "_experiments"
@@ -575,6 +591,27 @@ def _event_reporter(path: Path):
                 f"stale={event['stale_validations']} elapsed={event['elapsed_seconds']:.1f}s",
                 flush=True,
             )
+        elif event_name == "full_refit_started":
+            print(
+                f"[{task_prefix} full-refit config={event['config_label']}] "
+                f"fitting on every outer-training row: steps={event['refit_steps']} "
+                "unconditional; no OOF selection or guard",
+                flush=True,
+            )
+        elif event_name == "full_refit_step":
+            print(
+                f"[{task_prefix} full-refit step={event['step']}] "
+                f"objective={event['objective']:.6g} elapsed={event['elapsed_seconds']:.1f}s",
+                flush=True,
+            )
+        elif event_name == "full_refit_completed":
+            print(
+                f"[{task_prefix} full-refit] complete: "
+                "unconditional "
+                f"steps={event['executed_steps']}/{event['refit_steps']} "
+                f"time={event['train_seconds']:.1f}s peak={event['peak_allocated_gib']:.2f}GiB",
+                flush=True,
+            )
         elif event_name == "bag_completed":
             parity = ""
             if "identity_parity_max_abs_validation" in event:
@@ -718,7 +755,7 @@ def _configs(args: argparse.Namespace) -> tuple[list[str], list[dict[str, Any]]]
     return ["D", *(f"R{index + 1}" for index in range(len(random)))], [default, *random]
 
 
-def _validate(args: argparse.Namespace) -> None:
+def _validate(args: argparse.Namespace, *, full_context_refit: bool = False) -> None:
     if args.bags < 2:
         raise ValueError("--bags must be at least two")
     if args.n_random_configs < 0 or args.bootstrap_rounds <= 0:
@@ -755,6 +792,21 @@ def _validate(args: argparse.Namespace) -> None:
         raise ValueError("--retry-cuda-oom-skips requires --resume")
     if getattr(args, "dry_run", False) and args.resume:
         raise ValueError("--dry-run cannot be combined with --resume; it is a non-persistent preview")
+    if full_context_refit:
+        if args.pipeline != "standard":
+            raise ValueError("the full-context refit experiment requires --pipeline standard")
+        if args.n_random_configs != 0:
+            raise ValueError(
+                "the unconditional full-context refit experiment requires --n-random-configs 0; "
+                "its sole predeclared configuration must not be selected using old OOF results"
+            )
+        if args.context_cap != 0:
+            raise ValueError(
+                "the full-context refit experiment requires --context-cap 0 so its deployment context exactly "
+                "matches ordinary full-outer-training TabICLv2"
+            )
+    elif args.oof_source_dir is not None:
+        raise ValueError("--oof-source-dir is available only in the full-context refit launcher")
 
 
 def _is_cuda_out_of_memory(error: BaseException) -> bool:
@@ -912,13 +964,256 @@ def _task_file_provenance(path: Path) -> dict[str, Any]:
     }
 
 
+def _load_oof_source_manifest(source_dir: Path) -> tuple[Path, dict[str, Any]]:
+    """Load an earlier completed standard DirectSpline run read-only."""
+
+    resolved_dir = source_dir.resolve()
+    manifest_path = resolved_dir / "experiment_manifest.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(
+            "--oof-source-dir must contain a completed DirectSpline experiment_manifest.json: "
+            f"{manifest_path}"
+        )
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"cannot read OOF source manifest {manifest_path}: {error}") from error
+    if not isinstance(payload, dict) or not isinstance(payload.get("immutable_run"), dict):
+        raise ValueError(f"OOF source manifest is missing immutable_run: {manifest_path}")
+    if not isinstance(payload.get("run_fingerprint_sha256"), str):
+        raise ValueError(f"OOF source manifest is missing its run fingerprint: {manifest_path}")
+    return resolved_dir, payload
+
+
+def _source_manifest_task_ids(source_manifest: dict[str, Any], source_dir: Path) -> list[int]:
+    try:
+        raw_ids = source_manifest["immutable_run"]["data_source"]["task_ids"]
+    except (KeyError, TypeError) as error:
+        raise ValueError(f"OOF source has no frozen task IDs: {source_dir}") from error
+    if not isinstance(raw_ids, list) or not raw_ids:
+        raise ValueError(f"OOF source task list is empty or malformed: {source_dir}")
+    try:
+        task_ids = [int(task_id) for task_id in raw_ids]
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"OOF source task list contains a non-integer ID: {source_dir}") from error
+    if len(task_ids) != len(set(task_ids)):
+        raise ValueError(f"OOF source task list has duplicate IDs: {source_dir}")
+    return task_ids
+
+
+def _ordered_subsequence(selected: list[int], source: list[int]) -> bool:
+    """Return whether a pilot selection preserves the frozen source order."""
+
+    cursor = 0
+    for task_id in source:
+        if cursor < len(selected) and selected[cursor] == task_id:
+            cursor += 1
+    return cursor == len(selected)
+
+
+def _oof_source_provenance(source_dir: Path, source_manifest: dict[str, Any]) -> dict[str, Any]:
+    """Store immutable read-only provenance for artifacts owned by another run."""
+
+    manifest_path = source_dir / "experiment_manifest.json"
+    return {
+        "path": str(source_dir),
+        "manifest_sha256": _sha256_file(manifest_path),
+        "run_fingerprint_sha256": source_manifest["run_fingerprint_sha256"],
+        "task_ids": _source_manifest_task_ids(source_manifest, source_dir),
+    }
+
+
+def _same_checkpoint_identities(left: Any, right: Any) -> bool:
+    """Compare immutable checkpoint bytes without pinning a cache location."""
+
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return left == right
+    if set(left) != set(right):
+        return False
+    for kind in left:
+        left_item = left[kind]
+        right_item = right[kind]
+        if left_item is None or right_item is None:
+            if left_item is not None or right_item is not None:
+                return False
+            continue
+        if not isinstance(left_item, dict) or not isinstance(right_item, dict):
+            return False
+        if (
+            left_item.get("bytes") != right_item.get("bytes")
+            or left_item.get("sha256") != right_item.get("sha256")
+        ):
+            return False
+    return True
+
+
+def _validate_oof_source_compatibility(
+    *,
+    source_dir: Path,
+    source_manifest: dict[str, Any],
+    current_immutable_run: dict[str, Any],
+    selected_task_ids: list[int],
+) -> None:
+    """Reject a source whose OOF evidence cannot answer this refit question.
+
+    Source-code hashes intentionally differ: this launcher adds a *new* final
+    all-row refit after the already completed OOF bags.  Everything that could
+    change the OOF split, adapter optimisation, or ordinary baseline must
+    nevertheless match exactly.
+    """
+
+    source = source_manifest["immutable_run"]
+    source_ids = _source_manifest_task_ids(source_manifest, source_dir)
+    differences: list[str] = []
+    if source.get("pipeline") != "standard":
+        differences.append("pipeline is not standard")
+    if source.get("full_context_refit") is True:
+        differences.append("source is already a full-context refit rather than an OOF bag source")
+    if not _ordered_subsequence(selected_task_ids, source_ids):
+        differences.append("selected task IDs are not an ordered subset of the source task bank")
+    source_data = source.get("data_source")
+    current_data = current_immutable_run.get("data_source")
+    if not isinstance(source_data, dict) or not isinstance(current_data, dict):
+        differences.append("missing frozen OpenML data-source metadata")
+    elif source_data.get("outer_split") != current_data.get("outer_split"):
+        differences.append("outer OpenML split differs")
+    comparisons = {
+        "inner_bags": "inner bag count",
+        "inner_bag_policy": "inner bag policy",
+        "protocol_seed": "protocol seed",
+        "config_labels": "configuration labels",
+        "configs": "DirectSpline configuration",
+        "task_eligibility": "task eligibility",
+        "standard_tabarena_baseline": "normal TabICLv2 baseline configuration",
+    }
+    for key, label in comparisons.items():
+        if source.get(key) != current_immutable_run.get(key):
+            differences.append(f"{label} differs")
+    # A dry run deliberately does not resolve checkpoints. A real refit must
+    # prove the weights are identical to the OOF source before it starts.
+    if (
+        current_immutable_run.get("checkpoint_fingerprints") is not None
+        and not _same_checkpoint_identities(
+            source.get("checkpoint_fingerprints"),
+            current_immutable_run.get("checkpoint_fingerprints"),
+        )
+    ):
+        differences.append("checkpoint fingerprint differs")
+    source_standard = source.get("standard_pipeline")
+    current_standard = current_immutable_run.get("standard_pipeline")
+    if not isinstance(source_standard, dict) or not isinstance(current_standard, dict):
+        differences.append("missing standard-pipeline metadata")
+    else:
+        for key in (
+            "context_cap",
+            "requested_train_context_rows",
+            "resolved_train_context_rows",
+            "normal_tabarena_config",
+        ):
+            if source_standard.get(key) != current_standard.get(key):
+                differences.append(f"standard-pipeline {key} differs")
+    if differences:
+        raise ValueError(
+            "refusing to reuse OOF artifacts from "
+            f"{source_dir}: " + "; ".join(differences)
+        )
+
+
+def _validate_oof_source_task_artifacts(
+    *,
+    source_dir: Path,
+    source_manifest: dict[str, Any],
+    task: Any,
+    config_labels: list[str],
+) -> None:
+    """Confirm all selected source bags and their ordinary baseline are complete."""
+
+    source_fingerprint = source_manifest["run_fingerprint_sha256"]
+    missing: list[str] = []
+    for label in config_labels:
+        config_dir = source_dir / "raw" / f"task_{task.task_id}_{_safe_name(task.dataset_name)}" / f"config_{label}"
+        summary_path = config_dir / "config_summary.json"
+        predictions_path = config_dir / "config_predictions.npz"
+        if not summary_path.is_file() or not predictions_path.is_file():
+            missing.append(f"config={label} aggregation")
+            continue
+        try:
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError(f"OOF source has unreadable {summary_path}: {error}") from error
+        if not isinstance(summary, dict) or summary.get("run_fingerprint_hash") != source_fingerprint:
+            raise ValueError(f"OOF source configuration has another run fingerprint: {summary_path}")
+        if summary.get("outer_split_hash") != task.outer_split_hash:
+            raise ValueError(f"OOF source outer split does not match task {task.task_id}: {summary_path}")
+        effective_bags = summary.get("effective_bags")
+        bag_metadata = summary.get("bag_metadata")
+        if not isinstance(effective_bags, int) or effective_bags < 1 or not isinstance(bag_metadata, list):
+            raise ValueError(f"OOF source configuration is missing complete bag metadata: {summary_path}")
+        if len(bag_metadata) != effective_bags:
+            raise ValueError(f"OOF source configuration has incomplete bag metadata: {summary_path}")
+        for bag in range(effective_bags):
+            if not (config_dir / f"bag_{bag}.npz").is_file():
+                missing.append(f"config={label} bag={bag}")
+    baseline_dir = source_dir / "standard_tabarena_baseline" / f"task_{task.task_id}_{_safe_name(task.dataset_name)}"
+    baseline_summary = baseline_dir / "summary.json"
+    baseline_predictions = baseline_dir / "predictions.npz"
+    if not baseline_summary.is_file() or not baseline_predictions.is_file():
+        missing.append("normal TabICLv2 baseline")
+    else:
+        try:
+            baseline = json.loads(baseline_summary.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError(f"OOF source has unreadable {baseline_summary}: {error}") from error
+        if not isinstance(baseline, dict) or baseline.get("run_fingerprint_hash") != source_fingerprint:
+            raise ValueError(f"OOF source baseline has another run fingerprint: {baseline_summary}")
+        if baseline.get("outer_split_hash") != task.outer_split_hash:
+            raise ValueError(f"OOF source baseline outer split does not match task {task.task_id}")
+    if missing:
+        raise FileNotFoundError(
+            f"OOF source task {task.task_id} is incomplete; refusing to mix old and new bags: "
+            + ", ".join(missing)
+        )
+
+
+def _posthoc_oof_source_for_task(
+    *,
+    source_dir: Path | None,
+    source_manifest: dict[str, Any] | None,
+    current_immutable_run: dict[str, Any],
+    selected_task_ids: list[int],
+    task: Any,
+    config_labels: list[str],
+) -> tuple[Path | None, str | None]:
+    """Resolve optional old bags after refit without invalidating the primary arm."""
+
+    if source_dir is None or source_manifest is None:
+        return None, None
+    try:
+        _validate_oof_source_compatibility(
+            source_dir=source_dir,
+            source_manifest=source_manifest,
+            current_immutable_run=current_immutable_run,
+            selected_task_ids=selected_task_ids,
+        )
+        _validate_oof_source_task_artifacts(
+            source_dir=source_dir,
+            source_manifest=source_manifest,
+            task=task,
+            config_labels=config_labels,
+        )
+    except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError) as error:
+        return None, f"{type(error).__name__}: {error}"
+    return source_dir, None
+
+
 def main(
     *,
     default_pipeline: str = "lite",
     required_pipeline: str | None = None,
+    full_context_refit: bool = False,
 ) -> None:
     args = parse_args(default_pipeline=default_pipeline, required_pipeline=required_pipeline)
-    _validate(args)
+    _validate(args, full_context_refit=full_context_refit)
     labels, configs = _configs(args)
     manifest_path = args.output_dir / "experiment_manifest.json"
     previous: dict[str, Any] | None = None
@@ -931,6 +1226,22 @@ def main(
         previous = json.loads(manifest_path.read_text(encoding="utf-8"))
     elif args.resume:
         raise FileNotFoundError(f"cannot safely --resume without {manifest_path}")
+
+    if previous is not None and args.oof_source_dir is None:
+        prior_source = previous.get("immutable_run", {}).get("oof_source")
+        if isinstance(prior_source, dict) and isinstance(prior_source.get("path"), str):
+            args.oof_source_dir = Path(prior_source["path"])
+            print(
+                f"Resuming with frozen post-hoc OOF diagnostic source {args.oof_source_dir}; "
+                "it will not affect full-context training",
+                flush=True,
+            )
+    oof_source_dir: Path | None = None
+    oof_source_manifest: dict[str, Any] | None = None
+    oof_source_provenance: dict[str, Any] | None = None
+    if args.oof_source_dir is not None:
+        oof_source_dir, oof_source_manifest = _load_oof_source_manifest(args.oof_source_dir)
+        oof_source_provenance = _oof_source_provenance(oof_source_dir, oof_source_manifest)
 
     if args.task_id:
         task_ids = list(args.task_id)
@@ -965,7 +1276,11 @@ def main(
             "suite_id", TABARENA_V0PT1_OPENML_SUITE_ID
         )
     else:
-        suite_id = None if args.task_id_file is not None else TABARENA_V0PT1_OPENML_SUITE_ID
+        suite_id = (
+            None
+            if args.task_id_file is not None
+            else TABARENA_V0PT1_OPENML_SUITE_ID
+        )
     immutable_run = {
         "schema_version": 5,
         "experiment_semantics_version": EXPERIMENT_SEMANTICS_VERSION,
@@ -993,6 +1308,11 @@ def main(
             ),
         },
         "inner_bags": args.bags,
+        "inner_bags_role": (
+            "optional historical OOF diagnostic compatibility only"
+            if full_context_refit
+            else "training and validation"
+        ),
         "inner_bag_policy": (
             "Use the requested count unless a classification task's rarest outer-training class is smaller; "
             "then use that smaller valid stratified count so every fitting fold retains at least two rows/class."
@@ -1001,15 +1321,35 @@ def main(
         "bootstrap_rounds": args.bootstrap_rounds,
         "ensemble_rounds": args.ensemble_rounds or max(1, 2 * len(configs)),
         "pipeline": args.pipeline,
+        "full_context_refit": bool(full_context_refit),
+        "oof_source": oof_source_provenance,
         "standard_pipeline": (
             None
             if args.pipeline == "lite"
             else {
-                "identity_context": "all inner-bag fit rows" if args.context_cap == 0 else "stratified capped rows",
+                "identity_context": (
+                    "all outer-training rows"
+                    if full_context_refit
+                    else "all inner-bag fit rows"
+                    if args.context_cap == 0
+                    else "stratified capped rows"
+                ),
                 "context_cap": None if args.context_cap == 0 else args.context_cap,
                 "requested_train_context_rows": args.train_context_rows,
                 "resolved_train_context_rows": configs[0]["train_context_rows"],
                 "normal_tabarena_config": STANDARD_TABICL_CONFIG,
+                "final_deployment": (
+                    None
+                    if not full_context_refit
+                    else {
+                        "context": "all outer-training rows",
+                        "configuration": "sole predeclared DirectSpline configuration",
+                        "schedule": "fixed predeclared adapter_steps; no early stopping or OOF checkpoint selection",
+                        "guard": "none; the spline is evaluated unconditionally on every completed task",
+                        "identity_reference": "the fresh all-row estimator's exact pre-optimisation identity prediction",
+                        "oof_source_role": "optional post-hoc validation/test correlation diagnostic only",
+                    }
+                ),
             }
         ),
         "guard": {
@@ -1017,7 +1357,11 @@ def main(
             "multiclass": "log loss",
             "regression": "MSE",
             "required_relative_improvement": configs[0]["guard_relative_improvement"],
-            "scope": "retouche_per_bag_validation_guard_then_test_ensemble",
+            "scope": (
+                "posthoc_oof_correlation_only_no_deployment_guard"
+                if full_context_refit
+                else "retouche_per_bag_validation_guard_then_test_ensemble"
+            ),
         },
         "leaderboard_metric": {"binary": "1 - ROC-AUC", "multiclass": "log loss", "regression": "RMSE"},
         "config_labels": labels,
@@ -1025,7 +1369,21 @@ def main(
         "classifier_checkpoint_argument": None if args.classifier_checkpoint is None else str(args.classifier_checkpoint.resolve()),
         "regressor_checkpoint_argument": None if args.regressor_checkpoint is None else str(args.regressor_checkpoint.resolve()),
         "checkpoint_fingerprints": checkpoint_fingerprints,
-        "standard_tabarena_baseline": None if args.skip_standard_baseline else STANDARD_TABICL_CONFIG,
+        "standard_tabarena_baseline": (
+            STANDARD_TABICL_CONFIG
+            if full_context_refit or not args.skip_standard_baseline
+            else None
+        ),
+        "full_context_refit_contract": (
+            None
+            if not full_context_refit
+            else {
+                "oof_used_for_training_or_deployment": False,
+                "separate_standard_baseline_run": False,
+                "identity_prediction_source": "same fresh full-context estimator used by the adapted path",
+                "spline_evaluated_for_every_task": True,
+            }
+        ),
     }
     run_fingerprint_hash = _fingerprint(immutable_run)
     if previous is not None:
@@ -1097,7 +1455,9 @@ def main(
     else:
         manifest = {
             "experiment": (
-                "DirectSpline OpenML standard-ensemble experiment"
+                "DirectSpline OpenML standard-ensemble full-context refit experiment"
+                if full_context_refit
+                else "DirectSpline OpenML standard-ensemble experiment"
                 if args.pipeline == "standard"
                 else "DirectSpline OpenML Lite experiment"
             ),
@@ -1192,7 +1552,7 @@ def main(
             continue
         standard_tabarena = None
         baseline_cuda_oom = False
-        if not args.skip_standard_baseline:
+        if not full_context_refit and not args.skip_standard_baseline:
             try:
                 standard_tabarena = run_standard_tabarena_baseline(
                     task=task,
@@ -1229,55 +1589,128 @@ def main(
                 )
                 baseline_cuda_oom = True
         if baseline_cuda_oom:
-            # Release traceback-owned tensors before attempting the smaller
-            # inner-bag fits.  A full-outer baseline OOM must not discard an
-            # otherwise viable paired DirectSpline task.
+            # Release traceback-owned tensors before a normal bag-only run
+            # attempts smaller inner fits.
             gc.collect()
             if device.type == "cuda":
                 torch.cuda.empty_cache()
+            if full_context_refit:
+                # This experiment's primary comparison is intentionally
+                # exact full-row DirectSpline versus exact full-row TabICLv2.
+                # Without the latter there is no valid endpoint, and a final
+                # full-row spline is unlikely to fit where the normal model
+                # itself did not. Record a recoverable hardware skip rather
+                # than silently reporting a different comparison.
+                skipped = {
+                    "task_id": task.task_id,
+                    "dataset_id": task.dataset_id,
+                    "dataset_name": task.dataset_name,
+                    "problem_type": task.problem_type,
+                    "n_features": n_features,
+                    "outer_train_rows": int(len(task.y_train)),
+                    "outer_test_rows": int(len(task.y_test)),
+                    "reason": "cuda_out_of_memory",
+                    "stage": "standard_baseline_required_for_full_context_refit",
+                    "device": str(device),
+                }
+                skipped_tasks.append(skipped)
+                progress({"event": "task_skipped", **skipped})
+                _write_run_progress(args.output_dir, task_summaries, skipped_tasks)
+                continue
 
-        stage = "config_D"
+        stage = "full_context_refit" if full_context_refit else "config_D"
         cuda_oom_skipped = False
         try:
-            for label, config in zip(labels, configs, strict=True):
-                stage = f"config_{label}"
-                effective_bags = effective_inner_bag_count(task, requested_bags=args.bags)
-                print(
-                    f"[task={task.task_id} config={label}] starting/recovering "
-                    f"{effective_bags}/{args.bags} valid stratified bags",
-                    flush=True,
-                )
-                run_config = run_task_config_standard if args.pipeline == "standard" else run_task_config
-                result = run_config(
-                    task=task,
-                    label=label,
-                    config=config,
-                    output_dir=args.output_dir,
-                    bags=args.bags,
-                    protocol_seed=args.protocol_seed,
-                    device=device,
-                    classifier_checkpoint=args.classifier_checkpoint,
-                    regressor_checkpoint=args.regressor_checkpoint,
-                    resume=args.resume,
-                    run_fingerprint_hash=run_fingerprint_hash,
-                    progress=progress,
-                )
-                print(
-                    f"[task={task.task_id} config={label}] "
-                    f"guarded validation={result['validation']['guarded']['deployment_error']:.6g}; "
-                    "outer-test score withheld until validation-only selection is complete",
-                    flush=True,
-                )
+            run_config = run_task_config_standard if args.pipeline == "standard" else run_task_config
+            if not full_context_refit:
+                for label, config in zip(labels, configs, strict=True):
+                    stage = f"config_{label}"
+                    effective_bags = effective_inner_bag_count(task, requested_bags=args.bags)
+                    print(
+                        f"[task={task.task_id} config={label}] starting/recovering "
+                        f"{effective_bags}/{args.bags} valid stratified bags",
+                        flush=True,
+                    )
+                    result = run_config(
+                        task=task,
+                        label=label,
+                        config=config,
+                        output_dir=args.output_dir,
+                        bags=args.bags,
+                        protocol_seed=args.protocol_seed,
+                        device=device,
+                        classifier_checkpoint=args.classifier_checkpoint,
+                        regressor_checkpoint=args.regressor_checkpoint,
+                        resume=args.resume,
+                        run_fingerprint_hash=run_fingerprint_hash,
+                        progress=progress,
+                    )
+                    print(
+                        f"[task={task.task_id} config={label}] "
+                        f"guarded validation={result['validation']['guarded']['deployment_error']:.6g}; "
+                        "outer-test score withheld until validation-only selection is complete",
+                        flush=True,
+                    )
             stage = "task_summary"
             try:
-                task_summary = summarize_task_tuning(
-                    task=task,
-                    config_labels=labels,
-                    output_dir=args.output_dir,
-                    ensemble_rounds=immutable_run["ensemble_rounds"],
-                    standard_tabarena=standard_tabarena,
-                )
+                if full_context_refit:
+                    refit_result = run_task_unconditional_full_context_refit_standard(
+                        task=task,
+                        config_labels=labels,
+                        configs=configs,
+                        output_dir=args.output_dir,
+                        protocol_seed=args.protocol_seed,
+                        device=device,
+                        classifier_checkpoint=args.classifier_checkpoint,
+                        regressor_checkpoint=args.regressor_checkpoint,
+                        resume=args.resume,
+                        run_fingerprint_hash=run_fingerprint_hash,
+                        progress=progress,
+                    )
+                    # The primary full-context prediction is now frozen. Only
+                    # at this point may historical OOF bags be opened, and
+                    # only to test whether their validation signal predicted
+                    # the unconditional full-context outcome.
+                    task_oof_source, task_oof_error = _posthoc_oof_source_for_task(
+                        source_dir=oof_source_dir,
+                        source_manifest=oof_source_manifest,
+                        current_immutable_run=immutable_run,
+                        selected_task_ids=task_ids,
+                        task=task,
+                        config_labels=labels,
+                    )
+                    if task_oof_source is not None:
+                        print(
+                            f"[task={task.task_id}] loading old OOF bags only for post-hoc correlation",
+                            flush=True,
+                        )
+                    elif task_oof_error is not None:
+                        print(
+                            f"[task={task.task_id}] old OOF diagnostic unavailable; "
+                            "keeping the completed unconditional full-refit result",
+                            flush=True,
+                        )
+                    task_summary = summarize_full_context_refit_task(
+                        task=task,
+                        output_dir=args.output_dir,
+                        refit_result=refit_result,
+                        oof_source_dir=task_oof_source,
+                        oof_diagnostic_unavailable_reason=task_oof_error,
+                    )
+                else:
+                    task_summary = summarize_task_tuning(
+                        task=task,
+                        config_labels=labels,
+                        output_dir=args.output_dir,
+                        ensemble_rounds=immutable_run["ensemble_rounds"],
+                        standard_tabarena=standard_tabarena,
+                    )
             except json.JSONDecodeError:
+                if oof_source_dir is not None:
+                    raise RuntimeError(
+                        "OOF source contains a malformed aggregation; it is read-only and cannot be repaired "
+                        "by this refit run"
+                    ) from None
                 # A filesystem interruption can surface immediately after the
                 # configuration loop. Reuse the normal resume path: complete
                 # bags are retained and only the final aggregation is rebuilt.
@@ -1303,13 +1736,43 @@ def main(
                         run_fingerprint_hash=run_fingerprint_hash,
                         progress=progress,
                     )
-                task_summary = summarize_task_tuning(
-                    task=task,
-                    config_labels=labels,
-                    output_dir=args.output_dir,
-                    ensemble_rounds=immutable_run["ensemble_rounds"],
-                    standard_tabarena=standard_tabarena,
-                )
+                if full_context_refit:
+                    refit_result = run_task_unconditional_full_context_refit_standard(
+                        task=task,
+                        config_labels=labels,
+                        configs=configs,
+                        output_dir=args.output_dir,
+                        protocol_seed=args.protocol_seed,
+                        device=device,
+                        classifier_checkpoint=args.classifier_checkpoint,
+                        regressor_checkpoint=args.regressor_checkpoint,
+                        resume=True,
+                        run_fingerprint_hash=run_fingerprint_hash,
+                        progress=progress,
+                    )
+                    task_oof_source, task_oof_error = _posthoc_oof_source_for_task(
+                        source_dir=oof_source_dir,
+                        source_manifest=oof_source_manifest,
+                        current_immutable_run=immutable_run,
+                        selected_task_ids=task_ids,
+                        task=task,
+                        config_labels=labels,
+                    )
+                    task_summary = summarize_full_context_refit_task(
+                        task=task,
+                        output_dir=args.output_dir,
+                        refit_result=refit_result,
+                        oof_source_dir=task_oof_source,
+                        oof_diagnostic_unavailable_reason=task_oof_error,
+                    )
+                else:
+                    task_summary = summarize_task_tuning(
+                        task=task,
+                        config_labels=labels,
+                        output_dir=args.output_dir,
+                        ensemble_rounds=immutable_run["ensemble_rounds"],
+                        standard_tabarena=standard_tabarena,
+                    )
         except RuntimeError as error:
             if not _is_cuda_out_of_memory(error):
                 raise
@@ -1348,14 +1811,24 @@ def main(
         task_summaries.append(task_summary)
         _write_run_progress(args.output_dir, task_summaries, skipped_tasks)
     if task_summaries:
-        summary = summarize_experiment(
-            task_summaries=task_summaries,
-            output_dir=args.output_dir,
-            bootstrap_rounds=args.bootstrap_rounds,
-            bootstrap_seed=args.protocol_seed,
-            skipped_tasks=skipped_tasks,
-            task_eligibility=immutable_run["task_eligibility"],
-        )
+        if full_context_refit:
+            summary = summarize_full_context_refit_experiment(
+                task_summaries=task_summaries,
+                output_dir=args.output_dir,
+                bootstrap_rounds=args.bootstrap_rounds,
+                bootstrap_seed=args.protocol_seed,
+                skipped_tasks=skipped_tasks,
+                task_eligibility=immutable_run["task_eligibility"],
+            )
+        else:
+            summary = summarize_experiment(
+                task_summaries=task_summaries,
+                output_dir=args.output_dir,
+                bootstrap_rounds=args.bootstrap_rounds,
+                bootstrap_seed=args.protocol_seed,
+                skipped_tasks=skipped_tasks,
+                task_eligibility=immutable_run["task_eligibility"],
+            )
     else:
         summary = _write_all_skipped_summary(
             args.output_dir,

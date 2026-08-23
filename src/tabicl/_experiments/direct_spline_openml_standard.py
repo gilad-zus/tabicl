@@ -21,6 +21,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from contextlib import nullcontext
 from dataclasses import dataclass
+import csv
 import gc
 import json
 from pathlib import Path
@@ -41,15 +42,20 @@ from tabicl._experiments.direct_spline_openml import (
     OpenMLTaskData,
     _bag_splits,
     _config_dir,
+    _candidate_metric_bundle,
     _cpu_state_dict,
     _emit,
     _json_dump,
     _json_load,
     _load_bag,
     _metric_bundle,
+    _paired_comparison_summary,
     _prediction_shape,
+    _relative_error_change,
+    _safe_name,
     _save_bag,
     _seed,
+    _standard_baseline_dir,
     _set_frozen_autograd_routing,
     effective_inner_bag_count,
     load_frozen_backbone,
@@ -1732,4 +1738,653 @@ def run_task_config_standard(
     del backbone, checkpoint_path
     if device.type == "cuda":
         torch.cuda.empty_cache()
+    return summary
+
+
+def _full_context_refit_dir(
+    output_dir: Path,
+    task: OpenMLTaskData,
+    label: str,
+) -> Path:
+    """Return the resumable artifact directory for one all-row refit."""
+
+    return _config_dir(output_dir, task, label) / "full_context_refit"
+
+
+def _fit_full_context_refit_standard(
+    *,
+    task: OpenMLTaskData,
+    config: dict[str, Any],
+    refit_steps: int,
+    protocol_seed: int,
+    backbone: TabICL,
+    device: torch.device,
+    progress: Any,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    """Fit a fresh DirectSpline on every outer-training row exactly once.
+
+    The caller supplies the step budget frozen in the experiment manifest.
+    This function deliberately receives no test labels: it is safe to use test
+    *features* for the final prediction and parity audit, but no test metric is
+    computed until the caller has frozen this result.
+    """
+
+    if refit_steps < 0:
+        raise ValueError("refit_steps must be non-negative")
+    started = time.perf_counter()
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    full_indices = np.arange(len(task.y_train), dtype=int)
+    bundle = _fit_standard_bag(
+        task=task,
+        fit_indices=full_indices,
+        config=config,
+        protocol_seed=protocol_seed,
+        # This is a separate deterministic initialization from any OOF bag.
+        # It cannot affect context selection when every fit row is retained.
+        bag=-1,
+        backbone=backbone,
+        device=device,
+    )
+    adapter_seed = _seed(int(config["random_state"]), task.task_id, -1, 202)
+    torch.manual_seed(adapter_seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(adapter_seed)
+    adapters = _make_adapters(bundle, config, device)
+    parity_test, parity_reference_test, public_parity_test = _identity_view_parity(
+        bundle=bundle,
+        adapters=adapters,
+        query_x=task.x_test,
+        device=device,
+        progress=progress,
+        task_id=task.task_id,
+        bag=-1,
+        split="full_context_refit_test",
+    )
+    identity_test = _normal_prediction(
+        bundle=bundle,
+        query_x=task.x_test,
+        context_indices=bundle.support_indices,
+        adapters=None,
+        device=device,
+    )
+    training_context_sizes: list[int] = []
+    first_objective = final_objective = float("nan")
+    executed_steps = 0
+    no_trainable_numerical_features = adapters is None
+    if adapters is None or refit_steps == 0:
+        adapted_test = identity_test.copy()
+    else:
+        optimizer = _optimizer(adapters, config)
+        episode_rng = np.random.default_rng(
+            _seed(int(config["random_state"]), task.task_id, -1, 203)
+        )
+        for step in range(1, refit_steps + 1):
+            configured_context_rows = config.get("train_context_rows")
+            context_row_limit = (
+                max(1, bundle.fit_labels.size - int(config["query_batch_rows"]))
+                if configured_context_rows is None
+                else int(configured_context_rows)
+            )
+            context_rows, query_rows = sample_episode_indices(
+                bundle.fit_labels,
+                problem_type=task.problem_type,
+                context_rows=context_row_limit,
+                query_rows=int(config["query_batch_rows"]),
+                rng=episode_rng,
+            )
+            training_context_sizes.append(int(context_rows.size))
+            optimizer.zero_grad(set_to_none=True)
+            output = _training_logits(
+                bundle=bundle,
+                adapters=adapters,
+                context_indices=context_rows,
+                query_indices=query_rows,
+                device=device,
+            )
+            target = torch.as_tensor(bundle.fit_labels[query_rows], device=device)
+            if task.problem_type == "regression":
+                objective = F.mse_loss(output.flatten(), target.float().flatten())
+            else:
+                objective = F.cross_entropy(
+                    output / float(bundle.estimator.softmax_temperature), target.long().flatten()
+                )
+            if not torch.isfinite(objective):
+                _emit(
+                    progress,
+                    event="full_refit_nonfinite_objective",
+                    task_id=task.task_id,
+                    step=step,
+                )
+                del output, target, objective
+                break
+            if step == 1:
+                first_objective = float(objective.detach())
+            objective.backward()
+            torch.nn.utils.clip_grad_norm_(adapters.parameters(), float(config["grad_clip"]))
+            optimizer.step()
+            final_objective = float(objective.detach())
+            executed_steps = step
+            del output, target, objective
+            if step % int(config["validation_interval"]) == 0 or step == refit_steps:
+                _emit(
+                    progress,
+                    event="full_refit_step",
+                    task_id=task.task_id,
+                    step=step,
+                    objective=final_objective,
+                    elapsed_seconds=float(time.perf_counter() - started),
+                )
+        del optimizer
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        adapted_test = _normal_prediction(
+            bundle=bundle,
+            query_x=task.x_test,
+            context_indices=bundle.support_indices,
+            adapters=adapters,
+            device=device,
+        )
+    peak_gib = 0.0 if device.type != "cuda" else torch.cuda.max_memory_allocated(device) / 2**30
+    metadata = {
+        "fit_rows": int(full_indices.size),
+        "support_rows": int(bundle.support_indices.size),
+        "n_features": int(task.x_train.shape[1]),
+        "n_numerical_features": int(bundle.numerical_indices.size),
+        "no_trainable_numerical_features": bool(no_trainable_numerical_features),
+        "normal_estimators": int(STANDARD_TABICL_CONFIG["n_estimators"]),
+        "context_policy": (
+            "all_outer_training_rows"
+            if bundle.support_indices.size == bundle.fit_labels.size
+            else "stratified_context_cap"
+        ),
+        "identity_parity_max_abs_test": float(parity_test),
+        "identity_parity_reference_test": parity_reference_test,
+        "public_path_input_parity_checked_test": bool(public_parity_test),
+        "public_path_input_parity_passed": True if public_parity_test else None,
+        "fresh_spline_view_identity_passed": bool(adapters is None or parity_test == 0.0),
+        "adapter_seed": int(adapter_seed),
+        "adapter_refit_steps_requested": int(refit_steps),
+        "adapter_steps_executed": int(executed_steps),
+        "adapter_first_objective": first_objective,
+        "adapter_final_objective": final_objective,
+        "adapter_configured_train_context_rows": config.get("train_context_rows"),
+        "adapter_train_context_policy": (
+            "all_non_query_outer_training_rows"
+            if config.get("train_context_rows") is None
+            else "sampled_context_cap"
+        ),
+        "adapter_observed_train_context_rows_min": (
+            None if not training_context_sizes else int(min(training_context_sizes))
+        ),
+        "adapter_observed_train_context_rows_max": (
+            None if not training_context_sizes else int(max(training_context_sizes))
+        ),
+        "adapter_observed_train_context_rows_mean": (
+            None if not training_context_sizes else float(np.mean(training_context_sizes))
+        ),
+        "adapter_deployment_context_rows": int(bundle.support_indices.size),
+        "adapter_train_to_deployment_context_ratio": (
+            None
+            if not training_context_sizes
+            else float(np.mean(training_context_sizes) / bundle.support_indices.size)
+        ),
+        "train_seconds": float(time.perf_counter() - started),
+        "peak_allocated_gib": float(peak_gib),
+    }
+    del adapters, bundle
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    return identity_test, adapted_test, metadata
+
+
+def _load_prediction(path: Path, key: str) -> np.ndarray:
+    with np.load(path, allow_pickle=False) as artifact:
+        return np.asarray(artifact[key])
+
+
+def run_task_unconditional_full_context_refit_standard(
+    *,
+    task: OpenMLTaskData,
+    config_labels: list[str],
+    configs: list[dict[str, Any]],
+    output_dir: Path,
+    protocol_seed: int,
+    device: torch.device,
+    classifier_checkpoint: str | Path | None,
+    regressor_checkpoint: str | Path | None,
+    resume: bool,
+    run_fingerprint_hash: str,
+    progress: Any = None,
+) -> dict[str, Any]:
+    """Train the predeclared DirectSpline on every outer-training row.
+
+    This is the raw headroom experiment. There is no OOF configuration
+    selection, checkpoint selection, or deployment guard. The sole declared
+    configuration and its full ``adapter_steps`` budget are frozen in the run
+    manifest before any outer-test label is scored.
+    """
+
+    if len(config_labels) != 1 or len(configs) != 1:
+        raise ValueError(
+            "unconditional full-context refit requires exactly one predeclared configuration"
+        )
+    selected_label = config_labels[0]
+    selected_config = configs[0]
+    refit_steps = int(selected_config["adapter_steps"])
+    refit_dir = _full_context_refit_dir(output_dir, task, selected_label)
+    refit_summary_path = refit_dir / "summary.json"
+    refit_predictions_path = refit_dir / "predictions.npz"
+    if resume and refit_summary_path.is_file() and refit_predictions_path.is_file():
+        result = _json_load(refit_summary_path)
+        if result.get("run_fingerprint_hash") != run_fingerprint_hash:
+            raise RuntimeError(
+                f"refusing to resume {refit_dir}: full-context refit artifacts use another immutable fingerprint"
+            )
+        if result.get("selection", {}).get("mode") != "predeclared_fixed_schedule_no_guard":
+            raise RuntimeError(f"refusing to reuse an OOF-selected refit as an unconditional refit: {refit_dir}")
+        _emit(progress, event="full_refit_reused", task_id=task.task_id, config_label=selected_label)
+        return result
+
+    refit_dir.mkdir(parents=True, exist_ok=True)
+    _emit(
+        progress,
+        event="full_refit_started",
+        task_id=task.task_id,
+        config_label=selected_label,
+        refit_steps=refit_steps,
+        selection_mode="predeclared_fixed_schedule_no_guard",
+    )
+    backbone, checkpoint_path, checkpoint_metadata = load_frozen_backbone(
+        problem_type=task.problem_type,
+        device=device,
+        classifier_checkpoint=classifier_checkpoint,
+        regressor_checkpoint=regressor_checkpoint,
+    )
+    identity_test, adapted_test, metadata = _fit_full_context_refit_standard(
+        task=task,
+        config=selected_config,
+        refit_steps=refit_steps,
+        protocol_seed=protocol_seed,
+        backbone=backbone,
+        device=device,
+        progress=progress,
+    )
+    # Preserve the historical key only as an explicit no-guard alias. The
+    # unconditional spline is deployed on every task regardless of any old
+    # bag validation result.
+    np.savez_compressed(
+        refit_predictions_path,
+        identity_test=identity_test,
+        adapted_test=adapted_test,
+        guarded_test=adapted_test,
+    )
+    result = {
+        "task_id": task.task_id,
+        "dataset_id": task.dataset_id,
+        "dataset_name": task.dataset_name,
+        "problem_type": task.problem_type,
+        "n_classes": task.n_classes,
+        "outer_split_hash": task.outer_split_hash,
+        "run_fingerprint_hash": run_fingerprint_hash,
+        "selected_config_label": selected_label,
+        "selected_config": selected_config,
+        "selection": {
+            "mode": "predeclared_fixed_schedule_no_guard",
+            "config_selection": "sole configuration frozen before the run",
+            "refit_steps": {
+                "source": "predeclared adapter_steps",
+                "value": refit_steps,
+            },
+            "deployment_guard_applied": False,
+            "oof_used_for_training_or_deployment": False,
+        },
+        "checkpoint": checkpoint_metadata,
+        "identity_definition": (
+            "The same all-outer-training-row normal TabICLv2 estimator and context used by the adapted path, "
+            "with a fresh DirectSpline audited as exact identity before optimisation."
+        ),
+        "refit": metadata,
+        "test_metrics_deferred_to_task_summary": True,
+        "outer_test_policy": (
+            "Test labels were not used for configuration selection, schedule selection, spline optimisation, "
+            "or deployment. The predeclared spline is evaluated on every task."
+        ),
+    }
+    _json_dump(refit_summary_path, result)
+    _emit(
+        progress,
+        event="full_refit_completed",
+        task_id=task.task_id,
+        config_label=selected_label,
+        refit_steps=refit_steps,
+        executed_steps=int(metadata["adapter_steps_executed"]),
+        guard_applied=False,
+        train_seconds=float(metadata["train_seconds"]),
+        peak_allocated_gib=float(metadata["peak_allocated_gib"]),
+    )
+    del backbone, checkpoint_path
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    return result
+
+
+def summarize_full_context_refit_task(
+    *,
+    task: OpenMLTaskData,
+    output_dir: Path,
+    refit_result: dict[str, Any],
+    oof_source_dir: Path | None = None,
+    oof_diagnostic_unavailable_reason: str | None = None,
+) -> dict[str, Any]:
+    """Score the frozen unconditional refit, then optionally inspect old OOF evidence."""
+
+    selected_label = str(refit_result["selected_config_label"])
+    if oof_source_dir is not None and oof_diagnostic_unavailable_reason is not None:
+        raise ValueError("an OOF diagnostic cannot be both available and unavailable")
+    if refit_result.get("selection", {}).get("mode") != "predeclared_fixed_schedule_no_guard":
+        raise RuntimeError("refusing to report an OOF-selected refit as the unconditional experiment")
+    refit_prediction_path = _full_context_refit_dir(output_dir, task, selected_label) / "predictions.npz"
+    full_refit_identity = _load_prediction(refit_prediction_path, "identity_test")
+    full_refit_raw = _load_prediction(refit_prediction_path, "adapted_test")
+    identity_metrics = _metric_bundle(
+        task.problem_type, task.y_test, full_refit_identity, task.n_classes
+    )
+    raw_metrics = _candidate_metric_bundle(
+        task.problem_type, task.y_test, full_refit_raw, task.n_classes
+    )
+    identity_deployment_error = float(identity_metrics["deployment_error"])
+    raw_deployment_error = float(raw_metrics["deployment_error"])
+    full_refit_relative_improvement = float(
+        (identity_deployment_error - raw_deployment_error)
+        / max(abs(identity_deployment_error), 1e-12)
+    )
+    required_improvement = float(refit_result["selected_config"]["guard_relative_improvement"])
+
+    oof_diagnostic: dict[str, Any] | None = None
+    bagged_identity_metrics: dict[str, Any] | None = None
+    bagged_adapted_metrics: dict[str, Any] | None = None
+    bagged_guarded_metrics: dict[str, Any] | None = None
+    if oof_source_dir is not None:
+        config_dir = _config_dir(oof_source_dir, task, selected_label)
+        config_summary = _json_load(config_dir / "config_summary.json")
+        config_prediction_path = config_dir / "config_predictions.npz"
+        historical_standard_path = _standard_baseline_dir(oof_source_dir, task) / "predictions.npz"
+        historical_standard = _load_prediction(historical_standard_path, "prediction")
+        bagged_identity = _load_prediction(config_prediction_path, "identity_test")
+        bagged_adapted = _load_prediction(config_prediction_path, "adapted_test")
+        bagged_guarded = _load_prediction(config_prediction_path, "guarded_test")
+        oof_identity_error = float(config_summary["validation"]["identity"]["deployment_error"])
+        oof_adapted_error = float(config_summary["validation"]["adapted"]["deployment_error"])
+        historical_guard = choose_identity_guard(
+            identity_error=oof_identity_error,
+            adapted_error=oof_adapted_error,
+            required_relative_improvement=required_improvement,
+        )
+        historical_identity_difference = _difference_summary(
+            full_refit_identity, historical_standard
+        )
+        historical_identity_exact = bool(
+            historical_identity_difference.get("shape_match") is True
+            and historical_identity_difference.get("nonfinite_differences") == 0
+            and float(historical_identity_difference.get("max_abs", float("inf"))) == 0.0
+        )
+        oof_diagnostic = {
+            "role": "posthoc_correlation_only",
+            "loaded_after_full_refit_prediction_frozen": True,
+            "used_for_configuration_selection": False,
+            "used_for_step_selection": False,
+            "used_as_deployment_guard": False,
+            "validation_identity_deployment_error": oof_identity_error,
+            "validation_adapted_deployment_error": oof_adapted_error,
+            "validation_relative_improvement": float(historical_guard.relative_improvement),
+            "historical_guard_selected_adapted": bool(historical_guard.use_adapted),
+            "guard_required_relative_improvement": required_improvement,
+            "full_refit_test_deployment_relative_improvement": full_refit_relative_improvement,
+            "full_refit_test_improved": bool(raw_deployment_error < identity_deployment_error),
+            "full_refit_test_met_historical_guard_threshold": bool(
+                full_refit_relative_improvement >= required_improvement
+            ),
+            "full_refit_identity_vs_historical_standard": historical_identity_difference,
+            "historical_standard_is_exact_current_identity": historical_identity_exact,
+        }
+        bagged_identity_metrics = _metric_bundle(
+            task.problem_type, task.y_test, bagged_identity, task.n_classes
+        )
+        bagged_adapted_metrics = _candidate_metric_bundle(
+            task.problem_type, task.y_test, bagged_adapted, task.n_classes
+        )
+        bagged_guarded_metrics = _candidate_metric_bundle(
+            task.problem_type, task.y_test, bagged_guarded, task.n_classes
+        )
+    result = {
+        "report_schema_version": 2,
+        "outer_test_scored_after_predeclared_full_refit": True,
+        "oof_loaded_only_after_full_refit_prediction_frozen": oof_source_dir is not None,
+        "task_id": task.task_id,
+        "dataset_id": task.dataset_id,
+        "dataset_name": task.dataset_name,
+        "problem_type": task.problem_type,
+        "n_classes": task.n_classes,
+        "outer_split_hash": task.outer_split_hash,
+        "pipeline": "standard_ensemble_unconditional_full_context_refit",
+        "full_context_identity": identity_metrics,
+        "full_refit_identity": identity_metrics,
+        "full_refit_raw": raw_metrics,
+        # Kept only for readers of the earlier report schema. It is explicitly
+        # an alias, not a validation-gated arm.
+        "full_refit_guarded": raw_metrics,
+        "reported_arm_aliases": {"full_refit_guarded": "full_refit_raw"},
+        "deployment_guard_applied": False,
+        "full_refit_test_deployment_relative_improvement": full_refit_relative_improvement,
+        "bagged_identity": bagged_identity_metrics,
+        "bagged_adapted": bagged_adapted_metrics,
+        "bagged_guarded": bagged_guarded_metrics,
+        "oof_validation_diagnostic": oof_diagnostic,
+        "oof_validation_diagnostic_unavailable_reason": oof_diagnostic_unavailable_reason,
+        "full_refit": refit_result,
+        "comparison_note": (
+            "full_refit_raw uses the same fresh all-outer-training-row estimator and context as "
+            "full_context_identity; the only learned difference is DirectSpline. The spline is used on every "
+            "task. Any oof_validation_diagnostic or bagged_* value was loaded only after this prediction was "
+            "frozen and cannot affect it."
+        ),
+    }
+    path = output_dir / "full_context_refit_task_summaries" / (
+        f"task_{task.task_id}_{_safe_name(task.dataset_name)}.json"
+    )
+    _json_dump(path, result)
+    return result
+
+
+def _average_ranks(values: np.ndarray) -> np.ndarray:
+    """Return deterministic average ranks without adding a SciPy dependency."""
+
+    order = np.argsort(values, kind="mergesort")
+    ranks = np.empty(values.size, dtype=float)
+    start = 0
+    while start < values.size:
+        stop = start + 1
+        while stop < values.size and values[order[stop]] == values[order[start]]:
+            stop += 1
+        ranks[order[start:stop]] = 0.5 * (start + stop - 1) + 1.0
+        start = stop
+    return ranks
+
+
+def _finite_correlation(left: np.ndarray, right: np.ndarray) -> dict[str, Any]:
+    finite = np.isfinite(left) & np.isfinite(right)
+    x = left[finite]
+    y = right[finite]
+    result: dict[str, Any] = {"n": int(x.size), "pearson": None, "spearman": None}
+    if x.size < 2:
+        return result
+    if float(np.std(x)) > 0.0 and float(np.std(y)) > 0.0:
+        result["pearson"] = float(np.corrcoef(x, y)[0, 1])
+    x_rank = _average_ranks(x)
+    y_rank = _average_ranks(y)
+    if float(np.std(x_rank)) > 0.0 and float(np.std(y_rank)) > 0.0:
+        result["spearman"] = float(np.corrcoef(x_rank, y_rank)[0, 1])
+    return result
+
+
+def summarize_full_context_refit_experiment(
+    *,
+    task_summaries: list[dict[str, Any]],
+    output_dir: Path,
+    bootstrap_rounds: int,
+    bootstrap_seed: int,
+    skipped_tasks: list[dict[str, Any]] | None = None,
+    task_eligibility: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Report direct all-row-refit comparisons against ordinary TabICLv2."""
+
+    if not task_summaries:
+        raise ValueError("cannot summarise an empty full-context refit experiment")
+    skipped_tasks = [] if skipped_tasks is None else skipped_tasks
+    reference = np.asarray(
+        [float(item["full_context_identity"]["benchmark_error"]) for item in task_summaries],
+        dtype=float,
+    )
+    problem_types = np.asarray([str(item["problem_type"]) for item in task_summaries], dtype=object)
+    arms = ("full_refit_raw",)
+    paired_results: dict[str, dict[str, Any]] = {}
+    for offset, arm in enumerate(arms):
+        candidate = np.asarray(
+            [float(item[arm]["benchmark_error"]) for item in task_summaries], dtype=float
+        )
+        paired_results[arm] = _paired_comparison_summary(
+            reference=reference,
+            candidate=candidate,
+            problem_types=problem_types,
+            bootstrap_rounds=bootstrap_rounds,
+            bootstrap_seed=bootstrap_seed + offset,
+            reference_label="full_outer_training_standard_tabicl",
+            candidate_label=arm,
+        )
+    rows: list[dict[str, Any]] = []
+    for item in task_summaries:
+        row: dict[str, Any] = {
+            "task_id": item["task_id"],
+            "dataset_id": item["dataset_id"],
+            "dataset_name": item["dataset_name"],
+            "problem_type": item["problem_type"],
+            "outer_split_hash": item["outer_split_hash"],
+            "selected_config_label": item["full_refit"]["selected_config_label"],
+            "full_refit_steps": item["full_refit"]["refit"]["adapter_refit_steps_requested"],
+            "full_refit_steps_executed": item["full_refit"]["refit"]["adapter_steps_executed"],
+            "deployment_guard_applied": False,
+            "full_context_identity_benchmark_error": item["full_context_identity"]["benchmark_error"],
+            "full_context_identity_deployment_error": item["full_context_identity"]["deployment_error"],
+        }
+        for arm in arms:
+            row[f"{arm}_benchmark_error"] = item[arm]["benchmark_error"]
+            row[f"{arm}_deployment_error"] = item[arm]["deployment_error"]
+            row[f"{arm}_minus_full_context_identity_benchmark_error"] = (
+                item[arm]["benchmark_error"] - item["full_context_identity"]["benchmark_error"]
+            )
+            row[f"{arm}_relative_error_change_vs_full_context_identity"] = float(
+                _relative_error_change(
+                    np.asarray([item["full_context_identity"]["benchmark_error"]], dtype=float),
+                    np.asarray([item[arm]["benchmark_error"]], dtype=float),
+                )[0]
+            )
+        diagnostic = item.get("oof_validation_diagnostic")
+        if isinstance(diagnostic, dict):
+            row.update(
+                {
+                    "oof_validation_relative_improvement": diagnostic["validation_relative_improvement"],
+                    "oof_historical_guard_selected_adapted": diagnostic["historical_guard_selected_adapted"],
+                    "full_refit_test_deployment_relative_improvement": diagnostic[
+                        "full_refit_test_deployment_relative_improvement"
+                    ],
+                    "full_refit_test_improved": diagnostic["full_refit_test_improved"],
+                    "full_refit_test_met_historical_guard_threshold": diagnostic[
+                        "full_refit_test_met_historical_guard_threshold"
+                    ],
+                    "historical_standard_is_exact_current_identity": diagnostic[
+                        "historical_standard_is_exact_current_identity"
+                    ],
+                }
+            )
+            for arm in ("bagged_identity", "bagged_adapted", "bagged_guarded"):
+                metrics = item.get(arm)
+                if isinstance(metrics, dict):
+                    row[f"{arm}_benchmark_error"] = metrics["benchmark_error"]
+                    row[f"{arm}_deployment_error"] = metrics["deployment_error"]
+        rows.append(row)
+    csv_path = output_dir / "task_results.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        fieldnames = list(dict.fromkeys(key for row in rows for key in row))
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    diagnostics = [
+        item["oof_validation_diagnostic"]
+        for item in task_summaries
+        if isinstance(item.get("oof_validation_diagnostic"), dict)
+    ]
+    posthoc_correlation: dict[str, Any] | None = None
+    if diagnostics:
+        validation_improvement = np.asarray(
+            [float(item["validation_relative_improvement"]) for item in diagnostics], dtype=float
+        )
+        test_improvement = np.asarray(
+            [float(item["full_refit_test_deployment_relative_improvement"]) for item in diagnostics], dtype=float
+        )
+        old_guard = np.asarray(
+            [bool(item["historical_guard_selected_adapted"]) for item in diagnostics], dtype=bool
+        )
+        actual_threshold = np.asarray(
+            [bool(item["full_refit_test_met_historical_guard_threshold"]) for item in diagnostics], dtype=bool
+        )
+        validation_positive = validation_improvement > 0.0
+        test_positive = test_improvement > 0.0
+        posthoc_correlation = {
+            "role": "diagnostic_only_never_used_to_choose_or_guard_the_full_refit",
+            "n_tasks": len(diagnostics),
+            "relative_improvement_correlation": _finite_correlation(
+                validation_improvement, test_improvement
+            ),
+            "positive_direction_agreement_fraction": float(
+                np.mean(validation_positive == test_positive)
+            ),
+            "historical_guard_vs_full_refit_same_threshold": {
+                "agreement_fraction": float(np.mean(old_guard == actual_threshold)),
+                "guard_yes_test_yes": int(np.sum(old_guard & actual_threshold)),
+                "guard_yes_test_no": int(np.sum(old_guard & ~actual_threshold)),
+                "guard_no_test_yes": int(np.sum(~old_guard & actual_threshold)),
+                "guard_no_test_no": int(np.sum(~old_guard & ~actual_threshold)),
+            },
+        }
+    summary = {
+        "n_tasks": len(task_summaries),
+        "n_skipped_tasks": len(skipped_tasks),
+        "task_eligibility": task_eligibility,
+        "skipped_tasks": skipped_tasks,
+        "paired_elo_note": (
+            "Paired Elo is computed per completed task against normal TabICLv2 fitted on all outer-training rows. "
+            "The full-refit comparisons therefore share the same context size and ordinary preprocessing/ensemble; "
+            "they isolate the DirectSpline addition. These are local paired Elo deltas, not Retouche's absolute Elo pool."
+        ),
+        "metric_note": (
+            "Binary: 1-AUC; multiclass: log loss; regression: RMSE for paired comparison. "
+            "The optional historical OOF correlation uses the deployment metric (regression MSE)."
+        ),
+        "full_refit_protocol": {
+            "configuration_selection": "none; sole configuration D is frozen before the run",
+            "refit_step_selection": "none; full adapter_steps budget is frozen before the run",
+            "deployment_guard": "none; DirectSpline is evaluated on every completed task",
+            "identity_reference": "same fresh all-row estimator before DirectSpline optimisation",
+            "oof_source_role": "optional post-hoc validation/test correlation only",
+            "test_label_use": "scoring only after the unconditional spline prediction is frozen",
+        },
+        "posthoc_oof_correlation": posthoc_correlation,
+        "paired_results": paired_results,
+        "distinct_paired_result_keys": list(arms),
+        "paired_result_aliases": {"full_refit_guarded": "full_refit_raw"},
+        "task_results_csv": str(csv_path),
+    }
+    _json_dump(output_dir / "summary.json", summary)
     return summary

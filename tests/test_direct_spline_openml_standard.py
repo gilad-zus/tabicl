@@ -22,8 +22,11 @@ from tabicl._experiments.direct_spline_openml_standard import (
     _many_class_training_logits,
     _normal_prediction,
     _StandardBag,
+    run_task_unconditional_full_context_refit_standard,
     run_task_config_standard,
     standard_direct_spline_config,
+    summarize_full_context_refit_experiment,
+    summarize_full_context_refit_task,
 )
 from tabicl._hyperspline import DirectSplineTransform
 from tabicl._model.inference_config import InferenceConfig
@@ -497,6 +500,122 @@ def test_standard_runner_uses_retouches_per_bag_guard_for_test_ensemble(tmp_path
     assert summary["guard_selected_adapted_fraction"] == pytest.approx(0.5)
     assert np.array_equal(predictions["guarded_test"], expected_guarded_test)
     assert not np.array_equal(predictions["guarded_test"], predictions["adapted_test"])
+
+
+def test_full_context_refit_is_unconditional_and_oof_is_posthoc_only(tmp_path, monkeypatch):
+    """Old bag evidence must not select the full-row schedule or prediction."""
+
+    task = OpenMLTaskData(
+        task_id=93,
+        dataset_id=94,
+        dataset_name="full_refit",
+        problem_type="binary",
+        n_classes=2,
+        x_train=pd.DataFrame({"x": [0.0, 1.0, 2.0, 3.0]}),
+        y_train=np.asarray([0, 1, 0, 1]),
+        x_test=pd.DataFrame({"x": [4.0, 5.0]}),
+        y_test=np.asarray([0, 1]),
+        outer_split_hash="split",
+    )
+    config = standard_direct_spline_config()
+    config["adapter_steps"] = 500
+    identity = np.asarray([[0.9, 0.1], [0.2, 0.8]])
+    adapted = np.asarray([[0.7, 0.3], [0.3, 0.7]])
+    source_dir = tmp_path / "completed_oof_source"
+    destination_dir = tmp_path / "new_full_refit"
+    config_dir = source_dir / "raw" / "task_93_full_refit" / "config_D"
+    config_dir.mkdir(parents=True)
+    standard_openml._json_dump(
+        config_dir / "config_summary.json",
+        {
+            "run_fingerprint_hash": "test",
+            "validation": {
+                # This is below the historical 0.5% gate. The new experiment
+                # must nevertheless report the unconditional full-row spline.
+                "identity": {"deployment_error": 0.3000},
+                "adapted": {"deployment_error": 0.2990},
+            },
+            "bag_metadata": [
+                {"adapter_has_valid_learned_checkpoint": True, "adapter_best_step": 20},
+                {"adapter_has_valid_learned_checkpoint": True, "adapter_best_step": 40},
+                {"adapter_has_valid_learned_checkpoint": False, "adapter_best_step": 500},
+            ],
+        },
+    )
+    np.savez_compressed(
+        config_dir / "config_predictions.npz",
+        identity_test=identity,
+        adapted_test=adapted,
+        guarded_test=identity,
+    )
+    baseline_dir = source_dir / "standard_tabarena_baseline" / "task_93_full_refit"
+    baseline_dir.mkdir(parents=True)
+    np.savez_compressed(baseline_dir / "predictions.npz", prediction=identity)
+
+    observed: dict[str, int] = {}
+
+    def fake_load_backbone(**_kwargs):
+        return object(), None, {"test": "checkpoint"}
+
+    def fake_full_fit(*, refit_steps, **_kwargs):
+        observed["refit_steps"] = refit_steps
+        return identity.copy(), adapted.copy(), {
+            "adapter_refit_steps_requested": refit_steps,
+            "adapter_steps_executed": refit_steps,
+            "train_seconds": 0.0,
+            "peak_allocated_gib": 0.0,
+        }
+
+    monkeypatch.setattr(standard_openml, "load_frozen_backbone", fake_load_backbone)
+    monkeypatch.setattr(standard_openml, "_fit_full_context_refit_standard", fake_full_fit)
+
+    refit = run_task_unconditional_full_context_refit_standard(
+        task=task,
+        config_labels=["D"],
+        configs=[config],
+        output_dir=destination_dir,
+        protocol_seed=0,
+        device=torch.device("cpu"),
+        classifier_checkpoint=None,
+        regressor_checkpoint=None,
+        resume=False,
+        run_fingerprint_hash="test",
+    )
+    predictions = np.load(
+        destination_dir / "raw" / "task_93_full_refit" / "config_D" / "full_context_refit" / "predictions.npz"
+    )
+    assert observed["refit_steps"] == 500
+    assert refit["selection"]["mode"] == "predeclared_fixed_schedule_no_guard"
+    assert refit["selection"]["oof_used_for_training_or_deployment"] is False
+    assert np.array_equal(predictions["guarded_test"], adapted)
+
+    task_summary = summarize_full_context_refit_task(
+        task=task,
+        output_dir=destination_dir,
+        refit_result=refit,
+        oof_source_dir=source_dir,
+    )
+    assert task_summary["deployment_guard_applied"] is False
+    assert task_summary["reported_arm_aliases"] == {"full_refit_guarded": "full_refit_raw"}
+    assert task_summary["full_refit_guarded"]["deployment_error"] == pytest.approx(
+        task_summary["full_refit_raw"]["deployment_error"]
+    )
+    diagnostic = task_summary["oof_validation_diagnostic"]
+    assert diagnostic["historical_guard_selected_adapted"] is False
+    assert diagnostic["used_for_step_selection"] is False
+    assert diagnostic["used_as_deployment_guard"] is False
+    assert diagnostic["loaded_after_full_refit_prediction_frozen"] is True
+    experiment_summary = summarize_full_context_refit_experiment(
+        task_summaries=[task_summary],
+        output_dir=destination_dir,
+        bootstrap_rounds=20,
+        bootstrap_seed=0,
+    )
+    assert experiment_summary["distinct_paired_result_keys"] == ["full_refit_raw"]
+    assert experiment_summary["paired_result_aliases"] == {
+        "full_refit_guarded": "full_refit_raw"
+    }
+    assert experiment_summary["posthoc_oof_correlation"]["n_tasks"] == 1
 
 
 def test_full_query_parity_does_not_ignore_rows_after_old_probe_boundary(monkeypatch):
