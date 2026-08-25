@@ -22,9 +22,12 @@ from tabicl._experiments.direct_spline_openml_standard import (
     _many_class_training_logits,
     _normal_prediction,
     _StandardBag,
+    run_task_full_context_refit_checkpoint_audit_standard,
     run_task_unconditional_full_context_refit_standard,
     run_task_config_standard,
     standard_direct_spline_config,
+    summarize_full_context_refit_checkpoint_audit_experiment,
+    summarize_full_context_refit_checkpoint_audit_task,
     summarize_full_context_refit_experiment,
     summarize_full_context_refit_task,
 )
@@ -330,6 +333,56 @@ def test_standard_runner_checks_public_identity_and_preserves_prediction_shapes(
     assert any(not flag for flag in backbone.forward_training_flags)
 
 
+def test_full_context_checkpoint_audit_runs_and_persists_real_adapter_states(tmp_path):
+    rows = 32
+    features = pd.DataFrame(
+        {
+            "x0": np.linspace(-1.0, 1.0, rows),
+            "x1": np.tile([0.0, 1.0], rows // 2),
+        }
+    )
+    labels = np.tile([0, 1], rows // 2)
+    task = OpenMLTaskData(
+        task_id=96,
+        dataset_id=97,
+        dataset_name="real_checkpoint_audit",
+        problem_type="binary",
+        n_classes=2,
+        x_train=features.iloc[:24].reset_index(drop=True),
+        y_train=labels[:24],
+        x_test=features.iloc[24:].reset_index(drop=True),
+        y_test=labels[24:],
+        outer_split_hash="test",
+    )
+    config = {
+        **standard_direct_spline_config(train_context_rows=4),
+        "adapter_steps": 2,
+        "query_batch_rows": 4,
+        "cross_column_mixing_rank": 0,
+    }
+
+    identity, curve, metadata = standard_openml._fit_full_context_refit_checkpoint_audit_standard(
+        task=task,
+        config=config,
+        checkpoint_steps=(0, 1, 2),
+        protocol_seed=0,
+        backbone=_HalfPrecisionEvalBackbone(),
+        device=torch.device("cpu"),
+        checkpoint_state_dir=tmp_path / "states",
+        progress=None,
+    )
+
+    assert identity.shape == (8, 2)
+    assert sorted(curve) == [0, 1, 2]
+    assert np.array_equal(curve[0], identity)
+    assert metadata["adapter_steps_executed"] == 2
+    assert [item["step"] for item in metadata["checkpoint_metadata"]] == [0, 1, 2]
+    assert metadata["checkpoint_metadata"][0]["adapter_diagnostics"]["mean_grid_deformation"] == 0.0
+    assert (tmp_path / "states" / "step_000000.pt").is_file()
+    assert (tmp_path / "states" / "step_000001.pt").is_file()
+    assert (tmp_path / "states" / "step_000002.pt").is_file()
+
+
 def test_categorical_only_task_is_recorded_as_a_public_identity_tie():
     rows = 32
     features = pd.DataFrame(
@@ -616,6 +669,104 @@ def test_full_context_refit_is_unconditional_and_oof_is_posthoc_only(tmp_path, m
         "full_refit_guarded": "full_refit_raw"
     }
     assert experiment_summary["posthoc_oof_correlation"]["n_tasks"] == 1
+
+
+def test_full_context_checkpoint_audit_freezes_curve_before_scoring(tmp_path, monkeypatch):
+    """The audit stores all requested predictions and never selects a checkpoint."""
+
+    task = OpenMLTaskData(
+        task_id=94,
+        dataset_id=95,
+        dataset_name="checkpoint_audit",
+        problem_type="binary",
+        n_classes=2,
+        x_train=pd.DataFrame({"x": [0.0, 1.0, 2.0, 3.0]}),
+        y_train=np.asarray([0, 1, 0, 1]),
+        x_test=pd.DataFrame({"x": [4.0, 5.0]}),
+        y_test=np.asarray([0, 1]),
+        outer_split_hash="split",
+    )
+    config = standard_direct_spline_config(adapter_steps=5)
+    identity = np.asarray([[0.1, 0.9], [0.8, 0.2]])
+    step_two = np.asarray([[0.7, 0.3], [0.6, 0.4]])
+    step_five = np.asarray([[0.2, 0.8], [0.1, 0.9]])
+    observed: dict[str, object] = {}
+
+    def fake_load_backbone(**_kwargs):
+        return object(), None, {"test": "checkpoint"}
+
+    def fake_audit_fit(*, checkpoint_steps, checkpoint_state_dir, **_kwargs):
+        observed["checkpoint_steps"] = checkpoint_steps
+        observed["checkpoint_state_dir"] = checkpoint_state_dir
+        return identity.copy(), {0: identity.copy(), 2: step_two.copy(), 5: step_five.copy()}, {
+            "adapter_steps_executed": 5,
+            "train_seconds": 0.0,
+            "peak_allocated_gib": 0.0,
+            "checkpoint_metadata": [
+                {"step": 0, "objective": None, "elapsed_seconds": 0.0, "adapter_diagnostics": {}},
+                {"step": 2, "objective": 0.6, "elapsed_seconds": 1.0, "adapter_diagnostics": {}},
+                {"step": 5, "objective": 0.2, "elapsed_seconds": 2.0, "adapter_diagnostics": {}},
+            ],
+        }
+
+    monkeypatch.setattr(standard_openml, "load_frozen_backbone", fake_load_backbone)
+    monkeypatch.setattr(
+        standard_openml, "_fit_full_context_refit_checkpoint_audit_standard", fake_audit_fit
+    )
+
+    audit = run_task_full_context_refit_checkpoint_audit_standard(
+        task=task,
+        config_labels=["D"],
+        configs=[config],
+        checkpoint_steps=(0, 2, 5),
+        output_dir=tmp_path,
+        protocol_seed=0,
+        device=torch.device("cpu"),
+        classifier_checkpoint=None,
+        regressor_checkpoint=None,
+        resume=False,
+        run_fingerprint_hash="test",
+    )
+
+    assert observed["checkpoint_steps"] == (0, 2, 5)
+    assert audit["selection"]["checkpoint_selection"] == "none; every requested checkpoint is retained"
+    assert audit["checkpoint_steps_frozen"] == [0, 2, 5]
+    prediction_path = (
+        tmp_path
+        / "raw"
+        / "task_94_checkpoint_audit"
+        / "config_D"
+        / "full_context_checkpoint_audit"
+        / "predictions.npz"
+    )
+    predictions = np.load(prediction_path)
+    assert set(predictions.files) == {
+        "identity_test",
+        "adapted_test_step_000000",
+        "adapted_test_step_000002",
+        "adapted_test_step_000005",
+    }
+
+    task_summary = summarize_full_context_refit_checkpoint_audit_task(
+        task=task,
+        output_dir=tmp_path,
+        audit_result=audit,
+    )
+
+    assert task_summary["outer_test_scored_after_all_checkpoint_predictions_frozen"] is True
+    assert task_summary["outer_test_used_for_selection"] is False
+    assert [item["step"] for item in task_summary["checkpoint_metrics"]] == [0, 2, 5]
+    assert task_summary["checkpoint_metrics"][-1]["candidate"]["deployment_error"] < (
+        task_summary["full_context_identity"]["deployment_error"]
+    )
+    experiment_summary = summarize_full_context_refit_checkpoint_audit_experiment(
+        task_summaries=[task_summary],
+        output_dir=tmp_path,
+        bootstrap_rounds=20,
+        bootstrap_seed=0,
+    )
+    assert experiment_summary["checkpoint_steps"] == [0, 2, 5]
+    assert set(experiment_summary["checkpoint_paired_results"]) == {"0", "2", "5"}
 
 
 def test_full_query_parity_does_not_ignore_rows_after_old_probe_boundary(monkeypatch):

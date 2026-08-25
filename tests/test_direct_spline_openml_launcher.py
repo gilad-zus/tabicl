@@ -386,6 +386,34 @@ def test_standard_launcher_forwards_explicit_adapter_schedule(monkeypatch, tmp_p
     assert configs[0]["validation_interval"] == 10
 
 
+def test_checkpoint_audit_launcher_defaults_to_a_500_step_curve(monkeypatch, tmp_path):
+    from scripts.direct_spline_openml_lite import parse_args
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "direct_spline_openml_full_refit_checkpoint_audit.py",
+            "--output-dir",
+            str(tmp_path),
+            "--pipeline",
+            "standard",
+        ],
+    )
+
+    args = parse_args(
+        default_pipeline="standard",
+        required_pipeline="standard",
+        checkpoint_audit=True,
+    )
+    _validate(args, full_context_refit=True, checkpoint_audit=True)
+    labels, configs = _configs(args)
+
+    assert args.checkpoint_steps == (0, 25, 50, 100, 200, 300, 500)
+    assert args.adapter_steps == 500
+    assert labels == ["D"]
+    assert configs[0]["adapter_steps"] == 500
+
+
 def test_standard_launcher_pipeline_can_be_enforced(monkeypatch, tmp_path):
     from scripts.direct_spline_openml_lite import parse_args
 

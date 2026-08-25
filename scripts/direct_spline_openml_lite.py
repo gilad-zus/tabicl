@@ -91,10 +91,13 @@ from tabicl._experiments.direct_spline_protocol import (
     shared_random_direct_spline_configs,
 )
 from tabicl._experiments.direct_spline_openml_standard import (
+    run_task_full_context_refit_checkpoint_audit_standard,
     run_task_unconditional_full_context_refit_standard,
     run_task_config_standard,
     shared_standard_direct_spline_configs,
     standard_direct_spline_config,
+    summarize_full_context_refit_checkpoint_audit_experiment,
+    summarize_full_context_refit_checkpoint_audit_task,
     summarize_full_context_refit_experiment,
     summarize_full_context_refit_task,
 )
@@ -111,20 +114,27 @@ def parse_args(
     *,
     default_pipeline: str = "lite",
     required_pipeline: str | None = None,
+    checkpoint_audit: bool = False,
+    description: str | None = None,
 ) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument(
-        "--oof-source-dir",
-        type=Path,
-        default=None,
-        help=(
-            "Full-context refit launcher only: optionally read completed standard-pipeline OOF bags from "
-            "this earlier run after each unconditional full-context spline has been fitted and frozen. "
-            "The old bags are used only for a post-hoc validation/test correlation diagnostic; they never "
-            "select a configuration, step count, guard, or prediction."
-        ),
+    parser = argparse.ArgumentParser(
+        description=description or __doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
+    parser.add_argument("--output-dir", type=Path, required=True)
+    if checkpoint_audit:
+        parser.set_defaults(oof_source_dir=None)
+    else:
+        parser.add_argument(
+            "--oof-source-dir",
+            type=Path,
+            default=None,
+            help=(
+                "Full-context refit launcher only: optionally read completed standard-pipeline OOF bags from "
+                "this earlier run after each unconditional full-context spline has been fitted and frozen. "
+                "The old bags are used only for a post-hoc validation/test correlation diagnostic; they never "
+                "select a configuration, step count, guard, or prediction."
+            ),
+        )
     parser.add_argument(
         "--task-id", action="append", type=int,
         help="OpenML task ID. Repeat for a pilot; omit to run the public 51-task suite.",
@@ -212,6 +222,18 @@ def parse_args(
             "Omit to use the configuration default (10 for D)."
         ),
     )
+    if checkpoint_audit:
+        parser.add_argument(
+            "--checkpoint-steps",
+            type=_parse_checkpoint_steps,
+            default=(0, 25, 50, 100, 200, 300, 500),
+            metavar="STEP[,STEP,...]",
+            help=(
+                "Development-only full-refit audit: sorted DirectSpline checkpoints to freeze and score. "
+                "The default is 0,25,50,100,200,300,500. When --adapter-steps is omitted, its value is set "
+                "to the largest requested checkpoint."
+            ),
+        )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--classifier-checkpoint", type=Path, default=None)
     parser.add_argument("--regressor-checkpoint", type=Path, default=None)
@@ -252,12 +274,28 @@ def parse_args(
         help="Print a frozen-manifest preview without writing an output directory or running fits.",
     )
     args = parser.parse_args()
+    if checkpoint_audit and args.adapter_steps is None:
+        args.adapter_steps = max(args.checkpoint_steps)
     if required_pipeline is not None and args.pipeline != required_pipeline:
         parser.error(
             f"this launcher requires --pipeline {required_pipeline}; "
             f"received --pipeline {args.pipeline}"
         )
     return args
+
+
+def _parse_checkpoint_steps(value: str) -> tuple[int, ...]:
+    try:
+        steps = tuple(int(part.strip()) for part in value.split(",") if part.strip())
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("checkpoint steps must be comma-separated integers") from error
+    if not steps:
+        raise argparse.ArgumentTypeError("checkpoint steps must not be empty")
+    if steps != tuple(sorted(set(steps))):
+        raise argparse.ArgumentTypeError("checkpoint steps must be sorted and unique")
+    if steps[0] != 0 or any(step < 0 for step in steps):
+        raise argparse.ArgumentTypeError("checkpoint steps must start at 0 and be non-negative")
+    return steps
 
 
 def _git_revision() -> str | None:
@@ -612,6 +650,28 @@ def _event_reporter(path: Path):
                 f"time={event['train_seconds']:.1f}s peak={event['peak_allocated_gib']:.2f}GiB",
                 flush=True,
             )
+        elif event_name == "full_refit_checkpoint_audit_started":
+            print(
+                f"[{task_prefix} checkpoint-audit config={event['config_label']}] "
+                f"freezing development-only checkpoints={event['checkpoint_steps']}",
+                flush=True,
+            )
+        elif event_name == "full_refit_checkpoint_frozen":
+            objective = event.get("objective")
+            objective_text = "identity" if objective is None else f"objective={objective:.6g}"
+            print(
+                f"[{task_prefix} checkpoint-audit step={event['step']}] {objective_text} "
+                f"deformation={event['mean_grid_deformation']:.3g} "
+                f"elapsed={event['elapsed_seconds']:.1f}s",
+                flush=True,
+            )
+        elif event_name == "full_refit_checkpoint_audit_completed":
+            print(
+                f"[{task_prefix} checkpoint-audit] complete: "
+                f"frozen={event['checkpoint_steps_frozen']} steps={event['executed_steps']} "
+                f"time={event['train_seconds']:.1f}s peak={event['peak_allocated_gib']:.2f}GiB",
+                flush=True,
+            )
         elif event_name == "bag_completed":
             parity = ""
             if "identity_parity_max_abs_validation" in event:
@@ -755,7 +815,12 @@ def _configs(args: argparse.Namespace) -> tuple[list[str], list[dict[str, Any]]]
     return ["D", *(f"R{index + 1}" for index in range(len(random)))], [default, *random]
 
 
-def _validate(args: argparse.Namespace, *, full_context_refit: bool = False) -> None:
+def _validate(
+    args: argparse.Namespace,
+    *,
+    full_context_refit: bool = False,
+    checkpoint_audit: bool = False,
+) -> None:
     if args.bags < 2:
         raise ValueError("--bags must be at least two")
     if args.n_random_configs < 0 or args.bootstrap_rounds <= 0:
@@ -805,6 +870,16 @@ def _validate(args: argparse.Namespace, *, full_context_refit: bool = False) -> 
                 "the full-context refit experiment requires --context-cap 0 so its deployment context exactly "
                 "matches ordinary full-outer-training TabICLv2"
             )
+        if checkpoint_audit:
+            steps = getattr(args, "checkpoint_steps", None)
+            if not isinstance(steps, tuple) or not steps:
+                raise ValueError("the checkpoint audit requires a non-empty --checkpoint-steps schedule")
+            if steps != tuple(sorted(set(steps))) or steps[0] != 0 or any(step < 0 for step in steps):
+                raise ValueError("--checkpoint-steps must be sorted, unique, non-negative, and start at zero")
+            if args.adapter_steps is None or int(args.adapter_steps) < steps[-1]:
+                raise ValueError("--adapter-steps must be at least the largest --checkpoint-steps value")
+            if args.oof_source_dir is not None:
+                raise ValueError("--oof-source-dir is not used by the development-only checkpoint audit")
     elif args.oof_source_dir is not None:
         raise ValueError("--oof-source-dir is available only in the full-context refit launcher")
 
@@ -1211,9 +1286,16 @@ def main(
     default_pipeline: str = "lite",
     required_pipeline: str | None = None,
     full_context_refit: bool = False,
+    checkpoint_audit: bool = False,
+    description: str | None = None,
 ) -> None:
-    args = parse_args(default_pipeline=default_pipeline, required_pipeline=required_pipeline)
-    _validate(args, full_context_refit=full_context_refit)
+    args = parse_args(
+        default_pipeline=default_pipeline,
+        required_pipeline=required_pipeline,
+        checkpoint_audit=checkpoint_audit,
+        description=description,
+    )
+    _validate(args, full_context_refit=full_context_refit, checkpoint_audit=checkpoint_audit)
     labels, configs = _configs(args)
     manifest_path = args.output_dir / "experiment_manifest.json"
     previous: dict[str, Any] | None = None
@@ -1309,7 +1391,9 @@ def main(
         },
         "inner_bags": args.bags,
         "inner_bags_role": (
-            "optional historical OOF diagnostic compatibility only"
+            "not used by the full-context checkpoint audit"
+            if checkpoint_audit
+            else "optional historical OOF diagnostic compatibility only"
             if full_context_refit
             else "training and validation"
         ),
@@ -1322,6 +1406,8 @@ def main(
         "ensemble_rounds": args.ensemble_rounds or max(1, 2 * len(configs)),
         "pipeline": args.pipeline,
         "full_context_refit": bool(full_context_refit),
+        "checkpoint_audit": bool(checkpoint_audit),
+        "checkpoint_steps": list(args.checkpoint_steps) if checkpoint_audit else None,
         "oof_source": oof_source_provenance,
         "standard_pipeline": (
             None
@@ -1342,6 +1428,15 @@ def main(
                     None
                     if not full_context_refit
                     else {
+                        "role": "development-only full-context checkpoint learning curve",
+                        "context": "all outer-training rows",
+                        "configuration": "sole predeclared DirectSpline configuration",
+                        "checkpoint_steps": list(args.checkpoint_steps),
+                        "checkpoint_selection": "none; outer test is diagnostic only",
+                        "identity_reference": "the fresh all-row estimator's exact pre-optimisation identity prediction",
+                    }
+                    if checkpoint_audit
+                    else {
                         "context": "all outer-training rows",
                         "configuration": "sole predeclared DirectSpline configuration",
                         "schedule": "fixed predeclared adapter_steps; no early stopping or OOF checkpoint selection",
@@ -1358,6 +1453,9 @@ def main(
             "regression": "MSE",
             "required_relative_improvement": configs[0]["guard_relative_improvement"],
             "scope": (
+                "development_only_checkpoint_curve_no_selection"
+                if checkpoint_audit
+                else
                 "posthoc_oof_correlation_only_no_deployment_guard"
                 if full_context_refit
                 else "retouche_per_bag_validation_guard_then_test_ensemble"
@@ -1381,7 +1479,9 @@ def main(
                 "oof_used_for_training_or_deployment": False,
                 "separate_standard_baseline_run": False,
                 "identity_prediction_source": "same fresh full-context estimator used by the adapted path",
-                "spline_evaluated_for_every_task": True,
+                "spline_evaluated_for_every_task": not checkpoint_audit,
+                "checkpoint_audit_development_only": bool(checkpoint_audit),
+                "outer_test_checkpoint_selection_permitted": False if checkpoint_audit else None,
             }
         ),
     }
@@ -1455,6 +1555,9 @@ def main(
     else:
         manifest = {
             "experiment": (
+                "DirectSpline OpenML standard-ensemble development-only full-context checkpoint audit"
+                if checkpoint_audit
+                else
                 "DirectSpline OpenML standard-ensemble full-context refit experiment"
                 if full_context_refit
                 else "DirectSpline OpenML standard-ensemble experiment"
@@ -1464,7 +1567,13 @@ def main(
             "created_at_utc": datetime.now(timezone.utc).isoformat(),
             "immutable_run": immutable_run,
             "run_fingerprint_sha256": run_fingerprint_hash,
-            "outer_test_policy": "never read by preprocessing fitting, adapter optimisation, guard, HPO, or ensembling",
+            "outer_test_policy": (
+                "read only after all requested checkpoint predictions are frozen, to diagnose this development "
+                "learning curve; never used for optimisation, checkpoint selection, configuration selection, "
+                "regularisation selection, guarding, HPO, or ensembling"
+                if checkpoint_audit
+                else "never read by preprocessing fitting, adapter optimisation, guard, HPO, or ensembling"
+            ),
             "absolute_elo_note": (
                 "This run computes paired Elo deltas versus its own matched TabICL identity baseline. "
                 "Those deltas cannot be compared numerically with absolute ELO on TabArena's large published method pool."
@@ -1618,7 +1727,13 @@ def main(
                 _write_run_progress(args.output_dir, task_summaries, skipped_tasks)
                 continue
 
-        stage = "full_context_refit" if full_context_refit else "config_D"
+        stage = (
+            "full_context_checkpoint_audit"
+            if checkpoint_audit
+            else "full_context_refit"
+            if full_context_refit
+            else "config_D"
+        )
         cuda_oom_skipped = False
         try:
             run_config = run_task_config_standard if args.pipeline == "standard" else run_task_config
@@ -1654,49 +1769,70 @@ def main(
             stage = "task_summary"
             try:
                 if full_context_refit:
-                    refit_result = run_task_unconditional_full_context_refit_standard(
-                        task=task,
-                        config_labels=labels,
-                        configs=configs,
-                        output_dir=args.output_dir,
-                        protocol_seed=args.protocol_seed,
-                        device=device,
-                        classifier_checkpoint=args.classifier_checkpoint,
-                        regressor_checkpoint=args.regressor_checkpoint,
-                        resume=args.resume,
-                        run_fingerprint_hash=run_fingerprint_hash,
-                        progress=progress,
-                    )
-                    # The primary full-context prediction is now frozen. Only
-                    # at this point may historical OOF bags be opened, and
-                    # only to test whether their validation signal predicted
-                    # the unconditional full-context outcome.
-                    task_oof_source, task_oof_error = _posthoc_oof_source_for_task(
-                        source_dir=oof_source_dir,
-                        source_manifest=oof_source_manifest,
-                        current_immutable_run=immutable_run,
-                        selected_task_ids=task_ids,
-                        task=task,
-                        config_labels=labels,
-                    )
-                    if task_oof_source is not None:
-                        print(
-                            f"[task={task.task_id}] loading old OOF bags only for post-hoc correlation",
-                            flush=True,
+                    if checkpoint_audit:
+                        audit_result = run_task_full_context_refit_checkpoint_audit_standard(
+                            task=task,
+                            config_labels=labels,
+                            configs=configs,
+                            checkpoint_steps=args.checkpoint_steps,
+                            output_dir=args.output_dir,
+                            protocol_seed=args.protocol_seed,
+                            device=device,
+                            classifier_checkpoint=args.classifier_checkpoint,
+                            regressor_checkpoint=args.regressor_checkpoint,
+                            resume=args.resume,
+                            run_fingerprint_hash=run_fingerprint_hash,
+                            progress=progress,
                         )
-                    elif task_oof_error is not None:
-                        print(
-                            f"[task={task.task_id}] old OOF diagnostic unavailable; "
-                            "keeping the completed unconditional full-refit result",
-                            flush=True,
+                        task_summary = summarize_full_context_refit_checkpoint_audit_task(
+                            task=task,
+                            output_dir=args.output_dir,
+                            audit_result=audit_result,
                         )
-                    task_summary = summarize_full_context_refit_task(
-                        task=task,
-                        output_dir=args.output_dir,
-                        refit_result=refit_result,
-                        oof_source_dir=task_oof_source,
-                        oof_diagnostic_unavailable_reason=task_oof_error,
-                    )
+                    else:
+                        refit_result = run_task_unconditional_full_context_refit_standard(
+                            task=task,
+                            config_labels=labels,
+                            configs=configs,
+                            output_dir=args.output_dir,
+                            protocol_seed=args.protocol_seed,
+                            device=device,
+                            classifier_checkpoint=args.classifier_checkpoint,
+                            regressor_checkpoint=args.regressor_checkpoint,
+                            resume=args.resume,
+                            run_fingerprint_hash=run_fingerprint_hash,
+                            progress=progress,
+                        )
+                        # The primary full-context prediction is now frozen. Only
+                        # at this point may historical OOF bags be opened, and
+                        # only to test whether their validation signal predicted
+                        # the unconditional full-context outcome.
+                        task_oof_source, task_oof_error = _posthoc_oof_source_for_task(
+                            source_dir=oof_source_dir,
+                            source_manifest=oof_source_manifest,
+                            current_immutable_run=immutable_run,
+                            selected_task_ids=task_ids,
+                            task=task,
+                            config_labels=labels,
+                        )
+                        if task_oof_source is not None:
+                            print(
+                                f"[task={task.task_id}] loading old OOF bags only for post-hoc correlation",
+                                flush=True,
+                            )
+                        elif task_oof_error is not None:
+                            print(
+                                f"[task={task.task_id}] old OOF diagnostic unavailable; "
+                                "keeping the completed unconditional full-refit result",
+                                flush=True,
+                            )
+                        task_summary = summarize_full_context_refit_task(
+                            task=task,
+                            output_dir=args.output_dir,
+                            refit_result=refit_result,
+                            oof_source_dir=task_oof_source,
+                            oof_diagnostic_unavailable_reason=task_oof_error,
+                        )
                 else:
                     task_summary = summarize_task_tuning(
                         task=task,
@@ -1706,6 +1842,8 @@ def main(
                         standard_tabarena=standard_tabarena,
                     )
             except json.JSONDecodeError:
+                if checkpoint_audit:
+                    raise
                 if oof_source_dir is not None:
                     raise RuntimeError(
                         "OOF source contains a malformed aggregation; it is read-only and cannot be repaired "
@@ -1812,14 +1950,24 @@ def main(
         _write_run_progress(args.output_dir, task_summaries, skipped_tasks)
     if task_summaries:
         if full_context_refit:
-            summary = summarize_full_context_refit_experiment(
-                task_summaries=task_summaries,
-                output_dir=args.output_dir,
-                bootstrap_rounds=args.bootstrap_rounds,
-                bootstrap_seed=args.protocol_seed,
-                skipped_tasks=skipped_tasks,
-                task_eligibility=immutable_run["task_eligibility"],
-            )
+            if checkpoint_audit:
+                summary = summarize_full_context_refit_checkpoint_audit_experiment(
+                    task_summaries=task_summaries,
+                    output_dir=args.output_dir,
+                    bootstrap_rounds=args.bootstrap_rounds,
+                    bootstrap_seed=args.protocol_seed,
+                    skipped_tasks=skipped_tasks,
+                    task_eligibility=immutable_run["task_eligibility"],
+                )
+            else:
+                summary = summarize_full_context_refit_experiment(
+                    task_summaries=task_summaries,
+                    output_dir=args.output_dir,
+                    bootstrap_rounds=args.bootstrap_rounds,
+                    bootstrap_seed=args.protocol_seed,
+                    skipped_tasks=skipped_tasks,
+                    task_eligibility=immutable_run["task_eligibility"],
+                )
         else:
             summary = summarize_experiment(
                 task_summaries=task_summaries,

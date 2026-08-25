@@ -1751,6 +1751,73 @@ def _full_context_refit_dir(
     return _config_dir(output_dir, task, label) / "full_context_refit"
 
 
+def _full_context_checkpoint_audit_dir(
+    output_dir: Path,
+    task: OpenMLTaskData,
+    label: str,
+) -> Path:
+    """Return the artifact directory for a development-only refit learning curve."""
+
+    return _config_dir(output_dir, task, label) / "full_context_checkpoint_audit"
+
+
+@torch.no_grad()
+def _adapter_checkpoint_diagnostics(adapters: _AdapterSet | None) -> dict[str, Any]:
+    """Summarize function-space movement at one full-refit checkpoint.
+
+    Parameter norms are not a useful proxy here because each normalisation
+    branch has different parameterisations.  These diagnostics instead record
+    the generated function's grid deformation from identity, together with the
+    effective spline and cross-column gates.
+    """
+
+    if adapters is None:
+        return {
+            "has_trainable_numerical_features": False,
+            "mean_grid_deformation": 0.0,
+            "mean_gate": 0.0,
+            "max_gate": 0.0,
+            "mean_abs_location": 0.0,
+            "mean_abs_log_scale": 0.0,
+            "mean_mixing_spectral_norm": 0.0,
+            "branches": {},
+        }
+    branches: dict[str, dict[str, float]] = {}
+    for method, key in adapters._keys.items():
+        adapter = adapters.adapters[key]
+        parameters = adapter.parameters_for_transform()
+        _mixing_mean, _mixing_max, mixing_spectral = adapter.mixing_diagnostics()
+        grid = torch.linspace(
+            -adapter.standardized_range,
+            adapter.standardized_range,
+            33,
+            dtype=parameters.location.dtype,
+            device=parameters.location.device,
+        ).view(1, -1, 1).expand(parameters.location.shape[0], -1, parameters.location.shape[1])
+        grid_deformation = (adapter.transform(grid) - grid).square().mean()
+        branches[method] = {
+            "grid_deformation": float(grid_deformation.detach()),
+            "mean_gate": float(parameters.gate.mean().detach()),
+            "max_gate": float(parameters.gate.max().detach()),
+            "mean_abs_location": float(parameters.location.abs().mean().detach()),
+            "mean_abs_log_scale": float(parameters.scale.log().abs().mean().detach()),
+            "mixing_spectral_norm": float(mixing_spectral.detach()),
+        }
+    values = list(branches.values())
+    return {
+        "has_trainable_numerical_features": True,
+        "mean_grid_deformation": float(np.mean([item["grid_deformation"] for item in values])),
+        "mean_gate": float(np.mean([item["mean_gate"] for item in values])),
+        "max_gate": float(np.max([item["max_gate"] for item in values])),
+        "mean_abs_location": float(np.mean([item["mean_abs_location"] for item in values])),
+        "mean_abs_log_scale": float(np.mean([item["mean_abs_log_scale"] for item in values])),
+        "mean_mixing_spectral_norm": float(
+            np.mean([item["mixing_spectral_norm"] for item in values])
+        ),
+        "branches": branches,
+    }
+
+
 def _fit_full_context_refit_standard(
     *,
     task: OpenMLTaskData,
@@ -1939,6 +2006,228 @@ def _fit_full_context_refit_standard(
     return identity_test, adapted_test, metadata
 
 
+def _fit_full_context_refit_checkpoint_audit_standard(
+    *,
+    task: OpenMLTaskData,
+    config: dict[str, Any],
+    checkpoint_steps: tuple[int, ...],
+    protocol_seed: int,
+    backbone: TabICL,
+    device: torch.device,
+    checkpoint_state_dir: Path,
+    progress: Any,
+) -> tuple[np.ndarray, dict[int, np.ndarray], dict[str, Any]]:
+    """Freeze a full-refit prediction curve without selecting from it.
+
+    This deliberately differs from :func:`_fit_full_context_refit_standard`:
+    every listed checkpoint is retained for a *development-only* learning-curve
+    audit.  It receives no outer-test labels, makes no checkpoint decision,
+    and does not alter the unconditional full-refit deployment path.
+    """
+
+    if not checkpoint_steps:
+        raise ValueError("checkpoint_steps must not be empty")
+    if checkpoint_steps != tuple(sorted(set(checkpoint_steps))):
+        raise ValueError("checkpoint_steps must be sorted and unique")
+    if checkpoint_steps[0] != 0 or any(step < 0 for step in checkpoint_steps):
+        raise ValueError("checkpoint_steps must start at zero and be non-negative")
+    max_steps = int(checkpoint_steps[-1])
+    started = time.perf_counter()
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    full_indices = np.arange(len(task.y_train), dtype=int)
+    bundle = _fit_standard_bag(
+        task=task,
+        fit_indices=full_indices,
+        config=config,
+        protocol_seed=protocol_seed,
+        bag=-1,
+        backbone=backbone,
+        device=device,
+    )
+    adapter_seed = _seed(int(config["random_state"]), task.task_id, -1, 202)
+    torch.manual_seed(adapter_seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(adapter_seed)
+    adapters = _make_adapters(bundle, config, device)
+    parity_test, parity_reference_test, public_parity_test = _identity_view_parity(
+        bundle=bundle,
+        adapters=adapters,
+        query_x=task.x_test,
+        device=device,
+        progress=progress,
+        task_id=task.task_id,
+        bag=-1,
+        split="full_context_checkpoint_audit_test",
+    )
+    identity_test = _normal_prediction(
+        bundle=bundle,
+        query_x=task.x_test,
+        context_indices=bundle.support_indices,
+        adapters=None,
+        device=device,
+    )
+    checkpoint_state_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_predictions: dict[int, np.ndarray] = {}
+    checkpoint_metadata: list[dict[str, Any]] = []
+
+    def record_checkpoint(step: int, objective: float | None) -> None:
+        state_path = checkpoint_state_dir / f"step_{step:06d}.pt"
+        state = {} if adapters is None else _cpu_state_dict(adapters)
+        torch.save({"step": int(step), "adapter_state_dict": state}, state_path)
+        prediction = (
+            identity_test.copy()
+            if step == 0 or adapters is None
+            else _normal_prediction(
+                bundle=bundle,
+                query_x=task.x_test,
+                context_indices=bundle.support_indices,
+                adapters=adapters,
+                device=device,
+            )
+        )
+        checkpoint_predictions[step] = prediction
+        diagnostics = _adapter_checkpoint_diagnostics(adapters)
+        record = {
+            "step": int(step),
+            "objective": objective,
+            "elapsed_seconds": float(time.perf_counter() - started),
+            "state_path": state_path.name,
+            "adapter_diagnostics": diagnostics,
+        }
+        checkpoint_metadata.append(record)
+        _emit(
+            progress,
+            event="full_refit_checkpoint_frozen",
+            task_id=task.task_id,
+            step=int(step),
+            objective=objective,
+            elapsed_seconds=record["elapsed_seconds"],
+            mean_grid_deformation=diagnostics["mean_grid_deformation"],
+        )
+
+    record_checkpoint(0, None)
+    training_context_sizes: list[int] = []
+    first_objective = final_objective = float("nan")
+    executed_steps = 0
+    no_trainable_numerical_features = adapters is None
+    if adapters is None:
+        for step in checkpoint_steps[1:]:
+            record_checkpoint(step, None)
+    else:
+        optimizer = _optimizer(adapters, config)
+        episode_rng = np.random.default_rng(
+            _seed(int(config["random_state"]), task.task_id, -1, 203)
+        )
+        requested_steps = set(checkpoint_steps[1:])
+        for step in range(1, max_steps + 1):
+            configured_context_rows = config.get("train_context_rows")
+            context_row_limit = (
+                max(1, bundle.fit_labels.size - int(config["query_batch_rows"]))
+                if configured_context_rows is None
+                else int(configured_context_rows)
+            )
+            context_rows, query_rows = sample_episode_indices(
+                bundle.fit_labels,
+                problem_type=task.problem_type,
+                context_rows=context_row_limit,
+                query_rows=int(config["query_batch_rows"]),
+                rng=episode_rng,
+            )
+            training_context_sizes.append(int(context_rows.size))
+            optimizer.zero_grad(set_to_none=True)
+            output = _training_logits(
+                bundle=bundle,
+                adapters=adapters,
+                context_indices=context_rows,
+                query_indices=query_rows,
+                device=device,
+            )
+            target = torch.as_tensor(bundle.fit_labels[query_rows], device=device)
+            if task.problem_type == "regression":
+                objective_tensor = F.mse_loss(output.flatten(), target.float().flatten())
+            else:
+                objective_tensor = F.cross_entropy(
+                    output / float(bundle.estimator.softmax_temperature), target.long().flatten()
+                )
+            if not torch.isfinite(objective_tensor):
+                _emit(
+                    progress,
+                    event="full_refit_nonfinite_objective",
+                    task_id=task.task_id,
+                    step=step,
+                )
+                del output, target, objective_tensor
+                break
+            if step == 1:
+                first_objective = float(objective_tensor.detach())
+            objective_tensor.backward()
+            torch.nn.utils.clip_grad_norm_(adapters.parameters(), float(config["grad_clip"]))
+            optimizer.step()
+            final_objective = float(objective_tensor.detach())
+            executed_steps = step
+            del output, target, objective_tensor
+            if step in requested_steps:
+                record_checkpoint(step, final_objective)
+        del optimizer
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+    peak_gib = 0.0 if device.type != "cuda" else torch.cuda.max_memory_allocated(device) / 2**30
+    metadata = {
+        "fit_rows": int(full_indices.size),
+        "support_rows": int(bundle.support_indices.size),
+        "n_features": int(task.x_train.shape[1]),
+        "n_numerical_features": int(bundle.numerical_indices.size),
+        "no_trainable_numerical_features": bool(no_trainable_numerical_features),
+        "normal_estimators": int(STANDARD_TABICL_CONFIG["n_estimators"]),
+        "context_policy": (
+            "all_outer_training_rows"
+            if bundle.support_indices.size == bundle.fit_labels.size
+            else "stratified_context_cap"
+        ),
+        "identity_parity_max_abs_test": float(parity_test),
+        "identity_parity_reference_test": parity_reference_test,
+        "public_path_input_parity_checked_test": bool(public_parity_test),
+        "public_path_input_parity_passed": True if public_parity_test else None,
+        "fresh_spline_view_identity_passed": bool(adapters is None or parity_test == 0.0),
+        "adapter_seed": int(adapter_seed),
+        "adapter_checkpoint_steps_requested": list(checkpoint_steps),
+        "adapter_checkpoint_steps_frozen": sorted(checkpoint_predictions),
+        "adapter_steps_executed": int(executed_steps),
+        "adapter_first_objective": first_objective,
+        "adapter_final_objective": final_objective,
+        "adapter_configured_train_context_rows": config.get("train_context_rows"),
+        "adapter_train_context_policy": (
+            "all_non_query_outer_training_rows"
+            if config.get("train_context_rows") is None
+            else "sampled_context_cap"
+        ),
+        "adapter_observed_train_context_rows_min": (
+            None if not training_context_sizes else int(min(training_context_sizes))
+        ),
+        "adapter_observed_train_context_rows_max": (
+            None if not training_context_sizes else int(max(training_context_sizes))
+        ),
+        "adapter_observed_train_context_rows_mean": (
+            None if not training_context_sizes else float(np.mean(training_context_sizes))
+        ),
+        "adapter_deployment_context_rows": int(bundle.support_indices.size),
+        "adapter_train_to_deployment_context_ratio": (
+            None
+            if not training_context_sizes
+            else float(np.mean(training_context_sizes) / bundle.support_indices.size)
+        ),
+        "checkpoint_metadata": checkpoint_metadata,
+        "train_seconds": float(time.perf_counter() - started),
+        "peak_allocated_gib": float(peak_gib),
+    }
+    del adapters, bundle
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    return identity_test, checkpoint_predictions, metadata
+
+
 def _load_prediction(path: Path, key: str) -> np.ndarray:
     with np.load(path, allow_pickle=False) as artifact:
         return np.asarray(artifact[key])
@@ -2068,6 +2357,302 @@ def run_task_unconditional_full_context_refit_standard(
     if device.type == "cuda":
         torch.cuda.empty_cache()
     return result
+
+
+def run_task_full_context_refit_checkpoint_audit_standard(
+    *,
+    task: OpenMLTaskData,
+    config_labels: list[str],
+    configs: list[dict[str, Any]],
+    checkpoint_steps: tuple[int, ...],
+    output_dir: Path,
+    protocol_seed: int,
+    device: torch.device,
+    classifier_checkpoint: str | Path | None,
+    regressor_checkpoint: str | Path | None,
+    resume: bool,
+    run_fingerprint_hash: str,
+    progress: Any = None,
+) -> dict[str, Any]:
+    """Freeze a development-only full-context DirectSpline checkpoint curve.
+
+    The resulting outer-test curve is diagnostic evidence only.  It cannot
+    select a deployment checkpoint, a regulariser, or an identity guard.
+    """
+
+    if len(config_labels) != 1 or len(configs) != 1:
+        raise ValueError("full-context checkpoint audit requires exactly one predeclared configuration")
+    if not checkpoint_steps or checkpoint_steps != tuple(sorted(set(checkpoint_steps))):
+        raise ValueError("checkpoint_steps must be a non-empty sorted unique sequence")
+    if checkpoint_steps[0] != 0 or any(step < 0 for step in checkpoint_steps):
+        raise ValueError("checkpoint_steps must start at zero and be non-negative")
+    selected_label = config_labels[0]
+    selected_config = configs[0]
+    audit_dir = _full_context_checkpoint_audit_dir(output_dir, task, selected_label)
+    audit_summary_path = audit_dir / "summary.json"
+    audit_predictions_path = audit_dir / "predictions.npz"
+    if resume and audit_summary_path.is_file() and audit_predictions_path.is_file():
+        result = _json_load(audit_summary_path)
+        if result.get("run_fingerprint_hash") != run_fingerprint_hash:
+            raise RuntimeError(
+                f"refusing to resume {audit_dir}: checkpoint-audit artifacts use another immutable fingerprint"
+            )
+        if result.get("audit_type") != "development_only_full_context_checkpoint_curve":
+            raise RuntimeError(f"refusing to reuse a non-audit refit artifact: {audit_dir}")
+        if result.get("checkpoint_steps") != list(checkpoint_steps):
+            raise RuntimeError(f"refusing to reuse another checkpoint schedule: {audit_dir}")
+        _emit(progress, event="full_refit_checkpoint_audit_reused", task_id=task.task_id)
+        return result
+
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    _emit(
+        progress,
+        event="full_refit_checkpoint_audit_started",
+        task_id=task.task_id,
+        config_label=selected_label,
+        checkpoint_steps=list(checkpoint_steps),
+    )
+    backbone, checkpoint_path, checkpoint_metadata = load_frozen_backbone(
+        problem_type=task.problem_type,
+        device=device,
+        classifier_checkpoint=classifier_checkpoint,
+        regressor_checkpoint=regressor_checkpoint,
+    )
+    identity_test, checkpoint_predictions, metadata = _fit_full_context_refit_checkpoint_audit_standard(
+        task=task,
+        config=selected_config,
+        checkpoint_steps=checkpoint_steps,
+        protocol_seed=protocol_seed,
+        backbone=backbone,
+        device=device,
+        checkpoint_state_dir=audit_dir / "checkpoint_states",
+        progress=progress,
+    )
+    prediction_payload: dict[str, np.ndarray] = {"identity_test": identity_test}
+    for step, prediction in checkpoint_predictions.items():
+        prediction_payload[f"adapted_test_step_{step:06d}"] = prediction
+    np.savez_compressed(audit_predictions_path, **prediction_payload)
+    result = {
+        "audit_type": "development_only_full_context_checkpoint_curve",
+        "task_id": task.task_id,
+        "dataset_id": task.dataset_id,
+        "dataset_name": task.dataset_name,
+        "problem_type": task.problem_type,
+        "n_classes": task.n_classes,
+        "outer_split_hash": task.outer_split_hash,
+        "run_fingerprint_hash": run_fingerprint_hash,
+        "selected_config_label": selected_label,
+        "selected_config": selected_config,
+        "checkpoint_steps": list(checkpoint_steps),
+        "checkpoint_steps_frozen": sorted(checkpoint_predictions),
+        "checkpoint_state_directory": "checkpoint_states",
+        "checkpoint": checkpoint_metadata,
+        "refit": metadata,
+        "selection": {
+            "mode": "development_only_checkpoint_curve_no_selection",
+            "configuration_selection": "sole configuration frozen before the run",
+            "checkpoint_selection": "none; every requested checkpoint is retained",
+            "deployment_guard_applied": False,
+            "oof_used_for_training_or_deployment": False,
+        },
+        "outer_test_policy": (
+            "Outer-test labels are used only after every requested checkpoint prediction has been frozen, "
+            "to diagnose the development learning curve. They must not select a checkpoint, configuration, "
+            "regularisation strength, or deployment guard."
+        ),
+    }
+    _json_dump(audit_summary_path, result)
+    _emit(
+        progress,
+        event="full_refit_checkpoint_audit_completed",
+        task_id=task.task_id,
+        checkpoint_steps_frozen=sorted(checkpoint_predictions),
+        executed_steps=int(metadata["adapter_steps_executed"]),
+        train_seconds=float(metadata["train_seconds"]),
+        peak_allocated_gib=float(metadata["peak_allocated_gib"]),
+    )
+    del backbone, checkpoint_path
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    return result
+
+
+def summarize_full_context_refit_checkpoint_audit_task(
+    *,
+    task: OpenMLTaskData,
+    output_dir: Path,
+    audit_result: dict[str, Any],
+) -> dict[str, Any]:
+    """Score an already-frozen checkpoint curve for development diagnosis."""
+
+    if audit_result.get("audit_type") != "development_only_full_context_checkpoint_curve":
+        raise RuntimeError("refusing to score a non-audit full-context artifact as a checkpoint curve")
+    selected_label = str(audit_result["selected_config_label"])
+    audit_dir = _full_context_checkpoint_audit_dir(output_dir, task, selected_label)
+    prediction_path = audit_dir / "predictions.npz"
+    identity_prediction = _load_prediction(prediction_path, "identity_test")
+    identity_metrics = _metric_bundle(task.problem_type, task.y_test, identity_prediction, task.n_classes)
+    checkpoint_metadata = {
+        int(item["step"]): item
+        for item in audit_result["refit"].get("checkpoint_metadata", [])
+    }
+    checkpoint_metrics: list[dict[str, Any]] = []
+    frozen_steps = set(int(step) for step in audit_result.get("checkpoint_steps_frozen", []))
+    for step in (int(value) for value in audit_result["checkpoint_steps"]):
+        record = checkpoint_metadata.get(step)
+        if step not in frozen_steps:
+            checkpoint_metrics.append(
+                {
+                    "step": step,
+                    "prediction_frozen": False,
+                    "candidate": {
+                        "deployment_error": float("inf"),
+                        "benchmark_error": float("inf"),
+                        "prediction_valid": False,
+                        "invalid_prediction_error": "checkpoint_not_frozen_after_nonfinite_training_objective",
+                    },
+                    "deployment_relative_improvement_vs_identity": float("-inf"),
+                    "metadata": record,
+                }
+            )
+            continue
+        prediction = _load_prediction(prediction_path, f"adapted_test_step_{step:06d}")
+        candidate_metrics = _candidate_metric_bundle(
+            task.problem_type, task.y_test, prediction, task.n_classes
+        )
+        deployment_error_identity = float(identity_metrics["deployment_error"])
+        deployment_error_candidate = float(candidate_metrics["deployment_error"])
+        checkpoint_metrics.append(
+            {
+                "step": step,
+                "prediction_frozen": True,
+                "candidate": candidate_metrics,
+                "deployment_relative_improvement_vs_identity": float(
+                    (deployment_error_identity - deployment_error_candidate)
+                    / max(abs(deployment_error_identity), 1e-12)
+                ),
+                "metadata": record,
+            }
+        )
+    result = {
+        "report_schema_version": 1,
+        "audit_type": "development_only_full_context_checkpoint_curve",
+        "outer_test_scored_after_all_checkpoint_predictions_frozen": True,
+        "outer_test_used_for_selection": False,
+        "task_id": task.task_id,
+        "dataset_id": task.dataset_id,
+        "dataset_name": task.dataset_name,
+        "problem_type": task.problem_type,
+        "n_classes": task.n_classes,
+        "outer_split_hash": task.outer_split_hash,
+        "pipeline": "standard_ensemble_full_context_checkpoint_audit",
+        "full_context_identity": identity_metrics,
+        "checkpoint_metrics": checkpoint_metrics,
+        "checkpoint_audit": audit_result,
+        "comparison_note": (
+            "Every checkpoint uses the same fresh all-outer-training-row TabICL estimator and context as "
+            "full_context_identity. This outer-test curve is development-only diagnostic evidence; it is not "
+            "a permitted source of checkpoint, configuration, regularisation, or deployment selection."
+        ),
+    }
+    path = output_dir / "full_context_checkpoint_audit_task_summaries" / (
+        f"task_{task.task_id}_{_safe_name(task.dataset_name)}.json"
+    )
+    _json_dump(path, result)
+    return result
+
+
+def summarize_full_context_refit_checkpoint_audit_experiment(
+    *,
+    task_summaries: list[dict[str, Any]],
+    output_dir: Path,
+    bootstrap_rounds: int,
+    bootstrap_seed: int,
+    skipped_tasks: list[dict[str, Any]] | None = None,
+    task_eligibility: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Write the paired development learning curve across completed tasks."""
+
+    if not task_summaries:
+        raise ValueError("cannot summarise an empty full-context checkpoint audit")
+    skipped_tasks = [] if skipped_tasks is None else skipped_tasks
+    schedules = {tuple(item["checkpoint_audit"]["checkpoint_steps"]) for item in task_summaries}
+    if len(schedules) != 1:
+        raise ValueError("all checkpoint-audit task summaries must share one checkpoint schedule")
+    checkpoint_steps = next(iter(schedules))
+    problem_types = np.asarray([str(item["problem_type"]) for item in task_summaries], dtype=object)
+    identity_benchmark = np.asarray(
+        [float(item["full_context_identity"]["benchmark_error"]) for item in task_summaries], dtype=float
+    )
+    checkpoint_results: dict[str, dict[str, Any]] = {}
+    rows: list[dict[str, Any]] = []
+    for offset, step in enumerate(checkpoint_steps):
+        candidates: list[float] = []
+        for item in task_summaries:
+            metric = next(record for record in item["checkpoint_metrics"] if int(record["step"]) == step)
+            candidates.append(float(metric["candidate"]["benchmark_error"]))
+            metadata = metric.get("metadata") or {}
+            diagnostics = metadata.get("adapter_diagnostics") or {}
+            rows.append(
+                {
+                    "task_id": item["task_id"],
+                    "dataset_id": item["dataset_id"],
+                    "dataset_name": item["dataset_name"],
+                    "problem_type": item["problem_type"],
+                    "outer_split_hash": item["outer_split_hash"],
+                    "step": step,
+                    "prediction_frozen": metric["prediction_frozen"],
+                    "training_objective": metadata.get("objective"),
+                    "elapsed_seconds": metadata.get("elapsed_seconds"),
+                    "identity_benchmark_error": item["full_context_identity"]["benchmark_error"],
+                    "identity_deployment_error": item["full_context_identity"]["deployment_error"],
+                    "checkpoint_benchmark_error": metric["candidate"]["benchmark_error"],
+                    "checkpoint_deployment_error": metric["candidate"]["deployment_error"],
+                    "checkpoint_prediction_valid": metric["candidate"].get("prediction_valid", True),
+                    "checkpoint_deployment_relative_improvement_vs_identity": metric[
+                        "deployment_relative_improvement_vs_identity"
+                    ],
+                    "mean_grid_deformation": diagnostics.get("mean_grid_deformation"),
+                    "mean_gate": diagnostics.get("mean_gate"),
+                    "max_gate": diagnostics.get("max_gate"),
+                    "mean_abs_location": diagnostics.get("mean_abs_location"),
+                    "mean_abs_log_scale": diagnostics.get("mean_abs_log_scale"),
+                    "mean_mixing_spectral_norm": diagnostics.get("mean_mixing_spectral_norm"),
+                }
+            )
+        checkpoint_results[str(step)] = _paired_comparison_summary(
+            reference=identity_benchmark,
+            candidate=np.asarray(candidates, dtype=float),
+            problem_types=problem_types,
+            bootstrap_rounds=bootstrap_rounds,
+            bootstrap_seed=bootstrap_seed + offset,
+            reference_label="full_outer_training_standard_tabicl_identity",
+            candidate_label=f"full_context_direct_spline_step_{step}",
+        )
+    csv_path = output_dir / "checkpoint_results.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        fieldnames = list(dict.fromkeys(key for row in rows for key in row))
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    summary = {
+        "audit_type": "development_only_full_context_checkpoint_curve",
+        "n_tasks": len(task_summaries),
+        "n_skipped_tasks": len(skipped_tasks),
+        "task_eligibility": task_eligibility,
+        "skipped_tasks": skipped_tasks,
+        "checkpoint_steps": list(checkpoint_steps),
+        "checkpoint_paired_results": checkpoint_results,
+        "checkpoint_results_csv": str(csv_path),
+        "development_only_rule": (
+            "The outer-test curve diagnoses full-refit learning dynamics on this development suite. It must not "
+            "be used to select a checkpoint, regularisation strength, or deployment procedure; freeze those on "
+            "a subsequent independent evaluation bank."
+        ),
+        "metric_note": "Binary: 1-AUC; multiclass: log loss; regression: RMSE for paired comparison.",
+    }
+    _json_dump(output_dir / "summary.json", summary)
+    return summary
 
 
 def summarize_full_context_refit_task(
