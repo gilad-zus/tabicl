@@ -21,6 +21,7 @@ from scripts.direct_spline_openml_lite import (
     _same_equivalent_hardware_resume_semantics,
     _same_experimental_semantics,
     _validate,
+    _validation_selected_refit_configs,
     _write_all_skipped_summary,
     _write_run_progress,
 )
@@ -91,6 +92,16 @@ def test_all_skipped_run_writes_terminal_summary_instead_of_raising(tmp_path):
     assert result["paired_results"] == {}
     assert result["n_skipped_tasks"] == 1
     assert json.loads((tmp_path / "summary.json").read_text(encoding="utf-8")) == result
+
+
+def test_task_id_file_accepts_an_earlier_experiment_manifest(tmp_path):
+    manifest_path = tmp_path / "experiment_manifest.json"
+    manifest_path.write_text(
+        json.dumps({"immutable_run": {"data_source": {"task_ids": [5073, 363343]}}}),
+        encoding="utf-8",
+    )
+
+    assert launcher._task_ids_from_file(manifest_path) == [5073, 363343]
 
 
 def test_cuda_oom_skip_event_is_logged_clearly(tmp_path, capsys):
@@ -226,6 +237,7 @@ def test_source_hashes_cover_public_model_and_spline_implementation():
     expected = {
         "scripts/direct_spline_openml_lite.py",
         "scripts/direct_spline_openml_standard.py",
+        "scripts/direct_spline_openml_validation_selected_refit.py",
         "src/tabicl/__init__.py",
         "src/tabicl/_experiments/direct_spline_openml.py",
         "src/tabicl/_experiments/direct_spline_openml_standard.py",
@@ -412,6 +424,39 @@ def test_checkpoint_audit_launcher_defaults_to_a_500_step_curve(monkeypatch, tmp
     assert args.adapter_steps == 500
     assert labels == ["D"]
     assert configs[0]["adapter_steps"] == 500
+
+
+def test_validation_selected_refit_launcher_freezes_two_seeded_arms(monkeypatch, tmp_path):
+    from scripts.direct_spline_openml_lite import parse_args
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "direct_spline_openml_validation_selected_refit.py",
+            "--output-dir",
+            str(tmp_path),
+            "--pipeline",
+            "standard",
+        ],
+    )
+
+    args = parse_args(
+        default_pipeline="standard",
+        required_pipeline="standard",
+        validation_selected_refit=True,
+    )
+    _validate(args, validation_selected_refit=True)
+    labels, configs = _validation_selected_refit_configs(args)
+
+    assert args.adapter_steps == 500
+    assert args.protocol_seed == 20_260_826
+    assert args.split_seed == 20_260_826
+    assert args.adapter_seed == 20_260_826
+    assert labels == ["cosine", "cosine_identity_regularized"]
+    assert [config["identity_regularization"] for config in configs] == [0.0, 0.01]
+    assert all(config["random_state"] == args.adapter_seed for config in configs)
+    assert all(config["cosine_schedule_steps"] == 500 for config in configs)
+    assert all(config["selection_checkpoint_interval"] == 25 for config in configs)
 
 
 def test_standard_launcher_pipeline_can_be_enforced(monkeypatch, tmp_path):

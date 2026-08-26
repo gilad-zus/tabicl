@@ -23,6 +23,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 import csv
 import gc
+import hashlib
 import json
 from pathlib import Path
 import time
@@ -33,6 +34,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.utils.checkpoint import checkpoint
+from sklearn.model_selection import ShuffleSplit, StratifiedShuffleSplit
 from sklearn.utils.validation import validate_data
 
 from tabicl import TabICLClassifier, TabICLRegressor
@@ -136,6 +138,10 @@ class _AdapterSet(nn.Module):
 
     def for_method(self, method: str) -> DirectSplineTransform:
         return self.adapters[self._keys[method]]
+
+
+class ValidationSplitInfeasibleError(ValueError):
+    """A task cannot retain a valid one-split classification validation arm."""
 
 
 def standard_direct_spline_config(
@@ -365,6 +371,131 @@ def _optimizer(adapters: _AdapterSet, config: dict[str, Any]) -> torch.optim.Opt
     if not groups:
         raise RuntimeError("DirectSpline has no trainable parameters")
     return torch.optim.AdamW(groups)
+
+
+def _cosine_scheduler(
+    optimizer: torch.optim.Optimizer,
+    *,
+    total_steps: int,
+    min_lr_ratio: float,
+) -> torch.optim.lr_scheduler.LambdaLR:
+    """Decay every adapter parameter group along one reproducible cosine prefix.
+
+    A validation-selected duration is only meaningful if its full-data refit
+    receives the *same* learning-rate prefix.  ``total_steps`` is therefore
+    the declared maximum schedule length, not the selected refit duration.
+    """
+
+    if total_steps <= 0:
+        raise ValueError("total_steps must be positive")
+    if not 0.0 < min_lr_ratio <= 1.0:
+        raise ValueError("min_lr_ratio must lie in (0, 1]")
+
+    def multiplier(step: int) -> float:
+        progress = min(max(int(step), 0), total_steps) / float(total_steps)
+        return float(
+            min_lr_ratio
+            + (1.0 - min_lr_ratio) * 0.5 * (1.0 + np.cos(np.pi * progress))
+        )
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=multiplier)
+
+
+def _adapter_identity_penalty(adapters: _AdapterSet | None) -> torch.Tensor | None:
+    """Return differentiable mean function-space deformation from identity.
+
+    This penalises the actual numerical mapping rather than parameter norm.
+    It is intentionally evaluated in each normalisation branch's coordinate
+    system, mirroring the checkpoint diagnostics used by the preceding audit.
+    """
+
+    if adapters is None:
+        return None
+    penalties: list[torch.Tensor] = []
+    for key in adapters._keys.values():
+        adapter = adapters.adapters[key]
+        parameters = adapter.parameters_for_transform()
+        grid_values = torch.linspace(
+            -adapter.standardized_range,
+            adapter.standardized_range,
+            33,
+            dtype=parameters.location.dtype,
+            device=parameters.location.device,
+        )
+        # A same-value-in-every-column grid cannot observe a mixing matrix
+        # that happens to annihilate the all-ones direction.  Cyclically shift
+        # the sweep by column so this remains a compact function-space probe
+        # for the independent splines *and* for cross-column residuals.
+        grid_rows = torch.arange(grid_values.numel(), device=grid_values.device).view(-1, 1)
+        grid_columns = torch.arange(
+            parameters.location.shape[1], device=grid_values.device
+        ).view(1, -1)
+        grid = grid_values[(grid_rows + grid_columns) % grid_values.numel()].unsqueeze(0).expand(
+            parameters.location.shape[0], -1, -1
+        )
+        penalties.append((adapter.transform(grid) - grid).square().mean())
+    if not penalties:  # pragma: no cover - _AdapterSet always has at least one branch
+        return None
+    return torch.stack(penalties).mean()
+
+
+def _single_validation_split(
+    task: OpenMLTaskData,
+    *,
+    validation_fraction: float,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build one deterministic train/validation split inside the outer train set.
+
+    The adapter never sees validation labels while training.  Classification
+    uses stratification so the normal TabICL estimator and validation metric
+    retain every class on both sides of the split.
+    """
+
+    if not 0.0 < validation_fraction < 0.5:
+        raise ValueError("validation_fraction must lie in (0, 0.5)")
+    indices = np.arange(len(task.y_train), dtype=int)
+    if task.problem_type == "regression":
+        splitter = ShuffleSplit(n_splits=1, test_size=validation_fraction, random_state=seed)
+        fit_indices, validation_indices = next(splitter.split(indices))
+        return np.asarray(fit_indices, dtype=int), np.asarray(validation_indices, dtype=int)
+
+    counts = np.bincount(np.asarray(task.y_train, dtype=int))
+    if counts.size == 0 or int(counts.min()) < 3:
+        raise ValidationSplitInfeasibleError(
+            f"task {task.task_id} cannot form a train/validation DirectSpline split: "
+            "every classification class needs at least three outer-training rows"
+        )
+    splitter = StratifiedShuffleSplit(n_splits=1, test_size=validation_fraction, random_state=seed)
+    try:
+        fit_indices, validation_indices = next(splitter.split(indices, task.y_train))
+    except ValueError as error:
+        raise ValidationSplitInfeasibleError(
+            f"task {task.task_id} cannot form the requested stratified validation split "
+            f"at fraction {validation_fraction}"
+        ) from error
+    fit_labels = np.asarray(task.y_train[fit_indices], dtype=int)
+    validation_labels = np.asarray(task.y_train[validation_indices], dtype=int)
+    expected = np.arange(int(task.n_classes or 0), dtype=int)
+    if not (np.array_equal(np.unique(fit_labels), expected) and np.array_equal(np.unique(validation_labels), expected)):
+        raise ValidationSplitInfeasibleError(
+            f"task {task.task_id} validation split omitted a class despite stratification"
+        )
+    if int(np.bincount(fit_labels, minlength=len(expected)).min()) < 2:
+        raise ValidationSplitInfeasibleError(
+            f"task {task.task_id} cannot retain two inner-training rows in every class at "
+            f"validation_fraction={validation_fraction}"
+        )
+    return np.asarray(fit_indices, dtype=int), np.asarray(validation_indices, dtype=int)
+
+
+def _split_sha256(fit_indices: np.ndarray, validation_indices: np.ndarray) -> str:
+    """Fingerprint a persisted inner split without embedding every index in JSON."""
+
+    digest = hashlib.sha256()
+    for values in (np.asarray(fit_indices, dtype=np.int64), np.asarray(validation_indices, dtype=np.int64)):
+        digest.update(values.tobytes())
+    return digest.hexdigest()
 
 
 def _apply_adapter(
@@ -2231,6 +2362,1159 @@ def _fit_full_context_refit_checkpoint_audit_standard(
 def _load_prediction(path: Path, key: str) -> np.ndarray:
     with np.load(path, allow_pickle=False) as artifact:
         return np.asarray(artifact[key])
+
+
+def _validation_selected_refit_dir(
+    output_dir: Path,
+    task: OpenMLTaskData,
+    label: str,
+) -> Path:
+    """Return the durable artifact directory for one validation/refit arm."""
+
+    return _config_dir(output_dir, task, label) / "validation_selected_refit"
+
+
+def _artifact_sha256(path: Path) -> str:
+    """Hash a durable validation/refit artifact without holding it in memory."""
+
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _try_load_validation_selected_refit_artifact(
+    *,
+    task: OpenMLTaskData,
+    label: str,
+    config: dict[str, Any],
+    validation_fraction: float,
+    validation_seed: int,
+    task_split_seed: int,
+    fit_indices: np.ndarray,
+    validation_indices: np.ndarray,
+    split_hash: str,
+    summary_path: Path,
+    predictions_path: Path,
+    split_path: Path,
+    selected_state_path: Path,
+    run_fingerprint_hash: str,
+) -> dict[str, Any] | None:
+    """Return one complete, verified resume artifact or ``None`` to rebuild it.
+
+    The prediction archive is a completion boundary: outer-test metrics are
+    scored only after both variants' complete archives are present. A malformed
+    or interrupted artifact is deliberately rebuilt, while a different run
+    fingerprint remains a hard error rather than an unsafe overwrite.
+    """
+
+    try:
+        result = _json_load(summary_path)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return None
+    if result.get("run_fingerprint_hash") != run_fingerprint_hash:
+        raise RuntimeError(
+            f"refusing to resume {summary_path.parent}: validation/refit artifacts use another immutable fingerprint"
+        )
+    if result.get("experiment_type") != "validation_selected_checkpoint_then_full_context_refit":
+        return None
+    if (
+        result.get("task_id") != task.task_id
+        or result.get("dataset_id") != task.dataset_id
+        or result.get("dataset_name") != task.dataset_name
+        or result.get("outer_split_hash") != task.outer_split_hash
+        or result.get("config_label") != label
+        or result.get("config") != config
+    ):
+        return None
+    split_metadata = result.get("validation_split")
+    if not isinstance(split_metadata, dict) or split_metadata != {
+        "fraction": float(validation_fraction),
+        "root_seed": int(validation_seed),
+        "task_seed": int(task_split_seed),
+        "inner_train_rows": int(fit_indices.size),
+        "validation_rows": int(validation_indices.size),
+        "sha256": split_hash,
+        "artifact": split_path.name,
+    }:
+        return None
+    selection = result.get("selection")
+    refit = result.get("full_context_refit")
+    if not isinstance(selection, dict) or not isinstance(refit, dict):
+        return None
+    try:
+        selected_step = int(selection["selected_step"])
+        selected_use_adapted = bool(selection["selected_use_adapted"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if selected_step < 0 or selected_step > int(config["adapter_steps"]):
+        return None
+    if int(refit.get("selected_steps_requested", -1)) != selected_step:
+        return None
+    if not isinstance(refit.get("selected_duration_completed"), bool):
+        return None
+    expected_keys = {
+        "inner_identity_validation": _prediction_shape(
+            int(validation_indices.size), task.problem_type, task.n_classes
+        ),
+        "inner_selected_validation": _prediction_shape(
+            int(validation_indices.size), task.problem_type, task.n_classes
+        ),
+        "inner_identity_test": _prediction_shape(len(task.x_test), task.problem_type, task.n_classes),
+        "inner_selected_test": _prediction_shape(len(task.x_test), task.problem_type, task.n_classes),
+        "full_identity_test": _prediction_shape(len(task.x_test), task.problem_type, task.n_classes),
+        "full_selected_test": _prediction_shape(len(task.x_test), task.problem_type, task.n_classes),
+    }
+    try:
+        with np.load(split_path, allow_pickle=False) as persisted_split:
+            persisted_fit_indices = np.asarray(persisted_split["inner_train_indices"], dtype=int)
+            persisted_validation_indices = np.asarray(persisted_split["validation_indices"], dtype=int)
+        if not (
+            np.array_equal(persisted_fit_indices, fit_indices)
+            and np.array_equal(persisted_validation_indices, validation_indices)
+            and _split_sha256(persisted_fit_indices, persisted_validation_indices) == split_hash
+        ):
+            return None
+        if result.get("prediction_artifact_sha256") != _artifact_sha256(predictions_path):
+            return None
+        if result.get("selected_adapter_state_sha256") != _artifact_sha256(selected_state_path):
+            return None
+        with np.load(predictions_path, allow_pickle=False) as predictions:
+            if set(predictions.files) != set(expected_keys):
+                return None
+            for key, expected_shape in expected_keys.items():
+                array = np.asarray(predictions[key])
+                if array.shape != expected_shape or not np.issubdtype(array.dtype, np.number):
+                    return None
+        try:
+            state_payload = torch.load(selected_state_path, map_location="cpu", weights_only=True)
+        except TypeError:  # pragma: no cover - old torch compatibility.
+            state_payload = torch.load(selected_state_path, map_location="cpu")
+        if not isinstance(state_payload, dict):
+            return None
+        if (
+            int(state_payload.get("selected_step", -1)) != selected_step
+            or bool(state_payload.get("selected_use_adapted")) != selected_use_adapted
+            or not isinstance(state_payload.get("adapter_state_dict"), dict)
+        ):
+            return None
+    except Exception:  # Corrupt/interrupted local artifact: rebuild this arm deterministically.
+        return None
+    return result
+
+
+def _adapter_training_objective(
+    *,
+    bundle: _StandardBag,
+    adapters: _AdapterSet,
+    context_indices: np.ndarray,
+    query_indices: np.ndarray,
+    config: dict[str, Any],
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return task loss, function-space identity penalty, and total loss."""
+
+    output = _training_logits(
+        bundle=bundle,
+        adapters=adapters,
+        context_indices=context_indices,
+        query_indices=query_indices,
+        device=device,
+    )
+    target = torch.as_tensor(bundle.fit_labels[query_indices], device=device)
+    if bundle.problem_type == "regression":
+        task_loss = F.mse_loss(output.flatten(), target.float().flatten())
+    else:
+        task_loss = F.cross_entropy(
+            output / float(bundle.estimator.softmax_temperature), target.long().flatten()
+        )
+    regularization_weight = float(config.get("identity_regularization", 0.0))
+    if regularization_weight == 0.0:
+        # Keep the scheduler-only control free of an unnecessary second
+        # transform graph (and of any penalty-only non-finite failure). Grid
+        # deformation is still recorded at each selected checkpoint.
+        penalty = torch.zeros((), dtype=task_loss.dtype, device=task_loss.device)
+        total = task_loss
+    else:
+        penalty = _adapter_identity_penalty(adapters)
+        if penalty is None:  # pragma: no cover - callers only invoke this with adapters
+            penalty = torch.zeros((), dtype=task_loss.dtype, device=task_loss.device)
+        total = task_loss + regularization_weight * penalty
+    del output, target
+    return task_loss, penalty, total
+
+
+def _fit_validation_selected_checkpoint_standard(
+    *,
+    task: OpenMLTaskData,
+    fit_indices: np.ndarray,
+    validation_indices: np.ndarray,
+    config: dict[str, Any],
+    protocol_seed: int,
+    backbone: TabICL,
+    device: torch.device,
+    progress: Any,
+) -> tuple[dict[str, np.ndarray], dict[str, Any], dict[str, Any]]:
+    """Choose identity or a spline checkpoint using only inner validation labels.
+
+    No outer-test metric is computed here.  The selected inner-train model's
+    test prediction is frozen only after validation selection, and its test
+    label is intentionally left to the separate task-summary stage.
+    """
+
+    max_steps = int(config["adapter_steps"])
+    checkpoint_interval = int(config["selection_checkpoint_interval"])
+    scheduler_horizon = int(config["cosine_schedule_steps"])
+    if max_steps <= 0 or checkpoint_interval <= 0 or scheduler_horizon < max_steps:
+        raise ValueError("invalid validation-selection schedule")
+    started = time.perf_counter()
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    bundle = _fit_standard_bag(
+        task=task,
+        fit_indices=fit_indices,
+        config=config,
+        protocol_seed=protocol_seed,
+        bag=-2,
+        backbone=backbone,
+        device=device,
+    )
+    validation_x = task.x_train.iloc[validation_indices].reset_index(drop=True)
+    validation_y = np.asarray(task.y_train[validation_indices])
+    adapter_seed = _seed(int(config["random_state"]), task.task_id, -2, 202)
+    torch.manual_seed(adapter_seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(adapter_seed)
+    adapters = _make_adapters(bundle, config, device)
+    parity_validation, parity_validation_reference, public_parity_validation = _identity_view_parity(
+        bundle=bundle,
+        adapters=adapters,
+        query_x=validation_x,
+        device=device,
+        progress=progress,
+        task_id=task.task_id,
+        bag=-2,
+        split="validation_selection_validation",
+    )
+    # The outer-test feature view is checked while the adapter is exactly
+    # identity.  This uses no outer-test labels and guards the custom input
+    # boundary before any selected prediction is frozen.
+    parity_test, parity_test_reference, public_parity_test = _identity_view_parity(
+        bundle=bundle,
+        adapters=adapters,
+        query_x=task.x_test,
+        device=device,
+        progress=progress,
+        task_id=task.task_id,
+        bag=-2,
+        split="validation_selection_test",
+    )
+    identity_validation = _normal_prediction(
+        bundle=bundle,
+        query_x=validation_x,
+        context_indices=bundle.support_indices,
+        adapters=None,
+        device=device,
+    )
+    identity_validation_error = deployment_error(
+        task.problem_type, validation_y, identity_validation, n_classes=task.n_classes
+    )
+    identity_state = {} if adapters is None else _cpu_state_dict(adapters)
+    checkpoint_records: list[dict[str, Any]] = [
+        {
+            "step": 0,
+            "kind": "identity",
+            "validation_error": float(identity_validation_error),
+            "validation_relative_improvement_vs_identity": 0.0,
+            "task_objective": None,
+            "identity_penalty": 0.0,
+            "total_objective": None,
+            "learning_rates": [],
+            "elapsed_seconds": float(time.perf_counter() - started),
+            "adapter_diagnostics": _adapter_checkpoint_diagnostics(adapters),
+        }
+    ]
+    training_context_sizes: list[int] = []
+    first_task_objective = final_task_objective = float("nan")
+    first_identity_penalty = final_identity_penalty = float("nan")
+    first_total_objective = final_total_objective = float("nan")
+    selected_candidate_state: dict[str, Any] | None = None
+    selected_candidate_step: int | None = None
+    selected_candidate_error = float("inf")
+    executed_steps = 0
+    encountered_nonfinite_objective = False
+    no_trainable_numerical_features = adapters is None
+
+    if adapters is not None:
+        optimizer = _optimizer(adapters, config)
+        scheduler = _cosine_scheduler(
+            optimizer,
+            total_steps=scheduler_horizon,
+            min_lr_ratio=float(config["cosine_min_lr_ratio"]),
+        )
+        episode_rng = np.random.default_rng(
+            _seed(int(config["random_state"]), task.task_id, -2, 203)
+        )
+        for step in range(1, max_steps + 1):
+            configured_context_rows = config.get("train_context_rows")
+            context_row_limit = (
+                max(1, bundle.fit_labels.size - int(config["query_batch_rows"]))
+                if configured_context_rows is None
+                else int(configured_context_rows)
+            )
+            context_rows, query_rows = sample_episode_indices(
+                bundle.fit_labels,
+                problem_type=task.problem_type,
+                context_rows=context_row_limit,
+                query_rows=int(config["query_batch_rows"]),
+                rng=episode_rng,
+            )
+            training_context_sizes.append(int(context_rows.size))
+            optimizer.zero_grad(set_to_none=True)
+            task_objective, identity_penalty, total_objective = _adapter_training_objective(
+                bundle=bundle,
+                adapters=adapters,
+                context_indices=context_rows,
+                query_indices=query_rows,
+                config=config,
+                device=device,
+            )
+            if not torch.isfinite(total_objective):
+                encountered_nonfinite_objective = True
+                _emit(
+                    progress,
+                    event="validation_selection_nonfinite_objective",
+                    task_id=task.task_id,
+                    step=step,
+                )
+                del task_objective, identity_penalty, total_objective
+                break
+            if step == 1:
+                first_task_objective = float(task_objective.detach())
+                first_identity_penalty = float(identity_penalty.detach())
+                first_total_objective = float(total_objective.detach())
+            total_objective.backward()
+            torch.nn.utils.clip_grad_norm_(adapters.parameters(), float(config["grad_clip"]))
+            optimizer.step()
+            scheduler.step()
+            final_task_objective = float(task_objective.detach())
+            final_identity_penalty = float(identity_penalty.detach())
+            final_total_objective = float(total_objective.detach())
+            executed_steps = step
+            if step % checkpoint_interval == 0 or step == max_steps:
+                candidate = _normal_prediction(
+                    bundle=bundle,
+                    query_x=validation_x,
+                    context_indices=bundle.support_indices,
+                    adapters=adapters,
+                    device=device,
+                )
+                candidate_error = _candidate_deployment_error(
+                    task.problem_type, validation_y, candidate, n_classes=task.n_classes
+                )
+                relative_improvement = (
+                    None
+                    if not np.isfinite(candidate_error)
+                    else float(
+                        (identity_validation_error - candidate_error)
+                        / max(abs(identity_validation_error), 1e-12)
+                    )
+                )
+                if candidate_error < selected_candidate_error:
+                    selected_candidate_error = candidate_error
+                    selected_candidate_state = _cpu_state_dict(adapters)
+                    selected_candidate_step = int(step)
+                diagnostics = _adapter_checkpoint_diagnostics(adapters)
+                record = {
+                    "step": int(step),
+                    "kind": "spline",
+                    "validation_error": float(candidate_error),
+                    "validation_relative_improvement_vs_identity": relative_improvement,
+                    "task_objective": final_task_objective,
+                    "identity_penalty": final_identity_penalty,
+                    "total_objective": final_total_objective,
+                    "learning_rates": [float(group["lr"]) for group in optimizer.param_groups],
+                    "elapsed_seconds": float(time.perf_counter() - started),
+                    "adapter_diagnostics": diagnostics,
+                }
+                checkpoint_records.append(record)
+                _emit(
+                    progress,
+                    event="validation_selection_checkpoint",
+                    task_id=task.task_id,
+                    step=int(step),
+                    validation_error=float(candidate_error),
+                    identity_validation_error=float(identity_validation_error),
+                    validation_relative_improvement=relative_improvement,
+                    elapsed_seconds=record["elapsed_seconds"],
+                    mean_grid_deformation=diagnostics["mean_grid_deformation"],
+                )
+                del candidate
+            del task_objective, identity_penalty, total_objective
+        del scheduler, optimizer
+
+    if selected_candidate_state is None:
+        use_adapted = False
+        selected_step = 0
+        selected_validation_error = float(identity_validation_error)
+    else:
+        decision = choose_identity_guard(
+            identity_error=float(identity_validation_error),
+            adapted_error=float(selected_candidate_error),
+            required_relative_improvement=float(config["selection_relative_improvement"]),
+        )
+        use_adapted = bool(decision.use_adapted)
+        selected_step = int(selected_candidate_step) if use_adapted and selected_candidate_step is not None else 0
+        selected_validation_error = (
+            float(selected_candidate_error) if use_adapted else float(identity_validation_error)
+        )
+    selected_state = selected_candidate_state if use_adapted else identity_state
+    if adapters is not None:
+        adapters.load_state_dict(selected_state, strict=True)
+    selected_validation = (
+        identity_validation.copy()
+        if not use_adapted or adapters is None
+        else _normal_prediction(
+            bundle=bundle,
+            query_x=validation_x,
+            context_indices=bundle.support_indices,
+            adapters=adapters,
+            device=device,
+        )
+    )
+    # Outer-test predictions are deliberately generated only after the
+    # validation selection and adapter state are frozen.
+    identity_test = _normal_prediction(
+        bundle=bundle,
+        query_x=task.x_test,
+        context_indices=bundle.support_indices,
+        adapters=None,
+        device=device,
+    )
+    selected_test = (
+        identity_test.copy()
+        if not use_adapted or adapters is None
+        else _normal_prediction(
+            bundle=bundle,
+            query_x=task.x_test,
+            context_indices=bundle.support_indices,
+            adapters=adapters,
+            device=device,
+        )
+    )
+    peak_gib = 0.0 if device.type != "cuda" else torch.cuda.max_memory_allocated(device) / 2**30
+    metadata = {
+        "fit_rows": int(fit_indices.size),
+        "validation_rows": int(validation_indices.size),
+        "support_rows": int(bundle.support_indices.size),
+        "n_features": int(task.x_train.shape[1]),
+        "n_numerical_features": int(bundle.numerical_indices.size),
+        "no_trainable_numerical_features": bool(no_trainable_numerical_features),
+        "normal_estimators": int(STANDARD_TABICL_CONFIG["n_estimators"]),
+        "context_policy": (
+            "all_inner_training_rows"
+            if bundle.support_indices.size == bundle.fit_labels.size
+            else "stratified_context_cap"
+        ),
+        "identity_parity_max_abs_validation": float(parity_validation),
+        "identity_parity_max_abs_test": float(parity_test),
+        "identity_parity_reference_validation": parity_validation_reference,
+        "identity_parity_reference_test": parity_test_reference,
+        "public_path_input_parity_checked_validation": bool(public_parity_validation),
+        "public_path_input_parity_checked_test": bool(public_parity_test),
+        "public_path_input_parity_passed": (
+            True if public_parity_validation and public_parity_test else None
+        ),
+        "fresh_spline_view_identity_passed": bool(
+            adapters is None or (parity_validation == 0.0 and parity_test == 0.0)
+        ),
+        "adapter_seed": int(adapter_seed),
+        "adapter_steps_requested": max_steps,
+        "scheduler": {
+            "kind": "cosine",
+            "horizon_steps": scheduler_horizon,
+            "min_lr_ratio": float(config["cosine_min_lr_ratio"]),
+        },
+        "identity_regularization": float(config.get("identity_regularization", 0.0)),
+        "selection_relative_improvement": float(config["selection_relative_improvement"]),
+        "checkpoint_interval": checkpoint_interval,
+        "checkpoint_records": checkpoint_records,
+        "best_spline_checkpoint_step": selected_candidate_step,
+        "best_spline_validation_error": (
+            None if not np.isfinite(selected_candidate_error) else float(selected_candidate_error)
+        ),
+        "selected_step": int(selected_step),
+        "selected_use_adapted": bool(use_adapted),
+        "selected_validation_error": float(selected_validation_error),
+        "identity_validation_error": float(identity_validation_error),
+        "selected_validation_relative_improvement": float(
+            (identity_validation_error - selected_validation_error)
+            / max(abs(identity_validation_error), 1e-12)
+        ),
+        "adapter_steps_executed": int(executed_steps),
+        "fixed_horizon_completed": bool(adapters is None or executed_steps == max_steps),
+        "encountered_nonfinite_objective": bool(encountered_nonfinite_objective),
+        "adapter_first_task_objective": first_task_objective,
+        "adapter_final_task_objective": final_task_objective,
+        "adapter_first_identity_penalty": first_identity_penalty,
+        "adapter_final_identity_penalty": final_identity_penalty,
+        "adapter_first_total_objective": first_total_objective,
+        "adapter_final_total_objective": final_total_objective,
+        "adapter_configured_train_context_rows": config.get("train_context_rows"),
+        "adapter_train_context_policy": (
+            "all_non_query_inner_training_rows"
+            if config.get("train_context_rows") is None
+            else "sampled_context_cap"
+        ),
+        "adapter_observed_train_context_rows_min": (
+            None if not training_context_sizes else int(min(training_context_sizes))
+        ),
+        "adapter_observed_train_context_rows_max": (
+            None if not training_context_sizes else int(max(training_context_sizes))
+        ),
+        "adapter_observed_train_context_rows_mean": (
+            None if not training_context_sizes else float(np.mean(training_context_sizes))
+        ),
+        "train_seconds": float(time.perf_counter() - started),
+        "peak_allocated_gib": float(peak_gib),
+    }
+    selected_state_cpu = {} if adapters is None else _cpu_state_dict(adapters)
+    del adapters, bundle
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    return {
+        "identity_validation": identity_validation,
+        "selected_validation": selected_validation,
+        "identity_test": identity_test,
+        "selected_test": selected_test,
+    }, metadata, selected_state_cpu
+
+
+def _fit_selected_full_context_refit_standard(
+    *,
+    task: OpenMLTaskData,
+    selected_steps: int,
+    config: dict[str, Any],
+    protocol_seed: int,
+    backbone: TabICL,
+    device: torch.device,
+    progress: Any,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    """Refit a validation-selected schedule on all outer-training rows.
+
+    ``selected_steps`` may be zero, which explicitly carries the validation
+    choice of identity through to the full-context comparison.  When positive,
+    the cosine horizon remains the original maximum schedule length so the
+    refit receives the same LR prefix as its validation-selected checkpoint.
+    """
+
+    if selected_steps < 0 or selected_steps > int(config["adapter_steps"]):
+        raise ValueError("selected_steps must lie within the declared adapter schedule")
+    started = time.perf_counter()
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    full_indices = np.arange(len(task.y_train), dtype=int)
+    bundle = _fit_standard_bag(
+        task=task,
+        fit_indices=full_indices,
+        config=config,
+        protocol_seed=protocol_seed,
+        bag=-2,
+        backbone=backbone,
+        device=device,
+    )
+    adapter_seed = _seed(int(config["random_state"]), task.task_id, -2, 202)
+    torch.manual_seed(adapter_seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(adapter_seed)
+    adapters = _make_adapters(bundle, config, device)
+    parity_test, parity_reference_test, public_parity_test = _identity_view_parity(
+        bundle=bundle,
+        adapters=adapters,
+        query_x=task.x_test,
+        device=device,
+        progress=progress,
+        task_id=task.task_id,
+        bag=-2,
+        split="validation_selected_full_refit_test",
+    )
+    identity_test = _normal_prediction(
+        bundle=bundle,
+        query_x=task.x_test,
+        context_indices=bundle.support_indices,
+        adapters=None,
+        device=device,
+    )
+    training_context_sizes: list[int] = []
+    first_task_objective = final_task_objective = float("nan")
+    first_identity_penalty = final_identity_penalty = float("nan")
+    first_total_objective = final_total_objective = float("nan")
+    executed_steps = 0
+    encountered_nonfinite_objective = False
+    no_trainable_numerical_features = adapters is None
+    if adapters is None or selected_steps == 0:
+        selected_test = identity_test.copy()
+    else:
+        optimizer = _optimizer(adapters, config)
+        scheduler = _cosine_scheduler(
+            optimizer,
+            total_steps=int(config["cosine_schedule_steps"]),
+            min_lr_ratio=float(config["cosine_min_lr_ratio"]),
+        )
+        episode_rng = np.random.default_rng(
+            _seed(int(config["random_state"]), task.task_id, -2, 203)
+        )
+        for step in range(1, selected_steps + 1):
+            configured_context_rows = config.get("train_context_rows")
+            context_row_limit = (
+                max(1, bundle.fit_labels.size - int(config["query_batch_rows"]))
+                if configured_context_rows is None
+                else int(configured_context_rows)
+            )
+            context_rows, query_rows = sample_episode_indices(
+                bundle.fit_labels,
+                problem_type=task.problem_type,
+                context_rows=context_row_limit,
+                query_rows=int(config["query_batch_rows"]),
+                rng=episode_rng,
+            )
+            training_context_sizes.append(int(context_rows.size))
+            optimizer.zero_grad(set_to_none=True)
+            task_objective, identity_penalty, total_objective = _adapter_training_objective(
+                bundle=bundle,
+                adapters=adapters,
+                context_indices=context_rows,
+                query_indices=query_rows,
+                config=config,
+                device=device,
+            )
+            if not torch.isfinite(total_objective):
+                encountered_nonfinite_objective = True
+                _emit(
+                    progress,
+                    event="validation_selected_refit_nonfinite_objective",
+                    task_id=task.task_id,
+                    step=step,
+                )
+                del task_objective, identity_penalty, total_objective
+                break
+            if step == 1:
+                first_task_objective = float(task_objective.detach())
+                first_identity_penalty = float(identity_penalty.detach())
+                first_total_objective = float(total_objective.detach())
+            total_objective.backward()
+            torch.nn.utils.clip_grad_norm_(adapters.parameters(), float(config["grad_clip"]))
+            optimizer.step()
+            scheduler.step()
+            final_task_objective = float(task_objective.detach())
+            final_identity_penalty = float(identity_penalty.detach())
+            final_total_objective = float(total_objective.detach())
+            executed_steps = step
+            del task_objective, identity_penalty, total_objective
+        del scheduler, optimizer
+        if executed_steps != selected_steps:
+            # A partially fitted model is not the validation-selected duration
+            # and must never be silently reported as that endpoint. Retain an
+            # explicitly invalid prediction so the paired summary records a
+            # failed adaptation rather than treating it as a shorter refit.
+            selected_test = np.full_like(identity_test, np.nan)
+        else:
+            selected_test = _normal_prediction(
+                bundle=bundle,
+                query_x=task.x_test,
+                context_indices=bundle.support_indices,
+                adapters=adapters,
+                device=device,
+            )
+    peak_gib = 0.0 if device.type != "cuda" else torch.cuda.max_memory_allocated(device) / 2**30
+    metadata = {
+        "fit_rows": int(full_indices.size),
+        "support_rows": int(bundle.support_indices.size),
+        "n_features": int(task.x_train.shape[1]),
+        "n_numerical_features": int(bundle.numerical_indices.size),
+        "no_trainable_numerical_features": bool(no_trainable_numerical_features),
+        "normal_estimators": int(STANDARD_TABICL_CONFIG["n_estimators"]),
+        "context_policy": (
+            "all_outer_training_rows"
+            if bundle.support_indices.size == bundle.fit_labels.size
+            else "stratified_context_cap"
+        ),
+        "identity_parity_max_abs_test": float(parity_test),
+        "identity_parity_reference_test": parity_reference_test,
+        "public_path_input_parity_checked_test": bool(public_parity_test),
+        "public_path_input_parity_passed": True if public_parity_test else None,
+        "fresh_spline_view_identity_passed": bool(adapters is None or parity_test == 0.0),
+        "adapter_seed": int(adapter_seed),
+        "selected_steps_requested": int(selected_steps),
+        "adapter_steps_executed": int(executed_steps),
+        "selected_duration_completed": bool(executed_steps == selected_steps),
+        "encountered_nonfinite_objective": bool(encountered_nonfinite_objective),
+        "selected_prediction_policy": (
+            "identity_at_step_zero"
+            if selected_steps == 0
+            else "fresh_refit_at_selected_duration"
+            if executed_steps == selected_steps
+            else "invalid_prediction_after_incomplete_refit"
+        ),
+        "scheduler": {
+            "kind": "cosine",
+            "horizon_steps": int(config["cosine_schedule_steps"]),
+            "min_lr_ratio": float(config["cosine_min_lr_ratio"]),
+        },
+        "identity_regularization": float(config.get("identity_regularization", 0.0)),
+        "adapter_first_task_objective": first_task_objective,
+        "adapter_final_task_objective": final_task_objective,
+        "adapter_first_identity_penalty": first_identity_penalty,
+        "adapter_final_identity_penalty": final_identity_penalty,
+        "adapter_first_total_objective": first_total_objective,
+        "adapter_final_total_objective": final_total_objective,
+        "adapter_configured_train_context_rows": config.get("train_context_rows"),
+        "adapter_train_context_policy": (
+            "all_non_query_outer_training_rows"
+            if config.get("train_context_rows") is None
+            else "sampled_context_cap"
+        ),
+        "adapter_observed_train_context_rows_min": (
+            None if not training_context_sizes else int(min(training_context_sizes))
+        ),
+        "adapter_observed_train_context_rows_max": (
+            None if not training_context_sizes else int(max(training_context_sizes))
+        ),
+        "adapter_observed_train_context_rows_mean": (
+            None if not training_context_sizes else float(np.mean(training_context_sizes))
+        ),
+        "train_seconds": float(time.perf_counter() - started),
+        "peak_allocated_gib": float(peak_gib),
+    }
+    del adapters, bundle
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    return identity_test, selected_test, metadata
+
+
+def run_task_validation_selected_full_refit_standard(
+    *,
+    task: OpenMLTaskData,
+    config_labels: list[str],
+    configs: list[dict[str, Any]],
+    validation_fraction: float,
+    validation_seed: int,
+    output_dir: Path,
+    protocol_seed: int,
+    device: torch.device,
+    classifier_checkpoint: str | Path | None,
+    regressor_checkpoint: str | Path | None,
+    resume: bool,
+    run_fingerprint_hash: str,
+    progress: Any = None,
+) -> dict[str, Any]:
+    """Run validation selection and matched full-context refit for each arm.
+
+    Each arm freezes two outer-test prediction pairs: the selected checkpoint
+    from the inner-train model, and a fresh all-row refit trained for the
+    validation-selected duration.  Test labels are deliberately absent from
+    this function; summaries score only the frozen arrays afterward.
+    """
+
+    if len(config_labels) != len(configs) or not config_labels:
+        raise ValueError("validation-selected refit requires matching non-empty labels and configs")
+    if len(set(config_labels)) != len(config_labels):
+        raise ValueError("validation-selected refit config labels must be unique")
+    task_split_seed = _seed(int(validation_seed), task.task_id, -2, 301)
+    fit_indices, validation_indices = _single_validation_split(
+        task,
+        validation_fraction=validation_fraction,
+        seed=task_split_seed,
+    )
+    split_hash = _split_sha256(fit_indices, validation_indices)
+    variants: dict[str, dict[str, Any]] = {}
+    for label, config in zip(config_labels, configs, strict=True):
+        artifact_dir = _validation_selected_refit_dir(output_dir, task, label)
+        summary_path = artifact_dir / "summary.json"
+        predictions_path = artifact_dir / "predictions.npz"
+        split_path = artifact_dir / "inner_split.npz"
+        selected_state_path = artifact_dir / "selected_adapter_state.pt"
+        if resume and all(
+            path.is_file()
+            for path in (summary_path, predictions_path, split_path, selected_state_path)
+        ):
+            result = _try_load_validation_selected_refit_artifact(
+                task=task,
+                label=label,
+                config=config,
+                validation_fraction=validation_fraction,
+                validation_seed=validation_seed,
+                task_split_seed=task_split_seed,
+                fit_indices=fit_indices,
+                validation_indices=validation_indices,
+                split_hash=split_hash,
+                summary_path=summary_path,
+                predictions_path=predictions_path,
+                split_path=split_path,
+                selected_state_path=selected_state_path,
+                run_fingerprint_hash=run_fingerprint_hash,
+            )
+            if result is not None:
+                _emit(progress, event="validation_selected_refit_reused", task_id=task.task_id, config_label=label)
+                variants[label] = result
+                continue
+            _emit(
+                progress,
+                event="validation_selected_refit_rebuilding_incomplete",
+                task_id=task.task_id,
+                config_label=label,
+            )
+
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            split_path,
+            inner_train_indices=fit_indices,
+            validation_indices=validation_indices,
+        )
+        _emit(
+            progress,
+            event="validation_selected_refit_started",
+            task_id=task.task_id,
+            config_label=label,
+            inner_train_rows=int(fit_indices.size),
+            validation_rows=int(validation_indices.size),
+        )
+        selection_backbone, selection_checkpoint_path, selection_checkpoint_metadata = load_frozen_backbone(
+            problem_type=task.problem_type,
+            device=device,
+            classifier_checkpoint=classifier_checkpoint,
+            regressor_checkpoint=regressor_checkpoint,
+        )
+        selection_predictions, selection_metadata, selected_state = _fit_validation_selected_checkpoint_standard(
+            task=task,
+            fit_indices=fit_indices,
+            validation_indices=validation_indices,
+            config=config,
+            protocol_seed=protocol_seed,
+            backbone=selection_backbone,
+            device=device,
+            progress=progress,
+        )
+        torch.save(
+            {
+                "selected_step": int(selection_metadata["selected_step"]),
+                "selected_use_adapted": bool(selection_metadata["selected_use_adapted"]),
+                "adapter_state_dict": selected_state,
+            },
+            selected_state_path,
+        )
+        del selection_backbone, selection_checkpoint_path
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+        refit_backbone, refit_checkpoint_path, refit_checkpoint_metadata = load_frozen_backbone(
+            problem_type=task.problem_type,
+            device=device,
+            classifier_checkpoint=classifier_checkpoint,
+            regressor_checkpoint=regressor_checkpoint,
+        )
+        full_identity_test, full_selected_test, refit_metadata = _fit_selected_full_context_refit_standard(
+            task=task,
+            selected_steps=int(selection_metadata["selected_step"]),
+            config=config,
+            protocol_seed=protocol_seed,
+            backbone=refit_backbone,
+            device=device,
+            progress=progress,
+        )
+        del refit_backbone, refit_checkpoint_path
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+        np.savez_compressed(
+            predictions_path,
+            inner_identity_validation=selection_predictions["identity_validation"],
+            inner_selected_validation=selection_predictions["selected_validation"],
+            inner_identity_test=selection_predictions["identity_test"],
+            inner_selected_test=selection_predictions["selected_test"],
+            full_identity_test=full_identity_test,
+            full_selected_test=full_selected_test,
+        )
+        result = {
+            "experiment_type": "validation_selected_checkpoint_then_full_context_refit",
+            "task_id": task.task_id,
+            "dataset_id": task.dataset_id,
+            "dataset_name": task.dataset_name,
+            "problem_type": task.problem_type,
+            "n_classes": task.n_classes,
+            "outer_split_hash": task.outer_split_hash,
+            "run_fingerprint_hash": run_fingerprint_hash,
+            "config_label": label,
+            "config": config,
+            "validation_split": {
+                "fraction": float(validation_fraction),
+                "root_seed": int(validation_seed),
+                "task_seed": int(task_split_seed),
+                "inner_train_rows": int(fit_indices.size),
+                "validation_rows": int(validation_indices.size),
+                "sha256": split_hash,
+                "artifact": split_path.name,
+            },
+            "selection_checkpoint": selection_checkpoint_metadata,
+            "refit_checkpoint": refit_checkpoint_metadata,
+            "selection": selection_metadata,
+            "full_context_refit": refit_metadata,
+            "selected_adapter_state": selected_state_path.name,
+            "selected_adapter_state_sha256": _artifact_sha256(selected_state_path),
+            "prediction_artifact_sha256": _artifact_sha256(predictions_path),
+            "test_metrics_deferred_to_task_summary": True,
+            "outer_test_policy": (
+                "Validation labels alone select identity or a spline checkpoint before any outer-test prediction "
+                "is frozen. A fresh full-context refit then uses that selected duration and the same cosine "
+                "learning-rate prefix. Outer-test labels are read only by the separate summary stage."
+            ),
+        }
+        _json_dump(summary_path, result)
+        _emit(
+            progress,
+            event="validation_selected_refit_completed",
+            task_id=task.task_id,
+            config_label=label,
+            selected_step=int(selection_metadata["selected_step"]),
+            selected_use_adapted=bool(selection_metadata["selected_use_adapted"]),
+            selection_seconds=float(selection_metadata["train_seconds"]),
+            refit_seconds=float(refit_metadata["train_seconds"]),
+        )
+        variants[label] = result
+    return {
+        "experiment_type": "validation_selected_checkpoint_then_full_context_refit",
+        "task_id": task.task_id,
+        "dataset_id": task.dataset_id,
+        "dataset_name": task.dataset_name,
+        "problem_type": task.problem_type,
+        "n_classes": task.n_classes,
+        "outer_split_hash": task.outer_split_hash,
+        "run_fingerprint_hash": run_fingerprint_hash,
+        "validation_split": {
+            "fraction": float(validation_fraction),
+            "root_seed": int(validation_seed),
+            "task_seed": int(task_split_seed),
+            "inner_train_rows": int(fit_indices.size),
+            "validation_rows": int(validation_indices.size),
+            "sha256": split_hash,
+        },
+        "variants": variants,
+    }
+
+
+def _selected_pair_summary(
+    *,
+    task: OpenMLTaskData,
+    identity_prediction: np.ndarray,
+    selected_prediction: np.ndarray,
+) -> dict[str, Any]:
+    """Score one already-frozen selected prediction against its matched identity."""
+
+    identity_metrics = _metric_bundle(task.problem_type, task.y_test, identity_prediction, task.n_classes)
+    selected_metrics = _candidate_metric_bundle(
+        task.problem_type, task.y_test, selected_prediction, task.n_classes
+    )
+    selected_error = float(selected_metrics["deployment_error"])
+    identity_error = float(identity_metrics["deployment_error"])
+    relative_improvement = (
+        None
+        if not np.isfinite(selected_error)
+        else float((identity_error - selected_error) / max(abs(identity_error), 1e-12))
+    )
+    return {
+        "identity": identity_metrics,
+        "selected": selected_metrics,
+        "selected_deployment_relative_improvement_vs_identity": relative_improvement,
+    }
+
+
+def summarize_validation_selected_full_refit_task(
+    *,
+    task: OpenMLTaskData,
+    output_dir: Path,
+    task_result: dict[str, Any],
+) -> dict[str, Any]:
+    """Score both frozen test-prediction arms after validation-only selection."""
+
+    if task_result.get("experiment_type") != "validation_selected_checkpoint_then_full_context_refit":
+        raise RuntimeError("refusing to score a non-validation/refit task result")
+    variants: dict[str, Any] = {}
+    for label, result in task_result["variants"].items():
+        artifact_dir = _validation_selected_refit_dir(output_dir, task, label)
+        prediction_path = artifact_dir / "predictions.npz"
+        inner = _selected_pair_summary(
+            task=task,
+            identity_prediction=_load_prediction(prediction_path, "inner_identity_test"),
+            selected_prediction=_load_prediction(prediction_path, "inner_selected_test"),
+        )
+        full_refit = _selected_pair_summary(
+            task=task,
+            identity_prediction=_load_prediction(prediction_path, "full_identity_test"),
+            selected_prediction=_load_prediction(prediction_path, "full_selected_test"),
+        )
+        variants[label] = {
+            "config": result["config"],
+            "validation_selection": result["selection"],
+            "inner_train_selected_checkpoint": inner,
+            "full_context_refit_selected_duration": full_refit,
+            "full_context_refit": result["full_context_refit"],
+        }
+    summary = {
+        "report_schema_version": 1,
+        "experiment_type": "validation_selected_checkpoint_then_full_context_refit",
+        "outer_test_scored_after_validation_selection_and_refit_predictions_frozen": True,
+        "outer_test_used_for_selection": False,
+        "task_id": task.task_id,
+        "dataset_id": task.dataset_id,
+        "dataset_name": task.dataset_name,
+        "problem_type": task.problem_type,
+        "n_classes": task.n_classes,
+        "outer_split_hash": task.outer_split_hash,
+        "validation_split": task_result["validation_split"],
+        "variants": variants,
+        "comparison_note": (
+            "Each selected checkpoint is compared only with the identity prediction from the same fitted context: "
+            "inner-train context for the selected-checkpoint arm and all outer-training rows for the refit arm."
+        ),
+    }
+    path = output_dir / "validation_selected_refit_task_summaries" / (
+        f"task_{task.task_id}_{_safe_name(task.dataset_name)}.json"
+    )
+    _json_dump(path, summary)
+    return summary
+
+
+def summarize_validation_selected_full_refit_experiment(
+    *,
+    task_summaries: list[dict[str, Any]],
+    output_dir: Path,
+    bootstrap_rounds: int,
+    bootstrap_seed: int,
+    skipped_tasks: list[dict[str, Any]] | None = None,
+    task_eligibility: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Aggregate the two paired endpoints for scheduler and regularised arms."""
+
+    if not task_summaries:
+        raise ValueError("cannot summarise an empty validation/refit experiment")
+    skipped_tasks = [] if skipped_tasks is None else skipped_tasks
+    labels = list(task_summaries[0]["variants"])
+    if not labels or any(list(item["variants"]) != labels for item in task_summaries):
+        raise ValueError("all validation/refit task summaries must contain the same ordered variants")
+    rows: list[dict[str, Any]] = []
+    paired_results: dict[str, dict[str, Any]] = {}
+    selection_behavior: dict[str, dict[str, Any]] = {}
+    arms = ("inner_train_selected_checkpoint", "full_context_refit_selected_duration")
+    for label_offset, label in enumerate(labels):
+        selected_steps = np.asarray(
+            [int(item["variants"][label]["validation_selection"]["selected_step"]) for item in task_summaries],
+            dtype=int,
+        )
+        selected_adapted = np.asarray(
+            [
+                bool(item["variants"][label]["validation_selection"]["selected_use_adapted"])
+                for item in task_summaries
+            ],
+            dtype=bool,
+        )
+        selection_behavior[label] = {
+            "n_identity_selected": int(np.sum(~selected_adapted)),
+            "n_spline_selected": int(np.sum(selected_adapted)),
+            "spline_selected_fraction": float(np.mean(selected_adapted)),
+            "selected_step_min": int(np.min(selected_steps)),
+            "selected_step_median": float(np.median(selected_steps)),
+            "selected_step_max": int(np.max(selected_steps)),
+        }
+        paired_results[label] = {}
+        for arm_offset, arm in enumerate(arms):
+            reference = np.asarray(
+                [float(item["variants"][label][arm]["identity"]["benchmark_error"]) for item in task_summaries],
+                dtype=float,
+            )
+            candidate = np.asarray(
+                [float(item["variants"][label][arm]["selected"]["benchmark_error"]) for item in task_summaries],
+                dtype=float,
+            )
+            problem_types = np.asarray([str(item["problem_type"]) for item in task_summaries], dtype=object)
+            paired_results[label][arm] = _paired_comparison_summary(
+                reference=reference,
+                candidate=candidate,
+                problem_types=problem_types,
+                bootstrap_rounds=bootstrap_rounds,
+                bootstrap_seed=bootstrap_seed + 10 * label_offset + arm_offset,
+                reference_label=(
+                    "inner_train_standard_tabicl_identity"
+                    if arm == "inner_train_selected_checkpoint"
+                    else "full_outer_training_standard_tabicl_identity"
+                ),
+                candidate_label=f"{label}_{arm}",
+            )
+        for item in task_summaries:
+            variant = item["variants"][label]
+            selection = variant["validation_selection"]
+            for arm in arms:
+                endpoint = variant[arm]
+                rows.append(
+                    {
+                        "task_id": item["task_id"],
+                        "dataset_id": item["dataset_id"],
+                        "dataset_name": item["dataset_name"],
+                        "problem_type": item["problem_type"],
+                        "outer_split_hash": item["outer_split_hash"],
+                        "variant": label,
+                        "arm": arm,
+                        "identity_regularization": variant["config"].get("identity_regularization", 0.0),
+                        "selected_step": selection["selected_step"],
+                        "selected_use_adapted": selection["selected_use_adapted"],
+                        "validation_identity_error": selection["identity_validation_error"],
+                        "validation_selected_error": selection["selected_validation_error"],
+                        "validation_selected_relative_improvement": selection[
+                            "selected_validation_relative_improvement"
+                        ],
+                        "identity_benchmark_error": endpoint["identity"]["benchmark_error"],
+                        "identity_deployment_error": endpoint["identity"]["deployment_error"],
+                        "selected_benchmark_error": endpoint["selected"]["benchmark_error"],
+                        "selected_deployment_error": endpoint["selected"]["deployment_error"],
+                        "selected_prediction_valid": endpoint["selected"].get("prediction_valid", True),
+                        "selected_deployment_relative_improvement_vs_identity": endpoint[
+                            "selected_deployment_relative_improvement_vs_identity"
+                        ],
+                        "full_refit_selected_duration_completed": variant["full_context_refit"].get(
+                            "selected_duration_completed"
+                        ),
+                        "full_refit_encountered_nonfinite_objective": variant["full_context_refit"].get(
+                            "encountered_nonfinite_objective"
+                        ),
+                    }
+                )
+    csv_path = output_dir / "validation_selected_refit_results.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        fieldnames = list(dict.fromkeys(key for row in rows for key in row))
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    summary = {
+        "experiment_type": "validation_selected_checkpoint_then_full_context_refit",
+        "n_tasks": len(task_summaries),
+        "n_skipped_tasks": len(skipped_tasks),
+        "task_eligibility": task_eligibility,
+        "skipped_tasks": skipped_tasks,
+        "variant_paired_results": paired_results,
+        "selection_behavior": selection_behavior,
+        "results_csv": str(csv_path),
+        "selection_rule": (
+            "The inner-train validation metric chooses identity or the best observed spline checkpoint, subject to "
+            "the frozen relative-improvement margin. The full refit uses that duration and the same cosine prefix."
+        ),
+        "metric_note": "Binary: 1-AUC; multiclass: log loss; regression: RMSE for paired comparison.",
+    }
+    _json_dump(output_dir / "summary.json", summary)
+    return summary
 
 
 def run_task_unconditional_full_context_refit_standard(

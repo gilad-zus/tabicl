@@ -91,8 +91,10 @@ from tabicl._experiments.direct_spline_protocol import (
     shared_random_direct_spline_configs,
 )
 from tabicl._experiments.direct_spline_openml_standard import (
+    ValidationSplitInfeasibleError,
     run_task_full_context_refit_checkpoint_audit_standard,
     run_task_unconditional_full_context_refit_standard,
+    run_task_validation_selected_full_refit_standard,
     run_task_config_standard,
     shared_standard_direct_spline_configs,
     standard_direct_spline_config,
@@ -100,13 +102,15 @@ from tabicl._experiments.direct_spline_openml_standard import (
     summarize_full_context_refit_checkpoint_audit_task,
     summarize_full_context_refit_experiment,
     summarize_full_context_refit_task,
+    summarize_validation_selected_full_refit_experiment,
+    summarize_validation_selected_full_refit_task,
 )
 
 
 # Increment this whenever a code change can alter predictions, validation
 # selection, or persisted artifact semantics.  Unlike the source hashes, this
 # value is deliberately *not* ignored by --allow-compatible-code-resume.
-EXPERIMENT_SEMANTICS_VERSION = 5
+EXPERIMENT_SEMANTICS_VERSION = 6
 _RESUME_LAUNCHER_SOURCE = "scripts/direct_spline_openml_lite.py"
 
 
@@ -115,13 +119,14 @@ def parse_args(
     default_pipeline: str = "lite",
     required_pipeline: str | None = None,
     checkpoint_audit: bool = False,
+    validation_selected_refit: bool = False,
     description: str | None = None,
 ) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=description or __doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("--output-dir", type=Path, required=True)
-    if checkpoint_audit:
+    if checkpoint_audit or validation_selected_refit:
         parser.set_defaults(oof_source_dir=None)
     else:
         parser.add_argument(
@@ -144,8 +149,8 @@ def parse_args(
         type=Path,
         default=None,
         help=(
-            "A frozen JSON task bank (with selected_task_ids or task_ids) or a text file of positive "
-            "OpenML task IDs, one per line. Cannot be combined with --task-id."
+            "A frozen JSON task bank (with selected_task_ids or task_ids), an earlier experiment_manifest.json, "
+            "or a text file of positive OpenML task IDs, one per line. Cannot be combined with --task-id."
         ),
     )
     parser.add_argument("--max-tasks", type=int, default=None, help="Take the first N selected tasks; for smoke tests only.")
@@ -234,6 +239,73 @@ def parse_args(
                 "to the largest requested checkpoint."
             ),
         )
+    if validation_selected_refit:
+        # Although uncapped refits use every row, retain a new protocol seed
+        # as well so any deterministic support/preprocessing randomness is not
+        # silently inherited from the seed-0 audit.
+        parser.set_defaults(protocol_seed=20_260_826)
+        parser.add_argument(
+            "--validation-fraction",
+            type=float,
+            default=0.20,
+            help=(
+                "Validation-selected refit only: fraction of each published outer-training split held out "
+                "for the one deterministic checkpoint-selection split."
+            ),
+        )
+        parser.add_argument(
+            "--split-seed",
+            type=int,
+            default=20_260_826,
+            help=(
+                "Validation-selected refit only: root seed for the deterministic inner train/validation split. "
+                "It is intentionally independent of --protocol-seed."
+            ),
+        )
+        parser.add_argument(
+            "--adapter-seed",
+            type=int,
+            default=20_260_826,
+            help=(
+                "Validation-selected refit only: DirectSpline initialization and episode-sampling seed. "
+                "It is intentionally independent of --protocol-seed and differs from the earlier seed-0 audit."
+            ),
+        )
+        parser.add_argument(
+            "--selection-checkpoint-interval",
+            type=int,
+            default=25,
+            help=(
+                "Validation-selected refit only: evaluate the inner validation split every N adapter steps "
+                "(and always at the final step)."
+            ),
+        )
+        parser.add_argument(
+            "--cosine-min-lr-ratio",
+            type=float,
+            default=0.01,
+            help=(
+                "Validation-selected refit only: final/base learning-rate ratio of the frozen cosine schedule."
+            ),
+        )
+        parser.add_argument(
+            "--selection-relative-improvement",
+            type=float,
+            default=0.005,
+            help=(
+                "Validation-selected refit only: validation improvement required for a spline checkpoint to "
+                "beat step-0 identity."
+            ),
+        )
+        parser.add_argument(
+            "--identity-regularization",
+            type=float,
+            default=0.01,
+            help=(
+                "Validation-selected refit only: function-space identity-deformation penalty weight for the "
+                "regularized arm; the cosine-only arm always uses zero."
+            ),
+        )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--classifier-checkpoint", type=Path, default=None)
     parser.add_argument("--regressor-checkpoint", type=Path, default=None)
@@ -276,6 +348,8 @@ def parse_args(
     args = parser.parse_args()
     if checkpoint_audit and args.adapter_steps is None:
         args.adapter_steps = max(args.checkpoint_steps)
+    if validation_selected_refit and args.adapter_steps is None:
+        args.adapter_steps = 500
     if required_pipeline is not None and args.pipeline != required_pipeline:
         parser.error(
             f"this launcher requires --pipeline {required_pipeline}; "
@@ -331,6 +405,7 @@ def _experiment_source_hashes() -> dict[str, str]:
         Path(__file__).resolve(),
         root / "scripts" / "direct_spline_openml_standard.py",
         root / "scripts" / "direct_spline_openml_full_refit.py",
+        root / "scripts" / "direct_spline_openml_validation_selected_refit.py",
         root / "src" / "tabicl" / "__init__.py",
     }
     experiment_dir = root / "src" / "tabicl" / "_experiments"
@@ -672,6 +747,35 @@ def _event_reporter(path: Path):
                 f"time={event['train_seconds']:.1f}s peak={event['peak_allocated_gib']:.2f}GiB",
                 flush=True,
             )
+        elif event_name == "validation_selected_refit_started":
+            print(
+                f"[{task_prefix} validation-refit config={event['config_label']}] "
+                f"selecting on inner train={event['inner_train_rows']}, validation={event['validation_rows']}; "
+                "outer test remains withheld",
+                flush=True,
+            )
+        elif event_name == "validation_selection_checkpoint":
+            print(
+                f"[{task_prefix} validation-refit step={event['step']}] "
+                f"validation={event['validation_error']:.6g}/identity={event['identity_validation_error']:.6g} "
+                f"deformation={event['mean_grid_deformation']:.3g} "
+                f"elapsed={event['elapsed_seconds']:.1f}s",
+                flush=True,
+            )
+        elif event_name == "validation_selected_refit_completed":
+            selected = "spline" if event["selected_use_adapted"] else "identity"
+            print(
+                f"[{task_prefix} validation-refit config={event['config_label']}] complete: "
+                f"selected={selected}@{event['selected_step']} "
+                f"selection={event['selection_seconds']:.1f}s refit={event['refit_seconds']:.1f}s",
+                flush=True,
+            )
+        elif event_name == "validation_selected_refit_rebuilding_incomplete":
+            print(
+                f"[{task_prefix} validation-refit config={event['config_label']}] "
+                "rebuilding an incomplete or corrupt resume artifact",
+                flush=True,
+            )
         elif event_name == "bag_completed":
             parity = ""
             if "identity_parity_max_abs_validation" in event:
@@ -715,6 +819,12 @@ def _event_reporter(path: Path):
                 print(
                     f"[{task_prefix} dataset={event['dataset_name']}] skipped after CUDA OOM "
                     f"during {event['stage']}; continuing with the next task",
+                    flush=True,
+                )
+            elif event.get("reason") == "validation_split_infeasible":
+                print(
+                    f"[{task_prefix} dataset={event['dataset_name']}] skipped: no valid deterministic "
+                    f"inner validation split ({event['error']})",
                     flush=True,
                 )
             else:
@@ -815,11 +925,43 @@ def _configs(args: argparse.Namespace) -> tuple[list[str], list[dict[str, Any]]]
     return ["D", *(f"R{index + 1}" for index in range(len(random)))], [default, *random]
 
 
+def _validation_selected_refit_configs(args: argparse.Namespace) -> tuple[list[str], list[dict[str, Any]]]:
+    """Freeze the scheduler-only and identity-regularised arms.
+
+    The two arms deliberately share every initialization, split, episode, and
+    scheduling setting.  The explicit function-space penalty is their only
+    optimisation difference.
+    """
+
+    base = standard_direct_spline_config(
+        context_cap=None,
+        train_context_rows=None if args.train_context_rows == 0 else args.train_context_rows,
+        adapter_steps=args.adapter_steps,
+        validation_interval=args.selection_checkpoint_interval,
+    )
+    base.update(
+        {
+            "random_state": int(args.adapter_seed),
+            "adapter_patience": None,
+            "selection_checkpoint_interval": int(args.selection_checkpoint_interval),
+            "cosine_schedule_steps": int(args.adapter_steps),
+            "cosine_min_lr_ratio": float(args.cosine_min_lr_ratio),
+            "selection_relative_improvement": float(args.selection_relative_improvement),
+            "guard_relative_improvement": float(args.selection_relative_improvement),
+            "identity_regularization": 0.0,
+        }
+    )
+    regularized = dict(base)
+    regularized["identity_regularization"] = float(args.identity_regularization)
+    return ["cosine", "cosine_identity_regularized"], [base, regularized]
+
+
 def _validate(
     args: argparse.Namespace,
     *,
     full_context_refit: bool = False,
     checkpoint_audit: bool = False,
+    validation_selected_refit: bool = False,
 ) -> None:
     if args.bags < 2:
         raise ValueError("--bags must be at least two")
@@ -857,7 +999,41 @@ def _validate(
         raise ValueError("--retry-cuda-oom-skips requires --resume")
     if getattr(args, "dry_run", False) and args.resume:
         raise ValueError("--dry-run cannot be combined with --resume; it is a non-persistent preview")
-    if full_context_refit:
+    if checkpoint_audit and validation_selected_refit:
+        raise ValueError("checkpoint audit and validation-selected refit are mutually exclusive")
+    if validation_selected_refit:
+        if args.pipeline != "standard":
+            raise ValueError("the validation-selected refit experiment requires --pipeline standard")
+        if args.n_random_configs != 0:
+            raise ValueError(
+                "the validation-selected refit experiment has exactly two predeclared arms; "
+                "use --n-random-configs 0"
+            )
+        if args.context_cap != 0:
+            raise ValueError(
+                "the validation-selected refit experiment requires --context-cap 0 so each identity control "
+                "uses the exact full available context"
+            )
+        if args.adapter_patience is not None:
+            raise ValueError(
+                "the validation-selected refit experiment runs through the fixed horizon; "
+                "do not pass --adapter-patience"
+            )
+        if args.adapter_steps is None or args.adapter_steps <= 0:
+            raise ValueError("the validation-selected refit experiment requires a positive --adapter-steps")
+        if not 0.0 < args.validation_fraction < 0.5:
+            raise ValueError("--validation-fraction must lie in (0, 0.5)")
+        if args.selection_checkpoint_interval <= 0:
+            raise ValueError("--selection-checkpoint-interval must be positive")
+        if not 0.0 < args.cosine_min_lr_ratio <= 1.0:
+            raise ValueError("--cosine-min-lr-ratio must lie in (0, 1]")
+        if not 0.0 <= args.selection_relative_improvement < 1.0:
+            raise ValueError("--selection-relative-improvement must lie in [0, 1)")
+        if args.identity_regularization < 0.0:
+            raise ValueError("--identity-regularization must be non-negative")
+        if args.oof_source_dir is not None:
+            raise ValueError("--oof-source-dir is not used by the validation-selected refit experiment")
+    elif full_context_refit:
         if args.pipeline != "standard":
             raise ValueError("the full-context refit experiment requires --pipeline standard")
         if args.n_random_configs != 0:
@@ -1011,12 +1187,17 @@ def _task_ids_from_file(path: Path) -> list[int]:
                     f"--task-id-file is an incomplete task bank; rebuild it with the requested number of eligible tasks: {path}"
                 )
             raw_ids = payload.get("selected_task_ids", payload.get("task_ids"))
+            if raw_ids is None:
+                try:
+                    raw_ids = payload["immutable_run"]["data_source"]["task_ids"]
+                except (KeyError, TypeError):
+                    raw_ids = None
         else:
             raw_ids = None
     if not isinstance(raw_ids, list) or not raw_ids:
         raise ValueError(
-            f"--task-id-file must be a JSON list, a JSON object with selected_task_ids/task_ids, "
-            f"or one task ID per line: {path}"
+            f"--task-id-file must be a JSON list, a JSON object with selected_task_ids/task_ids, an "
+            f"experiment_manifest.json, or one task ID per line: {path}"
         )
     try:
         task_ids = [int(task_id) for task_id in raw_ids]
@@ -1287,16 +1468,27 @@ def main(
     required_pipeline: str | None = None,
     full_context_refit: bool = False,
     checkpoint_audit: bool = False,
+    validation_selected_refit: bool = False,
     description: str | None = None,
 ) -> None:
     args = parse_args(
         default_pipeline=default_pipeline,
         required_pipeline=required_pipeline,
         checkpoint_audit=checkpoint_audit,
+        validation_selected_refit=validation_selected_refit,
         description=description,
     )
-    _validate(args, full_context_refit=full_context_refit, checkpoint_audit=checkpoint_audit)
-    labels, configs = _configs(args)
+    _validate(
+        args,
+        full_context_refit=full_context_refit,
+        checkpoint_audit=checkpoint_audit,
+        validation_selected_refit=validation_selected_refit,
+    )
+    labels, configs = (
+        _validation_selected_refit_configs(args)
+        if validation_selected_refit
+        else _configs(args)
+    )
     manifest_path = args.output_dir / "experiment_manifest.json"
     previous: dict[str, Any] | None = None
     if manifest_path.is_file():
@@ -1364,7 +1556,7 @@ def main(
             else TABARENA_V0PT1_OPENML_SUITE_ID
         )
     immutable_run = {
-        "schema_version": 5,
+        "schema_version": 6,
         "experiment_semantics_version": EXPERIMENT_SEMANTICS_VERSION,
         "repository_revision": _git_revision(),
         "source_sha256": _experiment_source_hashes(),
@@ -1391,6 +1583,9 @@ def main(
         },
         "inner_bags": args.bags,
         "inner_bags_role": (
+            "one deterministic inner train/validation split per task; bags are otherwise unused"
+            if validation_selected_refit
+            else
             "not used by the full-context checkpoint audit"
             if checkpoint_audit
             else "optional historical OOF diagnostic compatibility only"
@@ -1398,6 +1593,10 @@ def main(
             else "training and validation"
         ),
         "inner_bag_policy": (
+            "A task-specific deterministic stratified ShuffleSplit for classification (or ShuffleSplit for "
+            "regression) is persisted with both index arrays; infeasible rare-class splits are explicitly skipped."
+            if validation_selected_refit
+            else
             "Use the requested count unless a classification task's rarest outer-training class is smaller; "
             "then use that smaller valid stratified count so every fitting fold retains at least two rows/class."
         ),
@@ -1407,13 +1606,31 @@ def main(
         "pipeline": args.pipeline,
         "full_context_refit": bool(full_context_refit),
         "checkpoint_audit": bool(checkpoint_audit),
+        "validation_selected_refit": bool(validation_selected_refit),
         "checkpoint_steps": list(args.checkpoint_steps) if checkpoint_audit else None,
+        "validation_selected_refit_settings": (
+            None
+            if not validation_selected_refit
+            else {
+                "validation_fraction": float(args.validation_fraction),
+                "split_seed": int(args.split_seed),
+                "adapter_seed": int(args.adapter_seed),
+                "selection_checkpoint_interval": int(args.selection_checkpoint_interval),
+                "cosine_schedule_steps": int(args.adapter_steps),
+                "cosine_min_lr_ratio": float(args.cosine_min_lr_ratio),
+                "selection_relative_improvement": float(args.selection_relative_improvement),
+                "identity_regularization": float(args.identity_regularization),
+            }
+        ),
         "oof_source": oof_source_provenance,
         "standard_pipeline": (
             None
             if args.pipeline == "lite"
             else {
                 "identity_context": (
+                    "one inner-train context for checkpoint selection, then all outer-training rows for refit"
+                    if validation_selected_refit
+                    else
                     "all outer-training rows"
                     if full_context_refit
                     else "all inner-bag fit rows"
@@ -1426,7 +1643,19 @@ def main(
                 "normal_tabarena_config": STANDARD_TABICL_CONFIG,
                 "final_deployment": (
                     None
-                    if not full_context_refit
+                    if not full_context_refit and not validation_selected_refit
+                    else {
+                        "role": "validation-selected checkpoint then fresh all-row refit",
+                        "inner_selection_context": "the persisted inner-training subset",
+                        "validation": "one deterministic held-out subset of the published outer-training rows",
+                        "full_refit_context": "all outer-training rows",
+                        "schedule": "fixed cosine horizon; refit uses the selected checkpoint duration and same LR prefix",
+                        "checkpoint_selection": "best observed validation checkpoint or step-0 identity only",
+                        "identity_reference": "fresh identity prediction from the matching inner or full-context estimator",
+                        "outer_test_selection": "forbidden",
+                        "variants": labels,
+                    }
+                    if validation_selected_refit
                     else {
                         "role": "development-only full-context checkpoint learning curve",
                         "context": "all outer-training rows",
@@ -1451,8 +1680,15 @@ def main(
             "binary": "1 - ROC-AUC",
             "multiclass": "log loss",
             "regression": "MSE",
-            "required_relative_improvement": configs[0]["guard_relative_improvement"],
+            "required_relative_improvement": (
+                configs[0]["selection_relative_improvement"]
+                if validation_selected_refit
+                else configs[0]["guard_relative_improvement"]
+            ),
             "scope": (
+                "single_inner_validation_checkpoint_selection_then_full_context_refit"
+                if validation_selected_refit
+                else
                 "development_only_checkpoint_curve_no_selection"
                 if checkpoint_audit
                 else
@@ -1469,7 +1705,7 @@ def main(
         "checkpoint_fingerprints": checkpoint_fingerprints,
         "standard_tabarena_baseline": (
             STANDARD_TABICL_CONFIG
-            if full_context_refit or not args.skip_standard_baseline
+            if full_context_refit or (not validation_selected_refit and not args.skip_standard_baseline)
             else None
         ),
         "full_context_refit_contract": (
@@ -1482,6 +1718,20 @@ def main(
                 "spline_evaluated_for_every_task": not checkpoint_audit,
                 "checkpoint_audit_development_only": bool(checkpoint_audit),
                 "outer_test_checkpoint_selection_permitted": False if checkpoint_audit else None,
+            }
+        ),
+        "validation_selected_refit_contract": (
+            None
+            if not validation_selected_refit
+            else {
+                "outer_test_used_for_selection": False,
+                "split_indices_persisted": True,
+                "adapter_seed_independent_of_protocol_seed": True,
+                "identity_is_a_selectable_step_zero_checkpoint": True,
+                "full_refit_uses_selected_duration": True,
+                "full_refit_preserves_inner_cosine_schedule_horizon": True,
+                "selection_uses_patience": False,
+                "predeclared_variants": labels,
             }
         ),
     }
@@ -1555,7 +1805,9 @@ def main(
     else:
         manifest = {
             "experiment": (
-                "DirectSpline OpenML standard-ensemble development-only full-context checkpoint audit"
+                "DirectSpline OpenML standard-ensemble validation-selected checkpoint and full-context refit experiment"
+                if validation_selected_refit
+                else "DirectSpline OpenML standard-ensemble development-only full-context checkpoint audit"
                 if checkpoint_audit
                 else
                 "DirectSpline OpenML standard-ensemble full-context refit experiment"
@@ -1568,7 +1820,11 @@ def main(
             "immutable_run": immutable_run,
             "run_fingerprint_sha256": run_fingerprint_hash,
             "outer_test_policy": (
-                "read only after all requested checkpoint predictions are frozen, to diagnose this development "
+                "read only after both variants' validation-selected inner-model and full-context-refit predictions "
+                "are frozen; never used for splitting, fitting, checkpoint selection, regularisation selection, "
+                "or identity selection"
+                if validation_selected_refit
+                else "read only after all requested checkpoint predictions are frozen, to diagnose this development "
                 "learning curve; never used for optimisation, checkpoint selection, configuration selection, "
                 "regularisation selection, guarding, HPO, or ensembling"
                 if checkpoint_audit
@@ -1661,7 +1917,7 @@ def main(
             continue
         standard_tabarena = None
         baseline_cuda_oom = False
-        if not full_context_refit and not args.skip_standard_baseline:
+        if not full_context_refit and not validation_selected_refit and not args.skip_standard_baseline:
             try:
                 standard_tabarena = run_standard_tabarena_baseline(
                     task=task,
@@ -1728,7 +1984,9 @@ def main(
                 continue
 
         stage = (
-            "full_context_checkpoint_audit"
+            "validation_selected_refit"
+            if validation_selected_refit
+            else "full_context_checkpoint_audit"
             if checkpoint_audit
             else "full_context_refit"
             if full_context_refit
@@ -1737,7 +1995,7 @@ def main(
         cuda_oom_skipped = False
         try:
             run_config = run_task_config_standard if args.pipeline == "standard" else run_task_config
-            if not full_context_refit:
+            if not full_context_refit and not validation_selected_refit:
                 for label, config in zip(labels, configs, strict=True):
                     stage = f"config_{label}"
                     effective_bags = effective_inner_bag_count(task, requested_bags=args.bags)
@@ -1768,7 +2026,28 @@ def main(
                     )
             stage = "task_summary"
             try:
-                if full_context_refit:
+                if validation_selected_refit:
+                    validation_refit_result = run_task_validation_selected_full_refit_standard(
+                        task=task,
+                        config_labels=labels,
+                        configs=configs,
+                        validation_fraction=args.validation_fraction,
+                        validation_seed=args.split_seed,
+                        output_dir=args.output_dir,
+                        protocol_seed=args.protocol_seed,
+                        device=device,
+                        classifier_checkpoint=args.classifier_checkpoint,
+                        regressor_checkpoint=args.regressor_checkpoint,
+                        resume=args.resume,
+                        run_fingerprint_hash=run_fingerprint_hash,
+                        progress=progress,
+                    )
+                    task_summary = summarize_validation_selected_full_refit_task(
+                        task=task,
+                        output_dir=args.output_dir,
+                        task_result=validation_refit_result,
+                    )
+                elif full_context_refit:
                     if checkpoint_audit:
                         audit_result = run_task_full_context_refit_checkpoint_audit_standard(
                             task=task,
@@ -1842,7 +2121,7 @@ def main(
                         standard_tabarena=standard_tabarena,
                     )
             except json.JSONDecodeError:
-                if checkpoint_audit:
+                if checkpoint_audit or validation_selected_refit:
                     raise
                 if oof_source_dir is not None:
                     raise RuntimeError(
@@ -1911,6 +2190,23 @@ def main(
                         ensemble_rounds=immutable_run["ensemble_rounds"],
                         standard_tabarena=standard_tabarena,
                     )
+        except ValidationSplitInfeasibleError as error:
+            skipped = {
+                "task_id": task.task_id,
+                "dataset_id": task.dataset_id,
+                "dataset_name": task.dataset_name,
+                "problem_type": task.problem_type,
+                "n_features": n_features,
+                "outer_train_rows": int(len(task.y_train)),
+                "outer_test_rows": int(len(task.y_test)),
+                "reason": "validation_split_infeasible",
+                "stage": stage,
+                "error": str(error),
+            }
+            skipped_tasks.append(skipped)
+            progress({"event": "task_skipped", **skipped})
+            _write_run_progress(args.output_dir, task_summaries, skipped_tasks)
+            continue
         except RuntimeError as error:
             if not _is_cuda_out_of_memory(error):
                 raise
@@ -1949,7 +2245,16 @@ def main(
         task_summaries.append(task_summary)
         _write_run_progress(args.output_dir, task_summaries, skipped_tasks)
     if task_summaries:
-        if full_context_refit:
+        if validation_selected_refit:
+            summary = summarize_validation_selected_full_refit_experiment(
+                task_summaries=task_summaries,
+                output_dir=args.output_dir,
+                bootstrap_rounds=args.bootstrap_rounds,
+                bootstrap_seed=args.protocol_seed,
+                skipped_tasks=skipped_tasks,
+                task_eligibility=immutable_run["task_eligibility"],
+            )
+        elif full_context_refit:
             if checkpoint_audit:
                 summary = summarize_full_context_refit_checkpoint_audit_experiment(
                     task_summaries=task_summaries,

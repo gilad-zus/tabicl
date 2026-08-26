@@ -10,7 +10,9 @@ import tabicl._experiments.direct_spline_openml_standard as standard_openml
 from tabicl._experiments.direct_spline_openml import BagPredictions, OpenMLTaskData
 from tabicl._experiments.direct_spline_openml_standard import (
     _apply_adapter,
+    _adapter_identity_penalty,
     _aggregate_public_classification_members,
+    _cosine_scheduler,
     _differentiable_row_interaction,
     _enable_frozen_training_path,
     _fit_standard_bag,
@@ -21,15 +23,19 @@ from tabicl._experiments.direct_spline_openml_standard import (
     _make_adapters,
     _many_class_training_logits,
     _normal_prediction,
+    _single_validation_split,
     _StandardBag,
     run_task_full_context_refit_checkpoint_audit_standard,
     run_task_unconditional_full_context_refit_standard,
+    run_task_validation_selected_full_refit_standard,
     run_task_config_standard,
     standard_direct_spline_config,
     summarize_full_context_refit_checkpoint_audit_experiment,
     summarize_full_context_refit_checkpoint_audit_task,
     summarize_full_context_refit_experiment,
     summarize_full_context_refit_task,
+    summarize_validation_selected_full_refit_experiment,
+    summarize_validation_selected_full_refit_task,
 )
 from tabicl._hyperspline import DirectSplineTransform
 from tabicl._model.inference_config import InferenceConfig
@@ -143,6 +149,100 @@ def test_standard_config_accepts_explicit_adapter_schedule():
     assert config["adapter_steps"] == 500
     assert config["adapter_patience"] == 10
     assert config["validation_interval"] == 10
+
+
+def test_validation_selected_split_is_deterministic_disjoint_and_stratified():
+    labels = np.tile([0, 1], 15)
+    task = OpenMLTaskData(
+        task_id=78,
+        dataset_id=79,
+        dataset_name="deterministic_validation_split",
+        problem_type="binary",
+        n_classes=2,
+        x_train=pd.DataFrame({"x": np.arange(labels.size)}),
+        y_train=labels,
+        x_test=pd.DataFrame({"x": [31.0, 32.0]}),
+        y_test=np.asarray([0, 1]),
+        outer_split_hash="split",
+    )
+
+    first_fit, first_validation = _single_validation_split(
+        task, validation_fraction=0.2, seed=12_345
+    )
+    second_fit, second_validation = _single_validation_split(
+        task, validation_fraction=0.2, seed=12_345
+    )
+
+    assert np.array_equal(first_fit, second_fit)
+    assert np.array_equal(first_validation, second_validation)
+    assert not np.intersect1d(first_fit, first_validation).size
+    assert np.array_equal(np.sort(np.concatenate((first_fit, first_validation))), np.arange(labels.size))
+    assert np.array_equal(np.unique(labels[first_fit]), np.asarray([0, 1]))
+    assert np.array_equal(np.unique(labels[first_validation]), np.asarray([0, 1]))
+    assert np.bincount(labels[first_fit]).min() >= 2
+
+
+def test_identity_regularizer_is_zero_at_identity_and_differentiable_after_movement():
+    adapter = DirectSplineTransform(
+        torch.zeros((1, 3, 2)),
+        n_control_points=8,
+        trainable_location_scale=True,
+        cross_column_mixing_rank=2,
+    )
+    with torch.no_grad():
+        adapter.location.zero_()
+        adapter.scale.fill_(1.0)
+    adapters = standard_openml._AdapterSet(OrderedDict({"none": adapter}))
+
+    initial = _adapter_identity_penalty(adapters)
+    assert initial is not None
+    assert float(initial.detach()) == 0.0
+    with torch.no_grad():
+        adapter.gap_logits[..., 0].add_(0.5)
+
+    penalty = _adapter_identity_penalty(adapters)
+    assert penalty is not None
+    assert float(penalty.detach()) > 0.0
+    penalty.backward()
+    assert adapter.gap_logits.grad is not None
+    assert torch.isfinite(adapter.gap_logits.grad).all()
+
+    adapter.zero_grad(set_to_none=True)
+    with torch.no_grad():
+        adapter.gap_logits.zero_()
+        assert adapter.mixing_left is not None
+        assert adapter.mixing_right is not None
+        assert adapter.mixing_weight_logits is not None
+        assert adapter.mixing_gate is not None
+        adapter.mixing_left.copy_(torch.eye(2).unsqueeze(0))
+        adapter.mixing_right.copy_(torch.eye(2).unsqueeze(0))
+        adapter.mixing_weight_logits.fill_(0.5)
+        adapter.mixing_gate.fill_(0.5)
+    mixing_penalty = _adapter_identity_penalty(adapters)
+    assert mixing_penalty is not None
+    assert float(mixing_penalty.detach()) > 0.0
+    mixing_penalty.backward()
+    assert adapter.mixing_gate.grad is not None
+
+
+def test_cosine_schedule_preserves_the_long_horizon_prefix_for_a_short_refit():
+    parameter = torch.nn.Parameter(torch.zeros(()))
+    optimizer = torch.optim.SGD([parameter], lr=1.0)
+    scheduler = _cosine_scheduler(optimizer, total_steps=500, min_lr_ratio=0.01)
+    for _ in range(25):
+        optimizer.step()
+        scheduler.step()
+    long_horizon_rate_at_25 = optimizer.param_groups[0]["lr"]
+
+    short_parameter = torch.nn.Parameter(torch.zeros(()))
+    short_optimizer = torch.optim.SGD([short_parameter], lr=1.0)
+    short_scheduler = _cosine_scheduler(short_optimizer, total_steps=25, min_lr_ratio=0.01)
+    for _ in range(25):
+        short_optimizer.step()
+        short_scheduler.step()
+
+    assert long_horizon_rate_at_25 > 0.9
+    assert short_optimizer.param_groups[0]["lr"] == pytest.approx(0.01)
 
 
 def test_standard_regression_reuses_public_estimator_scaled_labels_exactly():
@@ -381,6 +481,293 @@ def test_full_context_checkpoint_audit_runs_and_persists_real_adapter_states(tmp
     assert (tmp_path / "states" / "step_000000.pt").is_file()
     assert (tmp_path / "states" / "step_000001.pt").is_file()
     assert (tmp_path / "states" / "step_000002.pt").is_file()
+
+
+@pytest.mark.parametrize("selected_step", [0, 2])
+def test_validation_selected_refit_freezes_both_arms_before_summary(
+    tmp_path, monkeypatch, selected_step
+):
+    """The full refit receives the validation-selected duration, including zero."""
+
+    labels = np.tile([0, 1], 6)
+    task = OpenMLTaskData(
+        task_id=98 + selected_step,
+        dataset_id=99 + selected_step,
+        dataset_name=f"validation_refit_{selected_step}",
+        problem_type="binary",
+        n_classes=2,
+        x_train=pd.DataFrame({"x": np.arange(labels.size, dtype=float)}),
+        y_train=labels,
+        x_test=pd.DataFrame({"x": [12.0, 13.0, 14.0, 15.0]}),
+        y_test=np.asarray([0, 1, 0, 1]),
+        outer_split_hash="split",
+    )
+    identity = np.asarray([[0.5, 0.5], [0.5, 0.5], [0.5, 0.5], [0.5, 0.5]])
+    adapted = np.asarray([[0.7, 0.3], [0.3, 0.7], [0.7, 0.3], [0.3, 0.7]])
+    observed_steps: list[int] = []
+    selection_calls: list[float] = []
+
+    def fake_load_backbone(**_kwargs):
+        return object(), None, {"test": "checkpoint"}
+
+    def fake_selection_fit(**_kwargs):
+        selection_calls.append(float(_kwargs["config"]["identity_regularization"]))
+        validation_rows = len(_kwargs["validation_indices"])
+        validation_identity = identity[:validation_rows].copy()
+        validation_adapted = adapted[:validation_rows].copy()
+        return {
+            "identity_validation": validation_identity,
+            "selected_validation": validation_adapted if selected_step else validation_identity.copy(),
+            "identity_test": identity.copy(),
+            "selected_test": adapted.copy() if selected_step else identity.copy(),
+        }, {
+            "selected_step": selected_step,
+            "selected_use_adapted": bool(selected_step),
+            "identity_validation_error": 0.5,
+            "selected_validation_error": 0.4 if selected_step else 0.5,
+            "selected_validation_relative_improvement": 0.2 if selected_step else 0.0,
+            "train_seconds": 0.0,
+        }, {}
+
+    def fake_refit_fit(*, selected_steps, config, **_kwargs):
+        observed_steps.append(selected_steps)
+        assert config["cosine_schedule_steps"] == 5
+        return identity.copy(), adapted.copy() if selected_steps else identity.copy(), {
+            "selected_steps_requested": selected_steps,
+            "adapter_steps_executed": selected_steps,
+            "selected_duration_completed": True,
+            "encountered_nonfinite_objective": False,
+            "scheduler": {"horizon_steps": 5},
+            "train_seconds": 0.0,
+            "peak_allocated_gib": 0.0,
+        }
+
+    monkeypatch.setattr(standard_openml, "load_frozen_backbone", fake_load_backbone)
+    monkeypatch.setattr(
+        standard_openml, "_fit_validation_selected_checkpoint_standard", fake_selection_fit
+    )
+    monkeypatch.setattr(
+        standard_openml, "_fit_selected_full_context_refit_standard", fake_refit_fit
+    )
+    config = {
+        **standard_direct_spline_config(adapter_steps=5),
+        "random_state": 20_260_826,
+        "selection_checkpoint_interval": 1,
+        "cosine_schedule_steps": 5,
+        "cosine_min_lr_ratio": 0.01,
+        "selection_relative_improvement": 0.005,
+        "identity_regularization": 0.0,
+    }
+    result = run_task_validation_selected_full_refit_standard(
+        task=task,
+        config_labels=["cosine", "cosine_identity_regularized"],
+        configs=[config, {**config, "identity_regularization": 0.01}],
+        validation_fraction=0.25,
+        validation_seed=20_260_826,
+        output_dir=tmp_path,
+        protocol_seed=0,
+        device=torch.device("cpu"),
+        classifier_checkpoint=None,
+        regressor_checkpoint=None,
+        resume=False,
+        run_fingerprint_hash="test",
+    )
+
+    assert observed_steps == [selected_step, selected_step]
+    for label in result["variants"]:
+        artifact_dir = (
+            tmp_path
+            / "raw"
+            / f"task_{task.task_id}_{task.dataset_name}"
+            / f"config_{label}"
+            / "validation_selected_refit"
+        )
+        assert (artifact_dir / "inner_split.npz").is_file()
+        assert (artifact_dir / "selected_adapter_state.pt").is_file()
+        predictions = np.load(artifact_dir / "predictions.npz")
+        assert set(predictions.files) == {
+            "inner_identity_validation",
+            "inner_selected_validation",
+            "inner_identity_test",
+            "inner_selected_test",
+            "full_identity_test",
+            "full_selected_test",
+        }
+
+    task_summary = summarize_validation_selected_full_refit_task(
+        task=task,
+        output_dir=tmp_path,
+        task_result=result,
+    )
+    assert task_summary["outer_test_scored_after_validation_selection_and_refit_predictions_frozen"]
+    assert set(task_summary["variants"]) == {"cosine", "cosine_identity_regularized"}
+    experiment_summary = summarize_validation_selected_full_refit_experiment(
+        task_summaries=[task_summary],
+        output_dir=tmp_path,
+        bootstrap_rounds=10,
+        bootstrap_seed=0,
+    )
+    assert set(experiment_summary["variant_paired_results"]) == {
+        "cosine",
+        "cosine_identity_regularized",
+    }
+    assert experiment_summary["selection_behavior"]["cosine"]["n_spline_selected"] == int(
+        bool(selected_step)
+    )
+
+    corrupted_summary = (
+        tmp_path
+        / "raw"
+        / f"task_{task.task_id}_{task.dataset_name}"
+        / "config_cosine"
+        / "validation_selected_refit"
+        / "summary.json"
+    )
+    corrupted_summary.write_text("{", encoding="utf-8")
+    observed_steps.clear()
+    selection_calls.clear()
+    resumed = run_task_validation_selected_full_refit_standard(
+        task=task,
+        config_labels=["cosine", "cosine_identity_regularized"],
+        configs=[config, {**config, "identity_regularization": 0.01}],
+        validation_fraction=0.25,
+        validation_seed=20_260_826,
+        output_dir=tmp_path,
+        protocol_seed=0,
+        device=torch.device("cpu"),
+        classifier_checkpoint=None,
+        regressor_checkpoint=None,
+        resume=True,
+        run_fingerprint_hash="test",
+    )
+    assert set(resumed["variants"]) == {"cosine", "cosine_identity_regularized"}
+    assert observed_steps == [selected_step]
+    assert selection_calls == [0.0]
+
+
+@pytest.mark.parametrize("identity_regularization", [0.0, 0.01])
+def test_validation_selected_checkpoint_and_fresh_refit_run_on_a_tiny_real_adapter(
+    identity_regularization,
+):
+    rows = 32
+    features = pd.DataFrame(
+        {
+            "x0": np.linspace(-1.0, 1.0, rows),
+            "x1": np.tile([0.0, 1.0], rows // 2),
+        }
+    )
+    labels = np.tile([0, 1], rows // 2)
+    task = OpenMLTaskData(
+        task_id=103,
+        dataset_id=104,
+        dataset_name="tiny_validation_refit_real",
+        problem_type="binary",
+        n_classes=2,
+        x_train=features.iloc[:24].reset_index(drop=True),
+        y_train=labels[:24],
+        x_test=features.iloc[24:].reset_index(drop=True),
+        y_test=labels[24:],
+        outer_split_hash="split",
+    )
+    config = {
+        **standard_direct_spline_config(train_context_rows=4),
+        "adapter_steps": 2,
+        "query_batch_rows": 4,
+        "cross_column_mixing_rank": 0,
+        "random_state": 20_260_826,
+        "selection_checkpoint_interval": 1,
+        "cosine_schedule_steps": 2,
+        "cosine_min_lr_ratio": 0.01,
+        "selection_relative_improvement": 0.0,
+        "identity_regularization": identity_regularization,
+    }
+    predictions, selection, selected_state = standard_openml._fit_validation_selected_checkpoint_standard(
+        task=task,
+        fit_indices=np.arange(18),
+        validation_indices=np.arange(18, 24),
+        config=config,
+        protocol_seed=0,
+        backbone=_HalfPrecisionEvalBackbone(),
+        device=torch.device("cpu"),
+        progress=None,
+    )
+
+    assert predictions["identity_validation"].shape == (6, 2)
+    assert predictions["selected_test"].shape == (8, 2)
+    assert [item["step"] for item in selection["checkpoint_records"]] == [0, 1, 2]
+    assert selection["scheduler"]["horizon_steps"] == 2
+    assert selection["fixed_horizon_completed"] is True
+    assert selection["encountered_nonfinite_objective"] is False
+    assert isinstance(selected_state, dict)
+    identity, refit, refit_metadata = standard_openml._fit_selected_full_context_refit_standard(
+        task=task,
+        selected_steps=2,
+        config=config,
+        protocol_seed=0,
+        backbone=_HalfPrecisionEvalBackbone(),
+        device=torch.device("cpu"),
+        progress=None,
+    )
+
+    assert identity.shape == (8, 2)
+    assert refit.shape == (8, 2)
+    assert refit_metadata["adapter_steps_executed"] == 2
+    assert refit_metadata["scheduler"]["horizon_steps"] == 2
+
+
+def test_nonfinite_selected_refit_is_reported_as_an_invalid_endpoint(monkeypatch):
+    rows = 32
+    features = pd.DataFrame(
+        {
+            "x0": np.linspace(-1.0, 1.0, rows),
+            "x1": np.tile([0.0, 1.0], rows // 2),
+        }
+    )
+    labels = np.tile([0, 1], rows // 2)
+    task = OpenMLTaskData(
+        task_id=105,
+        dataset_id=106,
+        dataset_name="nonfinite_refit",
+        problem_type="binary",
+        n_classes=2,
+        x_train=features.iloc[:24].reset_index(drop=True),
+        y_train=labels[:24],
+        x_test=features.iloc[24:].reset_index(drop=True),
+        y_test=labels[24:],
+        outer_split_hash="split",
+    )
+    config = {
+        **standard_direct_spline_config(train_context_rows=4),
+        "adapter_steps": 2,
+        "query_batch_rows": 4,
+        "cross_column_mixing_rank": 0,
+        "random_state": 20_260_826,
+        "cosine_schedule_steps": 2,
+        "cosine_min_lr_ratio": 0.01,
+        "identity_regularization": 0.0,
+    }
+
+    def nonfinite_objective(**_kwargs):
+        value = torch.full((), float("nan"))
+        return value, value, value
+
+    monkeypatch.setattr(standard_openml, "_adapter_training_objective", nonfinite_objective)
+    identity, selected, metadata = standard_openml._fit_selected_full_context_refit_standard(
+        task=task,
+        selected_steps=2,
+        config=config,
+        protocol_seed=0,
+        backbone=_HalfPrecisionEvalBackbone(),
+        device=torch.device("cpu"),
+        progress=None,
+    )
+
+    assert identity.shape == (8, 2)
+    assert np.isnan(selected).all()
+    assert metadata["adapter_steps_executed"] == 0
+    assert metadata["selected_duration_completed"] is False
+    assert metadata["encountered_nonfinite_objective"] is True
+    assert metadata["selected_prediction_policy"] == "invalid_prediction_after_incomplete_refit"
 
 
 def test_categorical_only_task_is_recorded_as_a_public_identity_tie():
