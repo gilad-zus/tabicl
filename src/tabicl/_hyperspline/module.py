@@ -786,6 +786,7 @@ class DirectSplineTransform(nn.Module):
         free_control_bound: float = 1.0,
         cross_column_mixing_rank: int = 0,
         cross_column_mixing_bound: float = 0.1,
+        allow_non_cubic: bool = False,
         range_min: float = 1.0,
         range_max: float = 8.0,
         location_adjustment_bound: float = 1.0,
@@ -794,8 +795,10 @@ class DirectSplineTransform(nn.Module):
         super().__init__()
         if x_context.ndim != 3:
             raise ValueError("x_context must have shape (B, N, D)")
-        if degree != 3 or n_control_points <= degree:
-            raise ValueError("DirectSplineTransform requires valid fixed cubic splines")
+        if degree < 1 or n_control_points <= degree:
+            raise ValueError("DirectSplineTransform requires n_control_points > degree >= 1")
+        if degree != 3 and not allow_non_cubic:
+            raise ValueError("DirectSplineTransform fixes cubic degree=3 unless allow_non_cubic=True")
         if knot_placement not in {"uniform", "quantile", "learned"}:
             raise ValueError("knot_placement must be one of: uniform, quantile, learned")
         if control_mode not in {"monotone", "free"}:
@@ -1092,6 +1095,232 @@ class DirectSplineTransform(nn.Module):
         if effective_mixing is not None:
             output = output + torch.matmul(output, effective_mixing)
         return output.to(x.dtype)
+
+
+class AdaptiveDirectSplineTransform(nn.Module):
+    """A per-column mixture of small, medium, and flexible DirectSplines.
+
+    DirectSpline's original basis is one cubic, 20-control-point transform for
+    every numerical column.  This adapter instead learns a soft per-column
+    routing over a fixed, predeclared expert bank.  Each expert is still an
+    identity-initialised DirectSpline, so the complete adapter starts as the
+    exact identity without needing a separate table-level gate.
+
+    ``conditional_rank`` adds a bounded row-dependent multiplier to the
+    spline residual.  It is deliberately applied *after* the univariate
+    mixture: other values in the same row can change how strongly a column's
+    transform is used, but cannot directly overwrite that column's value.
+    """
+
+    def __init__(
+        self,
+        x_context: torch.Tensor,
+        *,
+        expert_specs: tuple[tuple[int, int], ...] = ((1, 4), (2, 8), (3, 20)),
+        standardized_range: float = 4.0,
+        eps: float = 1e-6,
+        trainable_location_scale: bool = False,
+        cross_column_mixing_rank: int = 0,
+        cross_column_mixing_bound: float = 0.1,
+        conditional_rank: int = 0,
+        conditional_bound: float = 0.25,
+        routing_temperature: float = 1.0,
+    ) -> None:
+        super().__init__()
+        if x_context.ndim != 3:
+            raise ValueError("x_context must have shape (B, N, D)")
+        if not expert_specs:
+            raise ValueError("expert_specs must be non-empty")
+        normalized_specs = tuple((int(degree), int(points)) for degree, points in expert_specs)
+        if len(set(normalized_specs)) != len(normalized_specs):
+            raise ValueError("expert_specs must be unique")
+        if any(degree < 1 or points <= degree for degree, points in normalized_specs):
+            raise ValueError("each adaptive expert requires n_control_points > degree >= 1")
+        if conditional_rank < 0:
+            raise ValueError("conditional_rank must be non-negative")
+        if conditional_bound <= 0:
+            raise ValueError("conditional_bound must be positive")
+        if routing_temperature <= 0:
+            raise ValueError("routing_temperature must be positive")
+        if cross_column_mixing_rank < 0 or cross_column_mixing_bound < 0:
+            raise ValueError("cross-column mixing rank and bound must be non-negative")
+
+        self.expert_specs = normalized_specs
+        self.standardized_range = float(standardized_range)
+        self.eps = float(eps)
+        self.routing_temperature = float(routing_temperature)
+        # The Phase-1 configuration requests rank four, but a small table can
+        # contain fewer than four numerical columns.  Its full available rank
+        # is the faithful bounded counterpart, not a reason to skip it.
+        self.conditional_rank = min(int(conditional_rank), x_context.shape[2])
+        self.conditional_bound = float(conditional_bound)
+        self.cross_column_mixing_rank = min(int(cross_column_mixing_rank), x_context.shape[2])
+        self.cross_column_mixing_bound = float(cross_column_mixing_bound)
+        self.experts = nn.ModuleList(
+            [
+                DirectSplineTransform(
+                    x_context,
+                    n_control_points=points,
+                    degree=degree,
+                    standardized_range=standardized_range,
+                    eps=eps,
+                    trainable_shape=True,
+                    trainable_location_scale=trainable_location_scale,
+                    knot_placement="uniform",
+                    control_mode="monotone",
+                    cross_column_mixing_rank=0,
+                    allow_non_cubic=True,
+                )
+                for degree, points in normalized_specs
+            ]
+        )
+        batch, columns = x_context.shape[0], x_context.shape[2]
+        self.routing_logits = nn.Parameter(torch.zeros(batch, columns, len(self.experts)))
+
+        if self.conditional_rank:
+            # Nonzero directions plus an exactly-zero output gate preserve
+            # identity while avoiding a zero-times-zero gradient deadlock.
+            factor_shape = (batch, columns, self.conditional_rank)
+            self.conditional_left = nn.Parameter(torch.randn(factor_shape) * 0.02)
+            self.conditional_right = nn.Parameter(torch.randn(batch, self.conditional_rank, columns) * 0.02)
+            self.conditional_gate = nn.Parameter(torch.zeros(batch, columns))
+        else:
+            self.register_parameter("conditional_left", None)
+            self.register_parameter("conditional_right", None)
+            self.register_parameter("conditional_gate", None)
+
+        if self.cross_column_mixing_rank:
+            factor_shape = (batch, columns, self.cross_column_mixing_rank)
+            self.mixing_left = nn.Parameter(torch.randn(factor_shape) * 0.02)
+            self.mixing_right = nn.Parameter(torch.randn(factor_shape) * 0.02)
+            self.mixing_weight_logits = nn.Parameter(
+                torch.full((batch, self.cross_column_mixing_rank), torch.atanh(torch.tensor(0.5)))
+            )
+            self.mixing_gate = nn.Parameter(torch.zeros(batch, columns))
+        else:
+            self.register_parameter("mixing_left", None)
+            self.register_parameter("mixing_right", None)
+            self.register_parameter("mixing_weight_logits", None)
+            self.register_parameter("mixing_gate", None)
+
+    def routing_weights(self) -> torch.Tensor:
+        """Return the per-column mixture weights in expert-spec order."""
+
+        return torch.softmax(self.routing_logits / self.routing_temperature, dim=-1)
+
+    def _conditional_amplitude(
+        self,
+        x: torch.Tensor,
+        *,
+        masked_inputs: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if self.conditional_left is None or self.conditional_right is None or self.conditional_gate is None:
+            return torch.ones_like(x.float())
+        condition_input = x.float()
+        if masked_inputs is not None:
+            condition_input = condition_input.masked_fill(masked_inputs.view(1, 1, -1), 0.0)
+        hidden = torch.tanh(torch.matmul(condition_input, self.conditional_left))
+        raw = torch.matmul(hidden, self.conditional_right)
+        return 1.0 + self.conditional_bound * torch.tanh(raw) * torch.tanh(self.conditional_gate).unsqueeze(1)
+
+    def unmixed_transform(self, x: torch.Tensor) -> torch.Tensor:
+        return self._unmixed_transform(x)
+
+    def unmixed_transform_masked(self, x: torch.Tensor, masked_inputs: torch.Tensor) -> torch.Tensor:
+        """Apply a masked-query-safe residual without conditioning on removed columns."""
+
+        return self._unmixed_transform(x, masked_inputs=masked_inputs)
+
+    def _unmixed_transform(
+        self,
+        x: torch.Tensor,
+        *,
+        masked_inputs: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        base = x.float()
+        residuals = torch.stack(
+            [expert.unmixed_transform(x) - base for expert in self.experts], dim=-1
+        )
+        residual = (residuals * self.routing_weights().unsqueeze(1)).sum(dim=-1)
+        return base + self._conditional_amplitude(base, masked_inputs=masked_inputs) * residual
+
+    def mixing_matrix(self) -> torch.Tensor | None:
+        if self.mixing_left is None or self.mixing_right is None or self.mixing_weight_logits is None:
+            return None
+        left, _ = torch.linalg.qr(self.mixing_left, mode="reduced")
+        right, _ = torch.linalg.qr(self.mixing_right, mode="reduced")
+        weights = torch.tanh(self.mixing_weight_logits)
+        return torch.matmul(left * weights.unsqueeze(-2), right.transpose(-1, -2))
+
+    def effective_mixing_matrix(self) -> torch.Tensor | None:
+        mixing = self.mixing_matrix()
+        if mixing is None or self.mixing_gate is None:
+            return None
+        return self.cross_column_mixing_bound * torch.tanh(self.mixing_gate).unsqueeze(-2) * mixing
+
+    def mixing_diagnostics(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.mixing_gate is None:
+            zero = self.routing_logits.new_zeros(())
+            return zero, zero, zero
+        effective = self.effective_mixing_matrix()
+        if effective is None:  # pragma: no cover - guarded above
+            zero = self.routing_logits.new_zeros(())
+            return zero, zero, zero
+        gate = self.cross_column_mixing_bound * torch.tanh(self.mixing_gate)
+        return gate.abs().mean(), gate.abs().max(), torch.linalg.matrix_norm(effective, ord=2).amax()
+
+    def transform(self, x: torch.Tensor) -> torch.Tensor:
+        output = self.unmixed_transform(x)
+        effective_mixing = self.effective_mixing_matrix()
+        if effective_mixing is not None:
+            output = output + torch.matmul(output, effective_mixing)
+        return output.to(x.dtype)
+
+    @torch.no_grad()
+    def checkpoint_diagnostics(self) -> dict[str, float | list[float] | list[dict[str, int]]]:
+        """Return function-space, routing, and interaction diagnostics for artifacts."""
+
+        prototype = self.experts[0]
+        grid = torch.linspace(
+            -self.standardized_range,
+            self.standardized_range,
+            33,
+            dtype=prototype.location.dtype,
+            device=prototype.location.device,
+        ).view(1, -1, 1).expand(prototype.location.shape[0], -1, prototype.location.shape[1])
+        weights = self.routing_weights()
+        expert_gates = torch.stack(
+            [expert.parameters_for_transform().gate for expert in self.experts], dim=-1
+        )
+        locations = torch.stack(
+            [expert.parameters_for_transform().location for expert in self.experts], dim=-1
+        )
+        scales = torch.stack(
+            [expert.parameters_for_transform().scale for expert in self.experts], dim=-1
+        )
+        routing_entropy = -(weights * weights.clamp_min(self.eps).log()).sum(dim=-1)
+        _mixing_mean, _mixing_max, mixing_spectral = self.mixing_diagnostics()
+        conditional_offset = (
+            self.routing_logits.new_zeros(())
+            if self.conditional_gate is None
+            else (self._conditional_amplitude(grid) - 1.0).abs().mean()
+        )
+        return {
+            "grid_deformation": float((self.transform(grid) - grid).square().mean()),
+            "mean_gate": float((expert_gates * weights).sum(dim=-1).mean()),
+            "max_gate": float(expert_gates.max()),
+            "mean_abs_location": float((locations * weights).sum(dim=-1).abs().mean()),
+            "mean_abs_log_scale": float((scales.log() * weights).sum(dim=-1).abs().mean()),
+            "mixing_spectral_norm": float(mixing_spectral),
+            "routing_entropy": float(routing_entropy.mean()),
+            "routing_effective_experts": float(routing_entropy.exp().mean()),
+            "routing_mean_weights": [float(value) for value in weights.mean(dim=(0, 1))],
+            "conditional_mean_abs_amplitude_offset": float(conditional_offset),
+            "expert_specs": [
+                {"degree": int(degree), "n_control_points": int(points)}
+                for degree, points in self.expert_specs
+            ],
+        }
 
 
 class FrozenTabICLHyperSpline(nn.Module):

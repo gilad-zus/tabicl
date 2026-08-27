@@ -110,7 +110,7 @@ from tabicl._experiments.direct_spline_openml_standard import (
 # Increment this whenever a code change can alter predictions, validation
 # selection, or persisted artifact semantics.  Unlike the source hashes, this
 # value is deliberately *not* ignored by --allow-compatible-code-resume.
-EXPERIMENT_SEMANTICS_VERSION = 6
+EXPERIMENT_SEMANTICS_VERSION = 7
 _RESUME_LAUNCHER_SOURCE = "scripts/direct_spline_openml_lite.py"
 
 
@@ -120,6 +120,7 @@ def parse_args(
     required_pipeline: str | None = None,
     checkpoint_audit: bool = False,
     validation_selected_refit: bool = False,
+    adaptive_phase1: bool = False,
     description: str | None = None,
 ) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -300,10 +301,10 @@ def parse_args(
         parser.add_argument(
             "--identity-regularization",
             type=float,
-            default=0.01,
+            default=0.0 if adaptive_phase1 else 0.01,
             help=(
                 "Validation-selected refit only: function-space identity-deformation penalty weight for the "
-                "regularized arm; the cosine-only arm always uses zero."
+                "regularized arm; Phase 1 fixes this at zero."
             ),
         )
     parser.add_argument("--device", default="cuda")
@@ -406,6 +407,7 @@ def _experiment_source_hashes() -> dict[str, str]:
         root / "scripts" / "direct_spline_openml_standard.py",
         root / "scripts" / "direct_spline_openml_full_refit.py",
         root / "scripts" / "direct_spline_openml_validation_selected_refit.py",
+        root / "scripts" / "direct_spline_openml_adaptive_phase1.py",
         root / "src" / "tabicl" / "__init__.py",
     }
     experiment_dir = root / "src" / "tabicl" / "_experiments"
@@ -956,12 +958,52 @@ def _validation_selected_refit_configs(args: argparse.Namespace) -> tuple[list[s
     return ["cosine", "cosine_identity_regularized"], [base, regularized]
 
 
+def _adaptive_phase1_validation_selected_refit_configs(
+    args: argparse.Namespace,
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """Freeze the three Phase-1 architecture arms.
+
+    Every arm shares the exact same split, seed, cosine schedule, checkpoint
+    interval, and selection threshold.  The only predeclared difference is
+    the numerical adapter architecture.  The old identity penalty is omitted
+    deliberately: this experiment tests heterogeneous basis capacity and
+    conditional interactions, not another regularisation setting.
+    """
+
+    labels, configs = _validation_selected_refit_configs(args)
+    baseline = dict(configs[0])
+    baseline["adapter_architecture"] = "fixed_cubic"
+    expert_specs = ((1, 4), (2, 8), (3, 20))
+    adaptive = dict(baseline)
+    adaptive.update(
+        {
+            "adapter_architecture": "adaptive_columns",
+            "adaptive_expert_specs": expert_specs,
+            "adaptive_routing_temperature": 1.0,
+        }
+    )
+    conditional = dict(adaptive)
+    conditional.update(
+        {
+            "adapter_architecture": "conditional_adaptive_columns",
+            "conditional_interaction_rank": 4,
+            "conditional_interaction_bound": 0.25,
+        }
+    )
+    return ["fixed_cubic20", "adaptive_columns", "conditional_adaptive_columns"], [
+        baseline,
+        adaptive,
+        conditional,
+    ]
+
+
 def _validate(
     args: argparse.Namespace,
     *,
     full_context_refit: bool = False,
     checkpoint_audit: bool = False,
     validation_selected_refit: bool = False,
+    adaptive_phase1: bool = False,
 ) -> None:
     if args.bags < 2:
         raise ValueError("--bags must be at least two")
@@ -1006,8 +1048,13 @@ def _validate(
             raise ValueError("the validation-selected refit experiment requires --pipeline standard")
         if args.n_random_configs != 0:
             raise ValueError(
-                "the validation-selected refit experiment has exactly two predeclared arms; "
+                "the validation-selected refit experiment has only predeclared arms; "
                 "use --n-random-configs 0"
+            )
+        if adaptive_phase1 and float(args.identity_regularization) != 0.0:
+            raise ValueError(
+                "the adaptive Phase-1 experiment fixes identity_regularization=0; "
+                "do not pass --identity-regularization"
             )
         if args.context_cap != 0:
             raise ValueError(
@@ -1469,13 +1516,17 @@ def main(
     full_context_refit: bool = False,
     checkpoint_audit: bool = False,
     validation_selected_refit: bool = False,
+    adaptive_phase1: bool = False,
     description: str | None = None,
 ) -> None:
+    if adaptive_phase1 and not validation_selected_refit:
+        raise ValueError("adaptive_phase1 requires validation_selected_refit=True")
     args = parse_args(
         default_pipeline=default_pipeline,
         required_pipeline=required_pipeline,
         checkpoint_audit=checkpoint_audit,
         validation_selected_refit=validation_selected_refit,
+        adaptive_phase1=adaptive_phase1,
         description=description,
     )
     _validate(
@@ -1483,9 +1534,12 @@ def main(
         full_context_refit=full_context_refit,
         checkpoint_audit=checkpoint_audit,
         validation_selected_refit=validation_selected_refit,
+        adaptive_phase1=adaptive_phase1,
     )
     labels, configs = (
-        _validation_selected_refit_configs(args)
+        _adaptive_phase1_validation_selected_refit_configs(args)
+        if adaptive_phase1
+        else _validation_selected_refit_configs(args)
         if validation_selected_refit
         else _configs(args)
     )
@@ -1607,6 +1661,7 @@ def main(
         "full_context_refit": bool(full_context_refit),
         "checkpoint_audit": bool(checkpoint_audit),
         "validation_selected_refit": bool(validation_selected_refit),
+        "adaptive_phase1": bool(adaptive_phase1),
         "checkpoint_steps": list(args.checkpoint_steps) if checkpoint_audit else None,
         "validation_selected_refit_settings": (
             None
@@ -1619,7 +1674,7 @@ def main(
                 "cosine_schedule_steps": int(args.adapter_steps),
                 "cosine_min_lr_ratio": float(args.cosine_min_lr_ratio),
                 "selection_relative_improvement": float(args.selection_relative_improvement),
-                "identity_regularization": float(args.identity_regularization),
+                "identity_regularization": 0.0 if adaptive_phase1 else float(args.identity_regularization),
             }
         ),
         "oof_source": oof_source_provenance,
@@ -1732,6 +1787,27 @@ def main(
                 "full_refit_preserves_inner_cosine_schedule_horizon": True,
                 "selection_uses_patience": False,
                 "predeclared_variants": labels,
+            }
+        ),
+        "adaptive_phase1_contract": (
+            None
+            if not adaptive_phase1
+            else {
+                "purpose": "development comparison of fixed, adaptive-column, and conditional adaptive DirectSpline bases",
+                "outer_test_used_for_architecture_selection": False,
+                "train_validation_test_protocol": "one persisted inner split selects identity or checkpoint; a fresh all-row refit uses the selected duration",
+                "predeclared_arms": labels,
+                "adaptive_expert_specs": [
+                    {"degree": 1, "n_control_points": 4},
+                    {"degree": 2, "n_control_points": 8},
+                    {"degree": 3, "n_control_points": 20},
+                ],
+                "conditional_interaction": {
+                    "rank": 4,
+                    "residual_amplitude_bound": 0.25,
+                    "enabled_only_for": "conditional_adaptive_columns",
+                },
+                "identity_regularization": 0.0,
             }
         ),
     }

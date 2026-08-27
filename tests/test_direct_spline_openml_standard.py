@@ -37,7 +37,7 @@ from tabicl._experiments.direct_spline_openml_standard import (
     summarize_validation_selected_full_refit_experiment,
     summarize_validation_selected_full_refit_task,
 )
-from tabicl._hyperspline import DirectSplineTransform
+from tabicl._hyperspline import AdaptiveDirectSplineTransform, DirectSplineTransform
 from tabicl._model.inference_config import InferenceConfig
 from tabicl._model.tabicl import TabICL
 
@@ -369,6 +369,58 @@ def test_standard_direct_spline_is_bit_exact_identity_before_first_update():
     assert torch.equal(transformed, support)
     transformed.sum().backward()
     assert adapter.gap_logits.grad is not None
+
+
+def test_standard_adaptive_direct_spline_is_bit_exact_identity_before_first_update():
+    canonical = torch.tensor(
+        [[-3.1251, -0.5001, 0.3334], [-1.0002, 0.4999, 1.7501], [0.1251, 2.0002, 4.1251]],
+        dtype=torch.float32,
+    )
+    adapter = AdaptiveDirectSplineTransform(
+        canonical.unsqueeze(0),
+        expert_specs=((1, 4), (2, 8), (3, 20)),
+        trainable_location_scale=True,
+        cross_column_mixing_rank=3,
+        cross_column_mixing_bound=0.1,
+        conditional_rank=2,
+    )
+    with torch.no_grad():
+        for expert in adapter.experts:
+            expert.location.zero_()
+            expert.scale.fill_(1.0)
+
+    assert torch.equal(adapter.transform(canonical.unsqueeze(0)), canonical.unsqueeze(0))
+    adapted = _apply_adapter(
+        canonical,
+        numerical_indices=np.array([0, 1, 2]),
+        adapter=adapter,
+    )
+    assert torch.equal(adapted, canonical)
+
+
+def test_standard_adapter_factory_accepts_the_frozen_adaptive_phase1_config():
+    bundle = SimpleNamespace(
+        numerical_indices=np.array([0, 1, 2]),
+        estimator=SimpleNamespace(
+            ensemble_generator_=SimpleNamespace(preprocessors_=["none", "power"])
+        ),
+    )
+    config = {
+        **standard_direct_spline_config(),
+        "adapter_architecture": "conditional_adaptive_columns",
+        "adaptive_expert_specs": ((1, 4), (2, 8), (3, 20)),
+        "adaptive_routing_temperature": 1.0,
+        "conditional_interaction_rank": 4,
+        "conditional_interaction_bound": 0.25,
+        "identity_regularization": 0.0,
+    }
+    adapters = _make_adapters(bundle, config, torch.device("cpu"))
+    assert adapters is not None
+    for method in ("none", "power"):
+        adapter = adapters.for_method(method)
+        assert isinstance(adapter, AdaptiveDirectSplineTransform)
+        probe = torch.tensor([[[1.0, -2.0, 3.0]]])
+        assert torch.equal(adapter.transform(probe), probe)
 
 
 def test_standard_runner_checks_public_identity_and_preserves_prediction_shapes():

@@ -11,6 +11,7 @@ from tabicl._sklearn.classifier import TabICLClassifier
 from tabicl._sklearn.preprocessing import EncodedTable, TransformToNumerical
 
 from tabicl._hyperspline import (
+    AdaptiveDirectSplineTransform,
     DirectSplineTransform,
     FrozenTabICLHyperSpline,
     HyperSplineTransform,
@@ -643,6 +644,39 @@ def test_direct_spline_low_rank_mixing_starts_at_identity_and_is_bounded():
         _, _, spectral_norm = mixed.mixing_diagnostics()
     assert spectral_norm <= 0.1 + 1e-6
     assert not torch.allclose(baseline.transform(context), mixed.transform(context))
+
+
+def test_adaptive_direct_spline_mixes_per_column_capacities_from_exact_identity():
+    context = torch.randn(1, 9, 4)
+    adaptive = AdaptiveDirectSplineTransform(
+        context,
+        expert_specs=((1, 4), (2, 8), (3, 20)),
+        trainable_location_scale=True,
+        cross_column_mixing_rank=2,
+        cross_column_mixing_bound=0.1,
+        conditional_rank=2,
+        conditional_bound=0.25,
+    )
+    with torch.no_grad():
+        # The standard DirectSpline runner uses already-preprocessed
+        # coordinates, so its adaptive experts must begin as literal x -> x.
+        for expert in adaptive.experts:
+            expert.location.zero_()
+            expert.scale.fill_(1.0)
+
+    assert torch.equal(adaptive.transform(context), context)
+    # Once one capacity has a non-zero residual, routing and the conditional
+    # cross-column amplitude both receive a real learning signal.
+    with torch.no_grad():
+        adaptive.experts[0].gap_logits[..., 1].fill_(0.3)
+    adaptive.transform(context).square().mean().backward()
+    assert adaptive.experts[0].gap_logits.grad is not None
+    assert adaptive.routing_logits.grad is not None and adaptive.routing_logits.grad.abs().sum() > 0
+    assert adaptive.conditional_gate.grad is not None and adaptive.conditional_gate.grad.abs().sum() > 0
+    assert adaptive.mixing_gate.grad is not None
+    diagnostics = adaptive.checkpoint_diagnostics()
+    assert diagnostics["routing_mean_weights"] == pytest.approx([1.0 / 3.0] * 3)
+    assert diagnostics["routing_effective_experts"] == pytest.approx(3.0)
 
 
 def test_frozen_adapter_preserves_categorical_columns_and_backbone_freezing():

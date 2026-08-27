@@ -69,7 +69,7 @@ from tabicl._experiments.direct_spline_protocol import (
     sample_episode_indices,
     sample_prediction_context,
 )
-from tabicl._hyperspline import DirectSplineTransform
+from tabicl._hyperspline import AdaptiveDirectSplineTransform, DirectSplineTransform
 from tabicl._model.attention import flash_attn3_toggle
 from tabicl._model.tabicl import TabICL
 
@@ -131,12 +131,12 @@ class _AdapterSet(nn.Module):
     their ordinary feature shuffles are applied.
     """
 
-    def __init__(self, adapters: OrderedDict[str, DirectSplineTransform]) -> None:
+    def __init__(self, adapters: OrderedDict[str, nn.Module]) -> None:
         super().__init__()
         self._keys = {method: f"branch_{index}" for index, method in enumerate(adapters)}
         self.adapters = nn.ModuleDict({self._keys[method]: adapter for method, adapter in adapters.items()})
 
-    def for_method(self, method: str) -> DirectSplineTransform:
+    def for_method(self, method: str) -> nn.Module:
         return self.adapters[self._keys[method]]
 
 
@@ -306,8 +306,13 @@ def _make_adapters(bundle: _StandardBag, config: dict[str, Any], device: torch.d
 
     if bundle.numerical_indices.size == 0:
         return None
-    adapters: OrderedDict[str, DirectSplineTransform] = OrderedDict()
+    adapters: OrderedDict[str, nn.Module] = OrderedDict()
     n_numerical = int(bundle.numerical_indices.size)
+    architecture = str(config.get("adapter_architecture", "fixed_cubic"))
+    if architecture not in {"fixed_cubic", "adaptive_columns", "conditional_adaptive_columns"}:
+        raise ValueError(f"unknown DirectSpline adapter architecture: {architecture!r}")
+    if architecture != "fixed_cubic" and float(config.get("identity_regularization", 0.0)) != 0.0:
+        raise ValueError("adaptive DirectSpline phase-1 arms require identity_regularization=0")
     # Standard preprocessing already defines the coordinates consumed by
     # TabICL.  DirectSpline's context statistics are therefore deliberately
     # replaced by location=0/scale=1 below.  Feeding tens of thousands of rows
@@ -317,23 +322,46 @@ def _make_adapters(bundle: _StandardBag, config: dict[str, Any], device: torch.d
     coordinate_dummy = torch.zeros((1, 1, n_numerical), dtype=torch.float32, device=device)
     identity_probe = torch.linspace(-5.0, 5.0, 17, device=device).view(1, 17, 1).expand(-1, -1, n_numerical)
     for method in bundle.estimator.ensemble_generator_.preprocessors_:
-        adapter = DirectSplineTransform(
-            coordinate_dummy,
-            n_control_points=int(config["n_control_points"]),
-            trainable_shape=True,
-            trainable_location_scale=bool(config["trainable_location_scale"]),
-            knot_placement="uniform",
-            control_mode="monotone",
-            cross_column_mixing_rank=int(config["cross_column_mixing_rank"]),
-            cross_column_mixing_bound=float(config["cross_column_mixing_bound"]),
-        ).to(device)
+        if architecture == "fixed_cubic":
+            adapter: nn.Module = DirectSplineTransform(
+                coordinate_dummy,
+                n_control_points=int(config["n_control_points"]),
+                trainable_shape=True,
+                trainable_location_scale=bool(config["trainable_location_scale"]),
+                knot_placement="uniform",
+                control_mode="monotone",
+                cross_column_mixing_rank=int(config["cross_column_mixing_rank"]),
+                cross_column_mixing_bound=float(config["cross_column_mixing_bound"]),
+            ).to(device)
+        else:
+            raw_specs = config.get("adaptive_expert_specs", ((1, 4), (2, 8), (3, 20)))
+            expert_specs = tuple((int(item[0]), int(item[1])) for item in raw_specs)
+            adapter = AdaptiveDirectSplineTransform(
+                coordinate_dummy,
+                expert_specs=expert_specs,
+                trainable_location_scale=bool(config["trainable_location_scale"]),
+                cross_column_mixing_rank=int(config["cross_column_mixing_rank"]),
+                cross_column_mixing_bound=float(config["cross_column_mixing_bound"]),
+                conditional_rank=(
+                    0
+                    if architecture == "adaptive_columns"
+                    else int(config.get("conditional_interaction_rank", 4))
+                ),
+                conditional_bound=float(config.get("conditional_interaction_bound", 0.25)),
+                routing_temperature=float(config.get("adaptive_routing_temperature", 1.0)),
+            ).to(device)
         # The standard preprocessing output is already the coordinate system
         # consumed by the normal estimator.  These values make a fresh spline
         # literally x -> x, not an extra standardisation pass.
         with torch.no_grad():
-            adapter.location.zero_()
-            adapter.scale.fill_(1.0)
-            if not torch.equal(adapter.transform(identity_probe), identity_probe):
+            if isinstance(adapter, AdaptiveDirectSplineTransform):
+                for expert in adapter.experts:
+                    expert.location.zero_()
+                    expert.scale.fill_(1.0)
+            else:
+                adapter.location.zero_()
+                adapter.scale.fill_(1.0)
+            if not torch.equal(adapter.transform(identity_probe), identity_probe):  # type: ignore[attr-defined]
                 raise RuntimeError("standard-pipeline DirectSpline did not initialise to bit-exact identity")
         adapters[method] = adapter
     return _AdapterSet(adapters)
@@ -502,7 +530,7 @@ def _apply_adapter(
     canonical: torch.Tensor,
     *,
     numerical_indices: np.ndarray,
-    adapter: DirectSplineTransform | None,
+    adapter: nn.Module | None,
     filtered_feature_mask: np.ndarray | None = None,
 ) -> torch.Tensor:
     if canonical.ndim != 2:
@@ -512,22 +540,28 @@ def _apply_adapter(
     indices = torch.as_tensor(numerical_indices, dtype=torch.long, device=canonical.device)
     transformed = canonical.clone()
     values = canonical.index_select(-1, indices).unsqueeze(0)
-    effective_mixing = adapter.effective_mixing_matrix()
-    if filtered_feature_mask is None or effective_mixing is None:
-        adapted_values = adapter.transform(values)
+    effective_mixing = adapter.effective_mixing_matrix()  # type: ignore[attr-defined]
+    if filtered_feature_mask is None:
+        adapted_values = adapter.transform(values)  # type: ignore[attr-defined]
     else:
         # Public feature masking removes an all-NaN feature from the table.  A
         # learned cross-column residual must not smuggle that feature back into
         # the remaining outputs.  Keep the learned submatrix on unmasked
         # numerical columns and zero only masked input contributions.
-        unmixed = adapter.unmixed_transform(values)
         masked_numerical = torch.as_tensor(
             np.asarray(filtered_feature_mask, dtype=bool)[numerical_indices],
             dtype=torch.bool,
             device=canonical.device,
         )
-        mixing_input = unmixed.masked_fill(masked_numerical.view(1, 1, -1), 0.0)
-        adapted_values = unmixed + torch.matmul(mixing_input, effective_mixing)
+        if hasattr(adapter, "unmixed_transform_masked"):
+            unmixed = adapter.unmixed_transform_masked(values, masked_numerical)  # type: ignore[attr-defined]
+        else:
+            unmixed = adapter.unmixed_transform(values)  # type: ignore[attr-defined]
+        if effective_mixing is None:
+            adapted_values = unmixed
+        else:
+            mixing_input = unmixed.masked_fill(masked_numerical.view(1, 1, -1), 0.0)
+            adapted_values = unmixed + torch.matmul(mixing_input, effective_mixing)
         adapted_values = adapted_values.to(values.dtype)
     transformed[..., indices] = adapted_values.squeeze(0)
     return transformed
@@ -1913,27 +1947,30 @@ def _adapter_checkpoint_diagnostics(adapters: _AdapterSet | None) -> dict[str, A
             "mean_mixing_spectral_norm": 0.0,
             "branches": {},
         }
-    branches: dict[str, dict[str, float]] = {}
+    branches: dict[str, dict[str, Any]] = {}
     for method, key in adapters._keys.items():
         adapter = adapters.adapters[key]
-        parameters = adapter.parameters_for_transform()
-        _mixing_mean, _mixing_max, mixing_spectral = adapter.mixing_diagnostics()
-        grid = torch.linspace(
-            -adapter.standardized_range,
-            adapter.standardized_range,
-            33,
-            dtype=parameters.location.dtype,
-            device=parameters.location.device,
-        ).view(1, -1, 1).expand(parameters.location.shape[0], -1, parameters.location.shape[1])
-        grid_deformation = (adapter.transform(grid) - grid).square().mean()
-        branches[method] = {
-            "grid_deformation": float(grid_deformation.detach()),
-            "mean_gate": float(parameters.gate.mean().detach()),
-            "max_gate": float(parameters.gate.max().detach()),
-            "mean_abs_location": float(parameters.location.abs().mean().detach()),
-            "mean_abs_log_scale": float(parameters.scale.log().abs().mean().detach()),
-            "mixing_spectral_norm": float(mixing_spectral.detach()),
-        }
+        if hasattr(adapter, "checkpoint_diagnostics"):
+            branches[method] = adapter.checkpoint_diagnostics()  # type: ignore[attr-defined]
+        else:
+            parameters = adapter.parameters_for_transform()  # type: ignore[attr-defined]
+            _mixing_mean, _mixing_max, mixing_spectral = adapter.mixing_diagnostics()  # type: ignore[attr-defined]
+            grid = torch.linspace(
+                -adapter.standardized_range,  # type: ignore[attr-defined]
+                adapter.standardized_range,  # type: ignore[attr-defined]
+                33,
+                dtype=parameters.location.dtype,
+                device=parameters.location.device,
+            ).view(1, -1, 1).expand(parameters.location.shape[0], -1, parameters.location.shape[1])
+            grid_deformation = (adapter.transform(grid) - grid).square().mean()  # type: ignore[attr-defined]
+            branches[method] = {
+                "grid_deformation": float(grid_deformation.detach()),
+                "mean_gate": float(parameters.gate.mean().detach()),
+                "max_gate": float(parameters.gate.max().detach()),
+                "mean_abs_location": float(parameters.location.abs().mean().detach()),
+                "mean_abs_log_scale": float(parameters.scale.log().abs().mean().detach()),
+                "mixing_spectral_norm": float(mixing_spectral.detach()),
+            }
     values = list(branches.values())
     return {
         "has_trainable_numerical_features": True,
