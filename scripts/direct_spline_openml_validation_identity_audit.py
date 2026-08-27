@@ -129,9 +129,10 @@ def _sha256(path: Path) -> str:
 
 
 def _split_sha256(fit_indices: np.ndarray, validation_indices: np.ndarray) -> str:
+    """Match the validation/refit runner's persisted-split fingerprint exactly."""
+
     digest = hashlib.sha256()
     digest.update(np.asarray(fit_indices, dtype=np.int64).tobytes())
-    digest.update(b"|")
     digest.update(np.asarray(validation_indices, dtype=np.int64).tobytes())
     return digest.hexdigest()
 
@@ -644,6 +645,10 @@ def main() -> None:
             "tie": "test_tie_no_decisive_selector_evidence",
         }[outcome]
         prediction_path = record_path.with_suffix(".predictions.npz")
+        # The prediction is intentionally frozen before any test metric is
+        # calculated, so ensure its durable destination exists at this point
+        # rather than relying on the later JSON-record write to create it.
+        prediction_path.parent.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(
             prediction_path,
             replay_identity_test=predictions["identity_test"],
