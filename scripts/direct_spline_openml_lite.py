@@ -1024,7 +1024,10 @@ def _adaptive_phase1_validation_selected_refit_configs(
     labels, configs = _validation_selected_refit_configs(args)
     baseline = dict(configs[0])
     baseline["adapter_architecture"] = "fixed_cubic"
-    expert_specs = ((1, 4), (2, 8), (3, 20))
+    # Keep the in-memory value in its canonical JSON form.  Tuples serialize
+    # as lists in the immutable manifest; reconstructing tuples on resume made
+    # an unchanged Phase-1 run fail direct manifest equality checks.
+    expert_specs = [[1, 4], [2, 8], [3, 20]]
     adaptive = dict(baseline)
     adaptive.update(
         {

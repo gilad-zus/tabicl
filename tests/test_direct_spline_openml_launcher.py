@@ -18,6 +18,7 @@ from scripts.direct_spline_openml_lite import (
     _repair_interrupted_config_summaries,
     _resolve_execution_environment,
     _restore_run_checkpoints,
+    _adaptive_phase1_validation_selected_refit_configs,
     _equivalent_hardware_resume_mismatches,
     _same_equivalent_hardware_resume_semantics,
     _same_experimental_semantics,
@@ -235,6 +236,22 @@ def test_equivalent_hardware_resume_ignores_only_scheduler_allocation_identity()
     current["execution_environment"]["cuda"]["selected_hardware"]["compute_capability"] = [8, 0]
     current["source_sha256"]["src/tabicl/_model/tabicl.py"] = "changed-model"
     assert not _same_equivalent_hardware_resume_semantics(previous, current)
+
+
+def test_adaptive_phase1_configs_are_stable_across_json_manifest_round_trip():
+    args = Namespace(
+        train_context_rows=0,
+        adapter_steps=500,
+        selection_checkpoint_interval=25,
+        adapter_seed=20_260_826,
+        cosine_min_lr_ratio=0.01,
+        selection_relative_improvement=0.005,
+        identity_regularization=0.0,
+    )
+    labels, configs = _adaptive_phase1_validation_selected_refit_configs(args)
+    restored = json.loads(json.dumps(configs))
+    assert labels == ["fixed_cubic20", "adaptive_columns", "conditional_adaptive_columns"]
+    assert restored == configs
 
 
 def test_source_hashes_cover_public_model_and_spline_implementation():
