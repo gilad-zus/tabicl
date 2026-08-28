@@ -485,6 +485,64 @@ def test_standard_runner_checks_public_identity_and_preserves_prediction_shapes(
     assert any(not flag for flag in backbone.forward_training_flags)
 
 
+def test_standard_runner_can_preserve_full_cosine_checkpoint_trajectory_without_patience():
+    rows = 32
+    features = pd.DataFrame(
+        {
+            "x0": np.linspace(-1.0, 1.0, rows),
+            "x1": np.tile([0.0, 1.0], rows // 2),
+        }
+    )
+    labels = np.tile([0, 1], rows // 2)
+    task = OpenMLTaskData(
+        task_id=111,
+        dataset_id=112,
+        dataset_name="cosine_preserved_checkpoint",
+        problem_type="binary",
+        n_classes=2,
+        x_train=features.iloc[:24].reset_index(drop=True),
+        y_train=labels[:24],
+        x_test=features.iloc[24:].reset_index(drop=True),
+        y_test=labels[24:],
+        outer_split_hash="test",
+    )
+    config = {
+        **standard_direct_spline_config(train_context_rows=4),
+        "adapter_steps": 2,
+        "adapter_patience": None,
+        "validation_interval": 1,
+        "cosine_schedule_steps": 2,
+        "cosine_min_lr_ratio": 0.01,
+        "query_batch_rows": 4,
+        "cross_column_mixing_rank": 0,
+    }
+    result = _fit_one_bag_standard(
+        task=task,
+        fit_indices=np.arange(16),
+        validation_indices=np.arange(16, 24),
+        bag=0,
+        config=config,
+        protocol_seed=0,
+        backbone=_HalfPrecisionEvalBackbone(),
+        device=torch.device("cpu"),
+        run_fingerprint_hash="test",
+        progress=None,
+        requested_bags=8,
+        effective_bags=8,
+    )
+
+    assert result.metadata["adapter_steps_executed"] == 2
+    assert result.metadata["adapter_early_stopping_patience"] is None
+    assert result.metadata["adapter_schedule"] == {
+        "kind": "cosine",
+        "horizon_steps": 2,
+        "min_lr_ratio": 0.01,
+    }
+    assert [record["step"] for record in result.metadata["adapter_checkpoint_records"]] == [1, 2]
+    learning_rates = [record["learning_rates"][0] for record in result.metadata["adapter_checkpoint_records"]]
+    assert learning_rates[1] < learning_rates[0]
+
+
 def test_full_context_checkpoint_audit_runs_and_persists_real_adapter_states(tmp_path):
     rows = 32
     features = pd.DataFrame(

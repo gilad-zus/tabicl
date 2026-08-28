@@ -18,6 +18,7 @@ from scripts.direct_spline_openml_lite import (
     _repair_interrupted_config_summaries,
     _resolve_execution_environment,
     _restore_run_checkpoints,
+    _adaptive_retouche_configs,
     _adaptive_phase1_validation_selected_refit_configs,
     _equivalent_hardware_resume_mismatches,
     _same_equivalent_hardware_resume_semantics,
@@ -479,6 +480,42 @@ def test_validation_selected_refit_launcher_freezes_two_seeded_arms(monkeypatch,
     assert all(config["random_state"] == args.adapter_seed for config in configs)
     assert all(config["cosine_schedule_steps"] == 500 for config in configs)
     assert all(config["selection_checkpoint_interval"] == 25 for config in configs)
+
+
+def test_adaptive_retouche_launcher_freezes_preserved_fold_bank(monkeypatch, tmp_path):
+    from scripts.direct_spline_openml_lite import parse_args
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "direct_spline_openml_adaptive_retouche.py",
+            "--output-dir",
+            str(tmp_path),
+            "--pipeline",
+            "standard",
+        ],
+    )
+
+    args = parse_args(
+        default_pipeline="standard",
+        required_pipeline="standard",
+        adaptive_retouche=True,
+    )
+    _validate(args, adaptive_retouche=True)
+    labels, configs = _adaptive_retouche_configs(args)
+
+    assert args.protocol_seed == 20_260_828
+    assert args.adapter_seed == 20_260_828
+    assert args.adapter_steps == 500
+    assert args.validation_interval == 25
+    assert labels == ["D", "adaptive_columns", "conditional_adaptive_columns"]
+    assert all(config["adapter_patience"] is None for config in configs)
+    assert all(config["cosine_schedule_steps"] == 500 for config in configs)
+    assert all(config["cosine_min_lr_ratio"] == 0.01 for config in configs)
+    assert all(config["identity_regularization"] == 0.0 for config in configs)
+    assert configs[1]["adaptive_expert_specs"] == [[1, 4], [2, 8], [3, 20]]
+    assert configs[2]["conditional_interaction_rank"] == 4
+    assert configs[2]["conditional_interaction_bound"] == 0.25
 
 
 def test_standard_launcher_pipeline_can_be_enforced(monkeypatch, tmp_path):

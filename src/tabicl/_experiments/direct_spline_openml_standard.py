@@ -1492,6 +1492,20 @@ def _fit_one_bag_standard(
         has_valid_adapted_checkpoint = False
     else:
         optimizer = _optimizer(adapters, config)
+        cosine_schedule_steps = config.get("cosine_schedule_steps")
+        if cosine_schedule_steps is None:
+            scheduler = None
+        else:
+            cosine_schedule_steps = int(cosine_schedule_steps)
+            if cosine_schedule_steps < int(config["adapter_steps"]):
+                raise ValueError(
+                    "cosine_schedule_steps must be at least adapter_steps when a cosine schedule is requested"
+                )
+            scheduler = _cosine_scheduler(
+                optimizer,
+                total_steps=cosine_schedule_steps,
+                min_lr_ratio=float(config["cosine_min_lr_ratio"]),
+            )
         episode_rng = np.random.default_rng(_seed(int(config["random_state"]), task.task_id, bag, 203))
         identity_state = _cpu_state_dict(adapters)
         best_state = identity_state
@@ -1499,6 +1513,7 @@ def _fit_one_bag_standard(
         best_step = 0
         has_valid_adapted_checkpoint = False
         stale = 0
+        checkpoint_records: list[dict[str, float | int | list[float]]] = []
         first_objective = final_objective = float("nan")
         executed_steps = 0
         for step in range(1, int(config["adapter_steps"]) + 1):
@@ -1546,6 +1561,8 @@ def _fit_one_bag_standard(
             objective.backward()
             torch.nn.utils.clip_grad_norm_(adapters.parameters(), float(config["grad_clip"]))
             optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
             final_objective = float(objective.detach())
             executed_steps = step
             del output, target, objective
@@ -1581,6 +1598,15 @@ def _fit_one_bag_standard(
                     stale = 0
                 else:
                     stale += 1
+                checkpoint_records.append(
+                    {
+                        "step": int(step),
+                        "validation_error": float(candidate_error),
+                        "identity_validation_error": float(paired_identity_error),
+                        "best_validation_error": float(best_error),
+                        "learning_rates": [float(group["lr"]) for group in optimizer.param_groups],
+                    }
+                )
                 _emit(
                     progress,
                     event="adapter_validation",
@@ -1594,10 +1620,10 @@ def _fit_one_bag_standard(
                     elapsed_seconds=float(time.perf_counter() - started),
                 )
                 del paired_identity, candidate
-                if stale >= int(config["adapter_patience"]):
+                if config.get("adapter_patience") is not None and stale >= int(config["adapter_patience"]):
                     break
         adapters.load_state_dict(best_state, strict=True)
-        del optimizer
+        del scheduler, optimizer
         gc.collect()
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -1680,6 +1706,17 @@ def _fit_one_bag_standard(
         "adapter_steps_executed": executed_steps,
         "adapter_best_step": int(best_step),
         "adapter_has_valid_learned_checkpoint": bool(has_valid_adapted_checkpoint),
+        "adapter_checkpoint_records": checkpoint_records if adapters is not None else [],
+        "adapter_early_stopping_patience": config.get("adapter_patience"),
+        "adapter_schedule": (
+            {"kind": "constant"}
+            if config.get("cosine_schedule_steps") is None
+            else {
+                "kind": "cosine",
+                "horizon_steps": int(config["cosine_schedule_steps"]),
+                "min_lr_ratio": float(config["cosine_min_lr_ratio"]),
+            }
+        ),
         "adapter_row_interaction_chunk_rows": int(bundle.row_interaction_chunk_rows),
         "adapter_configured_train_context_rows": config.get("train_context_rows"),
         "adapter_train_context_policy": (

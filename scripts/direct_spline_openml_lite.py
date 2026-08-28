@@ -110,7 +110,7 @@ from tabicl._experiments.direct_spline_openml_standard import (
 # Increment this whenever a code change can alter predictions, validation
 # selection, or persisted artifact semantics.  Unlike the source hashes, this
 # value is deliberately *not* ignored by --allow-compatible-code-resume.
-EXPERIMENT_SEMANTICS_VERSION = 7
+EXPERIMENT_SEMANTICS_VERSION = 8
 _RESUME_LAUNCHER_SOURCE = "scripts/direct_spline_openml_lite.py"
 
 
@@ -121,6 +121,7 @@ def parse_args(
     checkpoint_audit: bool = False,
     validation_selected_refit: bool = False,
     adaptive_phase1: bool = False,
+    adaptive_retouche: bool = False,
     description: str | None = None,
 ) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -307,6 +308,30 @@ def parse_args(
                 "regularized arm; Phase 1 fixes this at zero."
             ),
         )
+    elif adaptive_retouche:
+        # This protocol is deliberately a new seed from the one-split
+        # Phase-1 development run.  The user may still make it explicit on a
+        # command line, but every source of optimization randomness is
+        # frozen in the manifest.
+        parser.set_defaults(protocol_seed=20_260_828)
+        parser.add_argument(
+            "--adapter-seed",
+            type=int,
+            default=20_260_828,
+            help=(
+                "Retouche-style adaptive experiment only: DirectSpline initialization and episode-sampling "
+                "seed. It is independent of the deterministic eight-fold split seed."
+            ),
+        )
+        parser.add_argument(
+            "--cosine-min-lr-ratio",
+            type=float,
+            default=0.01,
+            help=(
+                "Retouche-style adaptive experiment only: final/base learning-rate ratio of the fixed "
+                "500-step cosine schedule."
+            ),
+        )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--classifier-checkpoint", type=Path, default=None)
     parser.add_argument("--regressor-checkpoint", type=Path, default=None)
@@ -351,6 +376,11 @@ def parse_args(
         args.adapter_steps = max(args.checkpoint_steps)
     if validation_selected_refit and args.adapter_steps is None:
         args.adapter_steps = 500
+    if adaptive_retouche:
+        if args.adapter_steps is None:
+            args.adapter_steps = 500
+        if args.validation_interval is None:
+            args.validation_interval = 25
     if required_pipeline is not None and args.pipeline != required_pipeline:
         parser.error(
             f"this launcher requires --pipeline {required_pipeline}; "
@@ -408,6 +438,7 @@ def _experiment_source_hashes() -> dict[str, str]:
         root / "scripts" / "direct_spline_openml_full_refit.py",
         root / "scripts" / "direct_spline_openml_validation_selected_refit.py",
         root / "scripts" / "direct_spline_openml_adaptive_phase1.py",
+        root / "scripts" / "direct_spline_openml_adaptive_retouche.py",
         root / "src" / "tabicl" / "__init__.py",
     }
     experiment_dir = root / "src" / "tabicl" / "_experiments"
@@ -1051,6 +1082,59 @@ def _adaptive_phase1_validation_selected_refit_configs(
     ]
 
 
+def _adaptive_retouche_configs(args: argparse.Namespace) -> tuple[list[str], list[dict[str, Any]]]:
+    """Freeze the final three-arm, preserved-fold DirectSpline bank.
+
+    Each arm is trained independently inside every normal TabICLv2 bag.  The
+    fold's best trained checkpoint is retained for the identity guard and for
+    its outer-test prediction: there is deliberately no all-row refit.  The
+    only arm difference is the spline basis/conditional architecture; the
+    optimization schedule and all regularization controls are shared.
+    """
+
+    base = standard_direct_spline_config(
+        context_cap=None,
+        train_context_rows=None,
+        adapter_steps=int(args.adapter_steps),
+        validation_interval=int(args.validation_interval),
+    )
+    base.update(
+        {
+            "random_state": int(args.adapter_seed),
+            # Checkpoint selection, rather than a patience heuristic, picks
+            # the exact trained member that is subsequently guarded/deployed.
+            "adapter_patience": None,
+            "cosine_schedule_steps": int(args.adapter_steps),
+            "cosine_min_lr_ratio": float(args.cosine_min_lr_ratio),
+            "guard_relative_improvement": 0.005,
+            # Phase 1's architecture comparison intentionally had no
+            # function-space identity penalty. Keep that fixed here so this
+            # final protocol changes selection/deployment, not a second axis.
+            "identity_regularization": 0.0,
+            "adapter_architecture": "fixed_cubic",
+        }
+    )
+    adaptive = dict(base)
+    adaptive.update(
+        {
+            "adapter_architecture": "adaptive_columns",
+            "adaptive_expert_specs": [[1, 4], [2, 8], [3, 20]],
+            "adaptive_routing_temperature": 1.0,
+        }
+    )
+    conditional = dict(adaptive)
+    conditional.update(
+        {
+            "adapter_architecture": "conditional_adaptive_columns",
+            "conditional_interaction_rank": 4,
+            "conditional_interaction_bound": 0.25,
+        }
+    )
+    # D denotes the fixed cubic-20 default. T and T+E are created later from
+    # guarded OOF predictions of all three predeclared configurations.
+    return ["D", "adaptive_columns", "conditional_adaptive_columns"], [base, adaptive, conditional]
+
+
 def _validate(
     args: argparse.Namespace,
     *,
@@ -1058,6 +1142,7 @@ def _validate(
     checkpoint_audit: bool = False,
     validation_selected_refit: bool = False,
     adaptive_phase1: bool = False,
+    adaptive_retouche: bool = False,
 ) -> None:
     if args.bags < 2:
         raise ValueError("--bags must be at least two")
@@ -1097,6 +1182,34 @@ def _validate(
         raise ValueError("--dry-run cannot be combined with --resume; it is a non-persistent preview")
     if checkpoint_audit and validation_selected_refit:
         raise ValueError("checkpoint audit and validation-selected refit are mutually exclusive")
+    if adaptive_retouche and (checkpoint_audit or validation_selected_refit or adaptive_phase1 or full_context_refit):
+        raise ValueError(
+            "the Retouche-style adaptive experiment is incompatible with refit, checkpoint-audit, and Phase-1 modes"
+        )
+    if adaptive_retouche:
+        if args.pipeline != "standard":
+            raise ValueError("the Retouche-style adaptive experiment requires --pipeline standard")
+        if args.n_random_configs != 0:
+            raise ValueError(
+                "the Retouche-style adaptive experiment has exactly three predeclared arms; use --n-random-configs 0"
+            )
+        if args.context_cap != 0 or args.train_context_rows != 0:
+            raise ValueError(
+                "the Retouche-style adaptive experiment requires all inner-bag fit rows as deployment and training context"
+            )
+        if args.adapter_steps != 500:
+            raise ValueError("the Retouche-style adaptive experiment fixes --adapter-steps to 500")
+        if args.validation_interval != 25:
+            raise ValueError("the Retouche-style adaptive experiment fixes --validation-interval to 25")
+        if args.adapter_patience is not None:
+            raise ValueError(
+                "the Retouche-style adaptive experiment selects the best checkpoint over the full cosine horizon; "
+                "do not pass --adapter-patience"
+            )
+        if not 0.0 < args.cosine_min_lr_ratio <= 1.0:
+            raise ValueError("--cosine-min-lr-ratio must lie in (0, 1]")
+        if args.oof_source_dir is not None:
+            raise ValueError("--oof-source-dir is not used by the Retouche-style adaptive experiment")
     if validation_selected_refit:
         if args.pipeline != "standard":
             raise ValueError("the validation-selected refit experiment requires --pipeline standard")
@@ -1571,16 +1684,20 @@ def main(
     checkpoint_audit: bool = False,
     validation_selected_refit: bool = False,
     adaptive_phase1: bool = False,
+    adaptive_retouche: bool = False,
     description: str | None = None,
 ) -> None:
     if adaptive_phase1 and not validation_selected_refit:
         raise ValueError("adaptive_phase1 requires validation_selected_refit=True")
+    if adaptive_retouche and adaptive_phase1:
+        raise ValueError("adaptive_retouche and adaptive_phase1 are mutually exclusive")
     args = parse_args(
         default_pipeline=default_pipeline,
         required_pipeline=required_pipeline,
         checkpoint_audit=checkpoint_audit,
         validation_selected_refit=validation_selected_refit,
         adaptive_phase1=adaptive_phase1,
+        adaptive_retouche=adaptive_retouche,
         description=description,
     )
     _validate(
@@ -1589,9 +1706,12 @@ def main(
         checkpoint_audit=checkpoint_audit,
         validation_selected_refit=validation_selected_refit,
         adaptive_phase1=adaptive_phase1,
+        adaptive_retouche=adaptive_retouche,
     )
     labels, configs = (
-        _adaptive_phase1_validation_selected_refit_configs(args)
+        _adaptive_retouche_configs(args)
+        if adaptive_retouche
+        else _adaptive_phase1_validation_selected_refit_configs(args)
         if adaptive_phase1
         else _validation_selected_refit_configs(args)
         if validation_selected_refit
@@ -1716,6 +1836,7 @@ def main(
         "checkpoint_audit": bool(checkpoint_audit),
         "validation_selected_refit": bool(validation_selected_refit),
         "adaptive_phase1": bool(adaptive_phase1),
+        "adaptive_retouche": bool(adaptive_retouche),
         "checkpoint_steps": list(args.checkpoint_steps) if checkpoint_audit else None,
         "validation_selected_refit_settings": (
             None
@@ -1729,6 +1850,23 @@ def main(
                 "cosine_min_lr_ratio": float(args.cosine_min_lr_ratio),
                 "selection_relative_improvement": float(args.selection_relative_improvement),
                 "identity_regularization": 0.0 if adaptive_phase1 else float(args.identity_regularization),
+            }
+        ),
+        "adaptive_retouche_settings": (
+            None
+            if not adaptive_retouche
+            else {
+                "adapter_seed": int(args.adapter_seed),
+                "adapter_steps": int(args.adapter_steps),
+                "checkpoint_interval": int(args.validation_interval),
+                "scheduler": {
+                    "kind": "cosine",
+                    "horizon_steps": int(args.adapter_steps),
+                    "min_lr_ratio": float(args.cosine_min_lr_ratio),
+                },
+                "early_stopping": None,
+                "identity_regularization": 0.0,
+                "guard_relative_improvement": 0.005,
             }
         ),
         "oof_source": oof_source_provenance,
@@ -1751,7 +1889,19 @@ def main(
                 "resolved_train_context_rows": configs[0]["train_context_rows"],
                 "normal_tabarena_config": STANDARD_TABICL_CONFIG,
                 "final_deployment": (
-                    None
+                    {
+                        "role": "eight-fold preserved-checkpoint guarded ensemble",
+                        "fit_context": "all rows of each inner-bag fitting partition",
+                        "validation": "the held-out partition of each bag",
+                        "checkpoint_selection": "best trained spline checkpoint by the per-bag deployment metric",
+                        "identity_guard": "per-bag post-training validation guard with a 0.5% relative-improvement threshold",
+                        "test_prediction": "mean of the eight guarded bag predictions; no all-row refit",
+                        "configuration_selection": "pooled guarded OOF validation predictions only",
+                        "outer_test_selection": "forbidden",
+                        "variants": labels,
+                    }
+                    if adaptive_retouche
+                    else None
                     if not full_context_refit and not validation_selected_refit
                     else {
                         "role": "validation-selected checkpoint then fresh all-row refit",
@@ -1862,6 +2012,39 @@ def main(
                     "enabled_only_for": "conditional_adaptive_columns",
                 },
                 "identity_regularization": 0.0,
+            }
+        ),
+        "adaptive_retouche_contract": (
+            None
+            if not adaptive_retouche
+            else {
+                "purpose": "final matched TabICLv2 comparison of fixed, adaptive-column, and conditional DirectSpline adapters",
+                "outer_test_used_for_training_or_selection": False,
+                "predeclared_arms": labels,
+                "train_validation_test_protocol": "each of eight bags trains on its fit rows, retains its validation-best spline checkpoint, applies a per-bag identity guard, and contributes that guarded member to the test ensemble",
+                "identity_is_a_checkpoint_candidate": False,
+                "identity_guard_scope": "per bag after selecting the best trained checkpoint",
+                "all_row_refit": False,
+                "adapter_steps": 500,
+                "checkpoint_interval": 25,
+                "scheduler": "single-cycle cosine from base LR to 1% of base LR",
+                "early_stopping": None,
+                "identity_regularization": 0.0,
+                "adaptive_expert_specs": [
+                    {"degree": 1, "n_control_points": 4},
+                    {"degree": 2, "n_control_points": 8},
+                    {"degree": 3, "n_control_points": 20},
+                ],
+                "conditional_interaction": {
+                    "rank": 4,
+                    "residual_amplitude_bound": 0.25,
+                    "enabled_only_for": "conditional_adaptive_columns",
+                },
+                "reporting": {
+                    "D": "fixed cubic-20 default",
+                    "T": "single best predeclared arm chosen by guarded OOF validation error",
+                    "T+E": "greedy ensemble of guarded arms chosen by OOF validation only",
+                },
             }
         ),
     }
