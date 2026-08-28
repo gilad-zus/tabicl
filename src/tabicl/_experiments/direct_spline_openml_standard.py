@@ -1567,25 +1567,17 @@ def _fit_one_bag_standard(
             executed_steps = step
             del output, target, objective
             if step % int(config["validation_interval"]) == 0 or step == int(config["adapter_steps"]):
-                # Score identity and adapted back-to-back while the live GPU
-                # state is the same.  This prevents automatic inference-plan
-                # changes from entering checkpoint selection as spline signal.
-                paired_identity = _normal_prediction(
-                    bundle=bundle,
-                    query_x=validation_x,
-                    context_indices=bundle.support_indices,
-                    adapters=None,
-                    device=device,
-                )
+                # Checkpoint ranking depends only on the trained spline's
+                # validation error. Identity is invariant within a bag and is
+                # evaluated once, back-to-back with this retained checkpoint,
+                # for the actual post-training guard below. Replaying it at
+                # every checkpoint is therefore pure overhead.
                 candidate = _normal_prediction(
                     bundle=bundle,
                     query_x=validation_x,
                     context_indices=bundle.support_indices,
                     adapters=adapters,
                     device=device,
-                )
-                paired_identity_error = deployment_error(
-                    task.problem_type, raw_validation_y, paired_identity, n_classes=task.n_classes
                 )
                 candidate_error = _candidate_deployment_error(
                     task.problem_type, raw_validation_y, candidate, n_classes=task.n_classes
@@ -1602,7 +1594,6 @@ def _fit_one_bag_standard(
                     {
                         "step": int(step),
                         "validation_error": float(candidate_error),
-                        "identity_validation_error": float(paired_identity_error),
                         "best_validation_error": float(best_error),
                         "learning_rates": [float(group["lr"]) for group in optimizer.param_groups],
                     }
@@ -1614,12 +1605,11 @@ def _fit_one_bag_standard(
                     bag=bag,
                     step=step,
                     validation_error=float(candidate_error),
-                    identity_validation_error=float(paired_identity_error),
                     best_validation_error=float(best_error),
                     stale_validations=stale,
                     elapsed_seconds=float(time.perf_counter() - started),
                 )
-                del paired_identity, candidate
+                del candidate
                 if config.get("adapter_patience") is not None and stale >= int(config["adapter_patience"]):
                     break
         adapters.load_state_dict(best_state, strict=True)

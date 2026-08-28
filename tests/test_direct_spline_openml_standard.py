@@ -516,6 +516,7 @@ def test_standard_runner_can_preserve_full_cosine_checkpoint_trajectory_without_
         "query_batch_rows": 4,
         "cross_column_mixing_rank": 0,
     }
+    events: list[dict[str, object]] = []
     result = _fit_one_bag_standard(
         task=task,
         fit_indices=np.arange(16),
@@ -526,7 +527,7 @@ def test_standard_runner_can_preserve_full_cosine_checkpoint_trajectory_without_
         backbone=_HalfPrecisionEvalBackbone(),
         device=torch.device("cpu"),
         run_fingerprint_hash="test",
-        progress=None,
+        progress=events.append,
         requested_bags=8,
         effective_bags=8,
     )
@@ -539,6 +540,15 @@ def test_standard_runner_can_preserve_full_cosine_checkpoint_trajectory_without_
         "min_lr_ratio": 0.01,
     }
     assert [record["step"] for record in result.metadata["adapter_checkpoint_records"]] == [1, 2]
+    assert all(
+        "identity_validation_error" not in record
+        for record in result.metadata["adapter_checkpoint_records"]
+    )
+    assert all(
+        "identity_validation_error" not in event
+        for event in events
+        if event["event"] == "adapter_validation"
+    )
     learning_rates = [record["learning_rates"][0] for record in result.metadata["adapter_checkpoint_records"]]
     assert learning_rates[1] < learning_rates[0]
 

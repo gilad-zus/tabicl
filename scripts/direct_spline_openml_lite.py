@@ -110,8 +110,15 @@ from tabicl._experiments.direct_spline_openml_standard import (
 # Increment this whenever a code change can alter predictions, validation
 # selection, or persisted artifact semantics.  Unlike the source hashes, this
 # value is deliberately *not* ignored by --allow-compatible-code-resume.
-EXPERIMENT_SEMANTICS_VERSION = 8
+EXPERIMENT_SEMANTICS_VERSION = 9
 _RESUME_LAUNCHER_SOURCE = "scripts/direct_spline_openml_lite.py"
+_RETOUCHE_EFFICIENCY_RESUME_SOURCE_PATHS = frozenset(
+    {
+        "scripts/direct_spline_openml_adaptive_retouche.py",
+        "scripts/direct_spline_openml_lite.py",
+        "src/tabicl/_experiments/direct_spline_openml_standard.py",
+    }
+)
 
 
 def parse_args(
@@ -328,8 +335,8 @@ def parse_args(
             type=float,
             default=0.01,
             help=(
-                "Retouche-style adaptive experiment only: final/base learning-rate ratio of the fixed "
-                "500-step cosine schedule."
+                "Retouche-style adaptive experiment only: final/base learning-rate ratio of the "
+                "500-step maximum cosine schedule."
             ),
         )
     parser.add_argument("--device", default="cuda")
@@ -356,6 +363,16 @@ def parse_args(
             "With --resume, explicitly allow a new Slurm/CUDA allocation only when all model, "
             "data, numerical-software, and equivalent-GPU properties match. The physical GPU UUID, "
             "CUDA index, and visible-device count may differ and are recorded in resume provenance."
+        ),
+    )
+    parser.add_argument(
+        "--allow-retouche-efficiency-resume",
+        action="store_true",
+        help=(
+            "With --resume, explicitly preserve completed Retouche arms from semantics version 8 "
+            "(full 500-step checkpoint search) while running unfinished arms under semantics version 9 "
+            "(12-check early stopping and no repeated checkpoint identity inference). All baseline, split, "
+            "seed, model, guard, and evaluation settings must still match; the migration is recorded."
         ),
     )
     parser.add_argument(
@@ -758,6 +775,87 @@ def _same_equivalent_hardware_resume_semantics(previous: dict[str, Any], current
     return not _equivalent_hardware_resume_mismatches(previous, current)
 
 
+def _retouche_efficiency_resume_mismatches(
+    previous: dict[str, Any],
+    current: dict[str, Any],
+    *,
+    allow_equivalent_hardware: bool,
+) -> list[str]:
+    """Validate the one permitted mixed-budget Retouche resume migration.
+
+    Version-8 completed artifacts searched every checkpoint through step 500.
+    Version 9 may stop an unfinished bag after 12 stale validation checks and
+    avoids repeatedly evaluating the invariant identity arm. Reusing the old
+    artifacts is valid for the headline comparison because the baseline,
+    splits, model, seeds, guard, and held-out evaluation are unchanged. This
+    helper deliberately permits no other experimental transition.
+    """
+
+    mismatches: list[str] = []
+    if previous.get("experiment_semantics_version") != 8:
+        mismatches.append("experiment_semantics_version.previous_not_8")
+    if current.get("experiment_semantics_version") != 9:
+        mismatches.append("experiment_semantics_version.current_not_9")
+    if previous.get("adaptive_retouche") is not True or current.get("adaptive_retouche") is not True:
+        mismatches.append("adaptive_retouche")
+    if mismatches:
+        return sorted(set(mismatches))
+
+    old = copy.deepcopy(previous)
+    new = copy.deepcopy(current)
+    old["experiment_semantics_version"] = new["experiment_semantics_version"]
+    old["repository_revision"] = new.get("repository_revision")
+
+    old_hashes = old.get("source_sha256")
+    new_hashes = new.get("source_sha256")
+    if not isinstance(old_hashes, dict) or not isinstance(new_hashes, dict):
+        mismatches.append("source_sha256")
+    elif set(old_hashes) != set(new_hashes):
+        mismatches.append("source_sha256.keys")
+    else:
+        for path in _RETOUCHE_EFFICIENCY_RESUME_SOURCE_PATHS:
+            if path not in old_hashes:
+                mismatches.append(f"source_sha256.{path}")
+            else:
+                old_hashes[path] = new_hashes[path]
+
+    old_configs = old.get("configs")
+    new_configs = new.get("configs")
+    if not isinstance(old_configs, list) or not isinstance(new_configs, list) or len(old_configs) != len(new_configs):
+        mismatches.append("configs")
+    else:
+        for index, (old_config, new_config) in enumerate(zip(old_configs, new_configs, strict=True)):
+            if not isinstance(old_config, dict) or not isinstance(new_config, dict):
+                mismatches.append(f"configs[{index}]")
+                continue
+            if old_config.get("adapter_patience") is not None or new_config.get("adapter_patience") != 12:
+                mismatches.append(f"configs[{index}].adapter_patience")
+                continue
+            old_config["adapter_patience"] = 12
+
+    for field in ("adaptive_retouche_settings", "adaptive_retouche_contract"):
+        old_record = old.get(field)
+        new_record = new.get(field)
+        expected_early_stop = {"stale_validation_checks": 12}
+        if not isinstance(old_record, dict) or not isinstance(new_record, dict):
+            mismatches.append(field)
+        elif old_record.get("early_stopping") is not None or new_record.get("early_stopping") != expected_early_stop:
+            mismatches.append(f"{field}.early_stopping")
+        else:
+            old_record["early_stopping"] = expected_early_stop
+
+    if allow_equivalent_hardware:
+        old["execution_environment"] = _normalise_equivalent_hardware_environment(
+            old.get("execution_environment")
+        )
+        new["execution_environment"] = _normalise_equivalent_hardware_environment(
+            new.get("execution_environment")
+        )
+
+    mismatches.extend(_difference_paths(old, new, prefix="immutable_run"))
+    return sorted(set(mismatches))
+
+
 def _slurm_allocation_provenance() -> dict[str, str | None]:
     return {
         name: os.environ.get(name)
@@ -1101,9 +1199,11 @@ def _adaptive_retouche_configs(args: argparse.Namespace) -> tuple[list[str], lis
     base.update(
         {
             "random_state": int(args.adapter_seed),
-            # Checkpoint selection, rather than a patience heuristic, picks
-            # the exact trained member that is subsequently guarded/deployed.
-            "adapter_patience": None,
+            # A conservative 12-check patience (300 stale optimisation steps)
+            # is fixed from Phase-1 validation trajectories before this run.
+            # The validation-best trained member is still preserved directly;
+            # no all-row refit follows early stopping.
+            "adapter_patience": 12,
             "cosine_schedule_steps": int(args.adapter_steps),
             "cosine_min_lr_ratio": float(args.cosine_min_lr_ratio),
             "guard_relative_improvement": 0.005,
@@ -1176,6 +1276,10 @@ def _validate(
         raise ValueError("--allow-compatible-code-resume requires --resume")
     if getattr(args, "allow_equivalent_hardware_resume", False) and not args.resume:
         raise ValueError("--allow-equivalent-hardware-resume requires --resume")
+    if getattr(args, "allow_retouche_efficiency_resume", False) and not args.resume:
+        raise ValueError("--allow-retouche-efficiency-resume requires --resume")
+    if getattr(args, "allow_retouche_efficiency_resume", False) and not adaptive_retouche:
+        raise ValueError("--allow-retouche-efficiency-resume is only valid for the Retouche-style adaptive experiment")
     if args.retry_cuda_oom_skips and not args.resume:
         raise ValueError("--retry-cuda-oom-skips requires --resume")
     if getattr(args, "dry_run", False) and args.resume:
@@ -1203,7 +1307,7 @@ def _validate(
             raise ValueError("the Retouche-style adaptive experiment fixes --validation-interval to 25")
         if args.adapter_patience is not None:
             raise ValueError(
-                "the Retouche-style adaptive experiment selects the best checkpoint over the full cosine horizon; "
+                "the Retouche-style adaptive experiment fixes a 12-check validation early-stop patience; "
                 "do not pass --adapter-patience"
             )
         if not 0.0 < args.cosine_min_lr_ratio <= 1.0:
@@ -1864,7 +1968,7 @@ def main(
                     "horizon_steps": int(args.adapter_steps),
                     "min_lr_ratio": float(args.cosine_min_lr_ratio),
                 },
-                "early_stopping": None,
+                "early_stopping": {"stale_validation_checks": 12},
                 "identity_regularization": 0.0,
                 "guard_relative_improvement": 0.005,
             }
@@ -2028,7 +2132,7 @@ def main(
                 "adapter_steps": 500,
                 "checkpoint_interval": 25,
                 "scheduler": "single-cycle cosine from base LR to 1% of base LR",
-                "early_stopping": None,
+                "early_stopping": {"stale_validation_checks": 12},
                 "identity_regularization": 0.0,
                 "adaptive_expert_specs": [
                     {"degree": 1, "n_control_points": 4},
@@ -2057,6 +2161,15 @@ def main(
                 if args.allow_equivalent_hardware_resume and isinstance(previous_run, dict)
                 else []
             )
+            retouche_efficiency_resume_mismatches = (
+                _retouche_efficiency_resume_mismatches(
+                    previous_run,
+                    immutable_run,
+                    allow_equivalent_hardware=bool(args.allow_equivalent_hardware_resume),
+                )
+                if args.allow_retouche_efficiency_resume and isinstance(previous_run, dict)
+                else []
+            )
             compatible_code_resume = (
                 args.allow_compatible_code_resume
                 and isinstance(previous_run, dict)
@@ -2067,7 +2180,23 @@ def main(
                 and isinstance(previous_run, dict)
                 and _same_equivalent_hardware_resume_semantics(previous_run, immutable_run)
             )
-            if not (compatible_code_resume or compatible_hardware_resume):
+            compatible_retouche_efficiency_resume = (
+                args.allow_retouche_efficiency_resume
+                and isinstance(previous_run, dict)
+                and not retouche_efficiency_resume_mismatches
+            )
+            if not (
+                compatible_code_resume
+                or compatible_hardware_resume
+                or compatible_retouche_efficiency_resume
+            ):
+                if args.allow_retouche_efficiency_resume:
+                    mismatch_summary = ", ".join(retouche_efficiency_resume_mismatches) or "unknown"
+                    raise ValueError(
+                        "refusing Retouche efficiency resume: differences extend beyond the explicit "
+                        "full-horizon-to-patience-12 migration. "
+                        f"Mismatched fields: {mismatch_summary}."
+                    )
                 if args.allow_equivalent_hardware_resume:
                     mismatch_summary = ", ".join(hardware_resume_mismatches) or "unknown"
                     raise ValueError(
@@ -2093,6 +2222,68 @@ def main(
                     "Resuming with identical source hashes and an explicitly recorded Git revision change; "
                     f"retaining immutable run fingerprint {prior_hash[:12]}"
                 )
+            elif compatible_retouche_efficiency_resume:
+                provenance_path = args.output_dir / "retouche_efficiency_resumes.jsonl"
+                provenance = {
+                    "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                    "previous_run_fingerprint_sha256": prior_hash,
+                    "proposed_resume_fingerprint_sha256": run_fingerprint_hash,
+                    "previous_experiment_semantics_version": previous_run.get(
+                        "experiment_semantics_version"
+                    ),
+                    "resumed_experiment_semantics_version": immutable_run.get(
+                        "experiment_semantics_version"
+                    ),
+                    "previous_source_sha256": previous_run.get("source_sha256"),
+                    "resumed_source_sha256": immutable_run["source_sha256"],
+                    "previous_execution_environment": previous_run.get("execution_environment"),
+                    "resumed_execution_environment": immutable_run["execution_environment"],
+                    "completed_artifact_policy": (
+                        "reuse version-8 completed configs/bags with their full 500-step checkpoint search"
+                    ),
+                    "unfinished_artifact_policy": (
+                        "run version-9 configs/bags with a 500-step maximum and 12 stale-check patience"
+                    ),
+                    "unchanged_comparison_contract": [
+                        "TabICLv2 baseline",
+                        "OpenML tasks and outer splits",
+                        "eight deterministic inner bags",
+                        "adapter and protocol seeds",
+                        "spline architectures and optimizer",
+                        "cosine schedule and checkpoint interval",
+                        "validation identity guard",
+                        "held-out test evaluation",
+                    ],
+                    "ignored_allocation_identity_fields": (
+                        [
+                            "cuda.visible_device_count",
+                            "cuda.selected_hardware.index",
+                            "cuda.selected_hardware.uuid",
+                        ]
+                        if args.allow_equivalent_hardware_resume
+                        else []
+                    ),
+                    "slurm_allocation": _slurm_allocation_provenance(),
+                    "reason": (
+                        "explicit mixed-compute Retouche resume: completed full-horizon searches are "
+                        "retained, while only unfinished work receives the conservative efficiency stop"
+                    ),
+                }
+                message = (
+                    "Resuming the Retouche comparison with completed full-horizon artifacts preserved and "
+                    "patience-12 applied only to unfinished work; "
+                    f"retaining immutable run fingerprint {prior_hash[:12]}"
+                )
+                migrations = previous.setdefault("resume_protocol_migrations", [])
+                if not isinstance(migrations, list):
+                    raise ValueError("existing manifest has an invalid resume_protocol_migrations record")
+                if not any(
+                    isinstance(item, dict)
+                    and item.get("proposed_resume_fingerprint_sha256") == run_fingerprint_hash
+                    for item in migrations
+                ):
+                    migrations.append(provenance)
+                    _json_dump(manifest_path, previous)
             else:
                 provenance_path = args.output_dir / "equivalent_hardware_resumes.jsonl"
                 provenance = {

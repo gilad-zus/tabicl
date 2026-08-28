@@ -16,6 +16,7 @@ from scripts.direct_spline_openml_lite import (
     _persisted_cuda_oom_skips,
     _persisted_task_skips,
     _repair_interrupted_config_summaries,
+    _retouche_efficiency_resume_mismatches,
     _resolve_execution_environment,
     _restore_run_checkpoints,
     _adaptive_retouche_configs,
@@ -237,6 +238,49 @@ def test_equivalent_hardware_resume_ignores_only_scheduler_allocation_identity()
     current["execution_environment"]["cuda"]["selected_hardware"]["compute_capability"] = [8, 0]
     current["source_sha256"]["src/tabicl/_model/tabicl.py"] = "changed-model"
     assert not _same_equivalent_hardware_resume_semantics(previous, current)
+
+
+def test_retouche_efficiency_resume_allows_only_full_horizon_to_patience_12_transition():
+    changed_sources = {
+        "scripts/direct_spline_openml_adaptive_retouche.py",
+        "scripts/direct_spline_openml_lite.py",
+        "src/tabicl/_experiments/direct_spline_openml_standard.py",
+    }
+    previous = {
+        "experiment_semantics_version": 8,
+        "repository_revision": "old",
+        "adaptive_retouche": True,
+        "source_sha256": {
+            **{path: f"old-{index}" for index, path in enumerate(sorted(changed_sources))},
+            "src/tabicl/_model/tabicl.py": "frozen-model",
+        },
+        "configs": [
+            {"label": label, "adapter_patience": None, "adapter_steps": 500}
+            for label in ("D", "adaptive_columns", "conditional_adaptive_columns")
+        ],
+        "adaptive_retouche_settings": {"early_stopping": None, "adapter_steps": 500},
+        "adaptive_retouche_contract": {"early_stopping": None, "outer_test_used_for_selection": False},
+        "execution_environment": {"resolved_device": "cuda:0", "precision": {"tf32": False}},
+        "standard_tabarena_baseline": {"n_estimators": 8},
+    }
+    current = json.loads(json.dumps(previous))
+    current["experiment_semantics_version"] = 9
+    current["repository_revision"] = "new"
+    for path in changed_sources:
+        current["source_sha256"][path] = f"new-{path}"
+    for config in current["configs"]:
+        config["adapter_patience"] = 12
+    current["adaptive_retouche_settings"]["early_stopping"] = {"stale_validation_checks": 12}
+    current["adaptive_retouche_contract"]["early_stopping"] = {"stale_validation_checks": 12}
+
+    assert _retouche_efficiency_resume_mismatches(
+        previous, current, allow_equivalent_hardware=False
+    ) == []
+
+    current["standard_tabarena_baseline"]["n_estimators"] = 4
+    assert _retouche_efficiency_resume_mismatches(
+        previous, current, allow_equivalent_hardware=False
+    ) == ["immutable_run.standard_tabarena_baseline.n_estimators"]
 
 
 def test_adaptive_phase1_configs_are_stable_across_json_manifest_round_trip():
@@ -509,7 +553,7 @@ def test_adaptive_retouche_launcher_freezes_preserved_fold_bank(monkeypatch, tmp
     assert args.adapter_steps == 500
     assert args.validation_interval == 25
     assert labels == ["D", "adaptive_columns", "conditional_adaptive_columns"]
-    assert all(config["adapter_patience"] is None for config in configs)
+    assert all(config["adapter_patience"] == 12 for config in configs)
     assert all(config["cosine_schedule_steps"] == 500 for config in configs)
     assert all(config["cosine_min_lr_ratio"] == 0.01 for config in configs)
     assert all(config["identity_regularization"] == 0.0 for config in configs)
