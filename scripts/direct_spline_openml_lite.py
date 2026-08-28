@@ -654,6 +654,68 @@ def _same_sources_except_resume_launcher(previous: dict[str, Any], current: dict
     )
 
 
+def _difference_paths(previous: Any, current: Any, *, prefix: str) -> list[str]:
+    """Return compact paths for unequal leaves in two JSON-like values."""
+
+    if isinstance(previous, dict) and isinstance(current, dict):
+        paths: list[str] = []
+        for key in sorted(set(previous) | set(current)):
+            child = f"{prefix}.{key}" if prefix else str(key)
+            if key not in previous or key not in current:
+                paths.append(child)
+            else:
+                paths.extend(_difference_paths(previous[key], current[key], prefix=child))
+        return paths
+    if isinstance(previous, list) and isinstance(current, list):
+        paths = []
+        if len(previous) != len(current):
+            paths.append(f"{prefix}.length")
+        for index, (old_item, new_item) in enumerate(zip(previous, current)):
+            paths.extend(
+                _difference_paths(old_item, new_item, prefix=f"{prefix}[{index}]")
+            )
+        return paths
+    return [] if previous == current else [prefix]
+
+
+def _equivalent_hardware_resume_mismatches(
+    previous: dict[str, Any], current: dict[str, Any]
+) -> list[str]:
+    """Explain every field that prevents an equivalent-hardware resume."""
+
+    mismatches: list[str] = []
+    if previous.get("experiment_semantics_version") != current.get(
+        "experiment_semantics_version"
+    ):
+        mismatches.append("experiment_semantics_version")
+
+    previous_hashes = previous.get("source_sha256")
+    current_hashes = current.get("source_sha256")
+    if not isinstance(previous_hashes, dict) or not isinstance(current_hashes, dict):
+        mismatches.append("source_sha256")
+    else:
+        for path in sorted(set(previous_hashes) | set(current_hashes)):
+            if path == _RESUME_LAUNCHER_SOURCE:
+                continue
+            if previous_hashes.get(path) != current_hashes.get(path):
+                mismatches.append(f"source_sha256.{path}")
+
+    ignored = {"repository_revision", "source_sha256", "execution_environment"}
+    previous_fields = {key: value for key, value in previous.items() if key not in ignored}
+    current_fields = {key: value for key, value in current.items() if key not in ignored}
+    mismatches.extend(
+        _difference_paths(previous_fields, current_fields, prefix="immutable_run")
+    )
+    mismatches.extend(
+        _difference_paths(
+            _normalise_equivalent_hardware_environment(previous.get("execution_environment")),
+            _normalise_equivalent_hardware_environment(current.get("execution_environment")),
+            prefix="execution_environment",
+        )
+    )
+    return sorted(set(mismatches))
+
+
 def _same_equivalent_hardware_resume_semantics(previous: dict[str, Any], current: dict[str, Any]) -> bool:
     """Check a Slurm-safe resume without silently accepting model/code changes.
 
@@ -662,18 +724,7 @@ def _same_equivalent_hardware_resume_semantics(previous: dict[str, Any], current
     scheduler allocation identity inside the execution environment may change.
     """
 
-    if previous.get("experiment_semantics_version") != current.get("experiment_semantics_version"):
-        return False
-    if not _same_sources_except_resume_launcher(previous, current):
-        return False
-    ignored = {"repository_revision", "source_sha256", "execution_environment"}
-    if {key: value for key, value in previous.items() if key not in ignored} != {
-        key: value for key, value in current.items() if key not in ignored
-    }:
-        return False
-    return _normalise_equivalent_hardware_environment(previous.get("execution_environment")) == (
-        _normalise_equivalent_hardware_environment(current.get("execution_environment"))
-    )
+    return not _equivalent_hardware_resume_mismatches(previous, current)
 
 
 def _slurm_allocation_provenance() -> dict[str, str | None]:
@@ -1815,6 +1866,11 @@ def main(
     if previous is not None:
         if previous.get("run_fingerprint_sha256") != run_fingerprint_hash or previous.get("immutable_run") != immutable_run:
             previous_run = previous.get("immutable_run")
+            hardware_resume_mismatches = (
+                _equivalent_hardware_resume_mismatches(previous_run, immutable_run)
+                if args.allow_equivalent_hardware_resume and isinstance(previous_run, dict)
+                else []
+            )
             compatible_code_resume = (
                 args.allow_compatible_code_resume
                 and isinstance(previous_run, dict)
@@ -1827,9 +1883,11 @@ def main(
             )
             if not (compatible_code_resume or compatible_hardware_resume):
                 if args.allow_equivalent_hardware_resume:
+                    mismatch_summary = ", ".join(hardware_resume_mismatches) or "unknown"
                     raise ValueError(
                         "refusing equivalent-hardware resume: the new allocation differs in model/training "
-                        "semantics or stable GPU/software/precision properties; choose a new --output-dir."
+                        "semantics or stable GPU/software/precision properties. "
+                        f"Mismatched fields: {mismatch_summary}. Choose a new --output-dir."
                     )
                 raise ValueError(
                     "refusing to resume: the existing output directory has a different immutable run fingerprint; "

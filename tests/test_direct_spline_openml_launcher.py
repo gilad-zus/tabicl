@@ -18,6 +18,7 @@ from scripts.direct_spline_openml_lite import (
     _repair_interrupted_config_summaries,
     _resolve_execution_environment,
     _restore_run_checkpoints,
+    _equivalent_hardware_resume_mismatches,
     _same_equivalent_hardware_resume_semantics,
     _same_experimental_semantics,
     _validate,
@@ -224,9 +225,13 @@ def test_equivalent_hardware_resume_ignores_only_scheduler_allocation_identity()
     }
 
     assert _same_equivalent_hardware_resume_semantics(previous, current)
+    assert _equivalent_hardware_resume_mismatches(previous, current) == []
 
     current["execution_environment"]["cuda"]["selected_hardware"]["compute_capability"] = [9, 0]
     assert not _same_equivalent_hardware_resume_semantics(previous, current)
+    assert _equivalent_hardware_resume_mismatches(previous, current) == [
+        "execution_environment.cuda.selected_hardware.compute_capability[0]"
+    ]
     current["execution_environment"]["cuda"]["selected_hardware"]["compute_capability"] = [8, 0]
     current["source_sha256"]["src/tabicl/_model/tabicl.py"] = "changed-model"
     assert not _same_equivalent_hardware_resume_semantics(previous, current)
