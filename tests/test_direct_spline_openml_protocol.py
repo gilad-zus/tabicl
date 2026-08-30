@@ -31,6 +31,11 @@ from tabicl._experiments.direct_spline_protocol import (
     sample_prediction_context,
     shared_random_direct_spline_configs,
 )
+from tabicl._experiments.direct_spline_random_forest_anchor import (
+    METHOD_RANDOM_FOREST,
+    fit_bradley_terry_elo,
+    fit_random_forest_task,
+)
 
 
 def test_fold_preprocessor_uses_train_statistics_and_maps_unknown_categories():
@@ -220,6 +225,40 @@ def test_paired_elo_is_symmetric_and_bootstrapped():
     assert result["paired_head_to_head_elo_equivalent"] == result["paired_elo_delta"]
     assert result["paired_elo_delta"] == pytest.approx(-inverse["paired_elo_delta"])
     assert interval["lower_95"] <= interval["upper_95"]
+
+
+def test_local_bradley_terry_anchor_is_fixed_and_orders_clear_methods():
+    board = fit_bradley_terry_elo(
+        errors_by_method={
+            METHOD_RANDOM_FOREST: [0.40, 0.40, 0.40, 0.40],
+            "TabICLv2_D": [0.30, 0.30, 0.30, 0.30],
+            "DirectSpline_D": [0.20, 0.20, 0.20, 0.20],
+        }
+    )
+    ratings = board["ratings"]
+    assert ratings[METHOD_RANDOM_FOREST]["elo"] == pytest.approx(1000.0)
+    assert ratings["DirectSpline_D"]["elo"] > ratings["TabICLv2_D"]["elo"] > 1000.0
+    assert board["rating_kind"] == "local_anchored_bradley_terry_elo"
+
+
+def test_random_forest_anchor_uses_only_outer_training_preprocessing():
+    task = OpenMLTaskData(
+        task_id=1,
+        dataset_id=2,
+        dataset_name="tiny_rf",
+        problem_type="binary",
+        n_classes=2,
+        x_train=pd.DataFrame({"numeric": [0.0, 0.1, 0.9, 1.0], "category": ["a", "a", "b", "b"]}),
+        y_train=np.array([0, 0, 1, 1]),
+        x_test=pd.DataFrame({"numeric": [0.05, 0.95], "category": ["missing-at-train", "b"]}),
+        y_test=np.array([0, 1]),
+        outer_split_hash="split",
+    )
+    result = fit_random_forest_task(task=task, config={"n_estimators": 10}, n_jobs=1)
+    assert result.prediction.shape == (2, 2)
+    assert np.allclose(result.prediction.sum(axis=1), 1.0)
+    assert np.isfinite(result.metadata["benchmark_error"])
+    assert result.metadata["preprocessor"] == "FoldPreprocessor.fit(outer_training_rows_only)"
 
 
 def test_invalid_candidate_prediction_is_retained_as_a_paired_loss():

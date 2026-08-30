@@ -1,0 +1,23 @@
+prefix_rule(
+    pattern = ["ssh"],
+    decision = "prompt",
+    justification = "Every remote SSH operation requires explicit user approval.",
+)
+
+prefix_rule(
+    pattern = ["scp"],
+    decision = "prompt",
+    justification = "Every remote file transfer requires explicit user approval.",
+)
+
+prefix_rule(
+    pattern = ["sftp"],
+    decision = "prompt",
+    justification = "Every remote file transfer requires explicit user approval.",
+)
+
+prefix_rule(
+    pattern = ["rsync"],
+    decision = "prompt",
+    justification = "Every remote synchronization requires explicit user approval.",
+)
