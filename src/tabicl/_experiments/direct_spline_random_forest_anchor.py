@@ -58,6 +58,12 @@ DEFAULT_BT_CONFIG: dict[str, Any] = {
     "maxiter": 10_000,
 }
 
+# ``model`` is persisted as descriptive metadata, rather than a numerical
+# option accepted by either Bradley--Terry fitting routine.
+BRADLEY_TERRY_FIT_CONFIG_KEYS = frozenset(
+    {"anchor_method", "anchor_elo", "tie_atol", "ridge_strength", "maxiter"}
+)
+
 
 @dataclass(frozen=True)
 class RandomForestTaskResult:
@@ -65,6 +71,15 @@ class RandomForestTaskResult:
 
     metadata: dict[str, Any]
     prediction: np.ndarray
+
+
+def bradley_terry_fit_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Return only fitting options from the persisted Bradley--Terry metadata."""
+
+    unknown = set(config) - (set(BRADLEY_TERRY_FIT_CONFIG_KEYS) | {"model"})
+    if unknown:
+        raise ValueError(f"unknown Bradley--Terry configuration fields: {sorted(unknown)}")
+    return {key: config[key] for key in BRADLEY_TERRY_FIT_CONFIG_KEYS if key in config}
 
 
 def _sha256_file(path: Path) -> str:

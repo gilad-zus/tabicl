@@ -32,7 +32,9 @@ from tabicl._experiments.direct_spline_protocol import (
     shared_random_direct_spline_configs,
 )
 from tabicl._experiments.direct_spline_random_forest_anchor import (
+    DEFAULT_BT_CONFIG,
     METHOD_RANDOM_FOREST,
+    bradley_terry_fit_config,
     fit_bradley_terry_elo,
     fit_random_forest_task,
 )
@@ -239,6 +241,13 @@ def test_local_bradley_terry_anchor_is_fixed_and_orders_clear_methods():
     assert ratings[METHOD_RANDOM_FOREST]["elo"] == pytest.approx(1000.0)
     assert ratings["DirectSpline_D"]["elo"] > ratings["TabICLv2_D"]["elo"] > 1000.0
     assert board["rating_kind"] == "local_anchored_bradley_terry_elo"
+
+
+def test_bradley_terry_fit_config_keeps_manifest_metadata_out_of_fit_kwargs():
+    fit_config = bradley_terry_fit_config(DEFAULT_BT_CONFIG)
+
+    assert "model" not in fit_config
+    assert fit_config["anchor_method"] == METHOD_RANDOM_FOREST
 
 
 def test_random_forest_anchor_uses_only_outer_training_preprocessing():

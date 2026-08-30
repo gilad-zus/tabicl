@@ -35,6 +35,7 @@ from tabicl._experiments.direct_spline_random_forest_anchor import (
     METHOD_DIRECT_SPLINE,
     METHOD_RANDOM_FOREST,
     METHOD_TABICL,
+    bradley_terry_fit_config,
     bootstrap_bradley_terry_elo,
     fit_bradley_terry_elo,
     fit_random_forest_task,
@@ -129,12 +130,13 @@ def _write_summary(
         METHOD_TABICL: np.asarray([row["tabicl_benchmark_error"] for row in task_rows], dtype=float),
         METHOD_DIRECT_SPLINE: np.asarray([row["direct_spline_benchmark_error"] for row in task_rows], dtype=float),
     }
-    board = fit_bradley_terry_elo(errors_by_method=errors, **bt_config)
+    fit_config = bradley_terry_fit_config(bt_config)
+    board = fit_bradley_terry_elo(errors_by_method=errors, **fit_config)
     bootstrap = bootstrap_bradley_terry_elo(
         errors_by_method=errors,
         rounds=bootstrap_rounds,
         seed=bootstrap_seed,
-        **bt_config,
+        **fit_config,
     )
     for method, interval in bootstrap["ratings"].items():
         board["ratings"][method]["bootstrap_95"] = interval
