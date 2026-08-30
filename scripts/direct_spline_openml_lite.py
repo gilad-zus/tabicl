@@ -456,6 +456,7 @@ def _experiment_source_hashes() -> dict[str, str]:
         root / "scripts" / "direct_spline_openml_validation_selected_refit.py",
         root / "scripts" / "direct_spline_openml_adaptive_phase1.py",
         root / "scripts" / "direct_spline_openml_adaptive_retouche.py",
+        root / "scripts" / "direct_spline_openml_adaptive_retouche_d_tabarena.py",
         root / "src" / "tabicl" / "__init__.py",
     }
     experiment_dir = root / "src" / "tabicl" / "_experiments"
@@ -1180,7 +1181,9 @@ def _adaptive_phase1_validation_selected_refit_configs(
     ]
 
 
-def _adaptive_retouche_configs(args: argparse.Namespace) -> tuple[list[str], list[dict[str, Any]]]:
+def _adaptive_retouche_configs(
+    args: argparse.Namespace, *, d_only: bool = False
+) -> tuple[list[str], list[dict[str, Any]]]:
     """Freeze the final three-arm, preserved-fold DirectSpline bank.
 
     Each arm is trained independently inside every normal TabICLv2 bag.  The
@@ -1230,6 +1233,11 @@ def _adaptive_retouche_configs(args: argparse.Namespace) -> tuple[list[str], lis
             "conditional_interaction_bound": 0.25,
         }
     )
+    if d_only:
+        # This is a deliberately separate final evaluation: it tests the
+        # strongest fixed arm on the complete benchmark without spending the
+        # additional compute on architecture selection or ensembling.
+        return ["D"], [base]
     # D denotes the fixed cubic-20 default. T and T+E are created later from
     # guarded OOF predictions of all three predeclared configurations.
     return ["D", "adaptive_columns", "conditional_adaptive_columns"], [base, adaptive, conditional]
@@ -1789,12 +1797,15 @@ def main(
     validation_selected_refit: bool = False,
     adaptive_phase1: bool = False,
     adaptive_retouche: bool = False,
+    adaptive_retouche_d_only: bool = False,
     description: str | None = None,
 ) -> None:
     if adaptive_phase1 and not validation_selected_refit:
         raise ValueError("adaptive_phase1 requires validation_selected_refit=True")
     if adaptive_retouche and adaptive_phase1:
         raise ValueError("adaptive_retouche and adaptive_phase1 are mutually exclusive")
+    if adaptive_retouche_d_only and not adaptive_retouche:
+        raise ValueError("adaptive_retouche_d_only requires adaptive_retouche=True")
     args = parse_args(
         default_pipeline=default_pipeline,
         required_pipeline=required_pipeline,
@@ -1813,7 +1824,7 @@ def main(
         adaptive_retouche=adaptive_retouche,
     )
     labels, configs = (
-        _adaptive_retouche_configs(args)
+        _adaptive_retouche_configs(args, d_only=adaptive_retouche_d_only)
         if adaptive_retouche
         else _adaptive_phase1_validation_selected_refit_configs(args)
         if adaptive_phase1
@@ -2122,7 +2133,11 @@ def main(
             None
             if not adaptive_retouche
             else {
-                "purpose": "final matched TabICLv2 comparison of fixed, adaptive-column, and conditional DirectSpline adapters",
+                "purpose": (
+                    "final TabArena evaluation of the fixed cubic-20 DirectSpline adapter against TabICLv2"
+                    if adaptive_retouche_d_only
+                    else "final matched TabICLv2 comparison of fixed, adaptive-column, and conditional DirectSpline adapters"
+                ),
                 "outer_test_used_for_training_or_selection": False,
                 "predeclared_arms": labels,
                 "train_validation_test_protocol": "each of eight bags trains on its fit rows, retains its validation-best spline checkpoint, applies a per-bag identity guard, and contributes that guarded member to the test ensemble",
@@ -2134,20 +2149,28 @@ def main(
                 "scheduler": "single-cycle cosine from base LR to 1% of base LR",
                 "early_stopping": {"stale_validation_checks": 12},
                 "identity_regularization": 0.0,
-                "adaptive_expert_specs": [
+                "adaptive_expert_specs": None if adaptive_retouche_d_only else [
                     {"degree": 1, "n_control_points": 4},
                     {"degree": 2, "n_control_points": 8},
                     {"degree": 3, "n_control_points": 20},
                 ],
-                "conditional_interaction": {
+                "conditional_interaction": None if adaptive_retouche_d_only else {
                     "rank": 4,
                     "residual_amplitude_bound": 0.25,
                     "enabled_only_for": "conditional_adaptive_columns",
                 },
                 "reporting": {
                     "D": "fixed cubic-20 default",
-                    "T": "single best predeclared arm chosen by guarded OOF validation error",
-                    "T+E": "greedy ensemble of guarded arms chosen by OOF validation only",
+                    "T": (
+                        "alias of D; architecture selection is intentionally disabled for this D-only evaluation"
+                        if adaptive_retouche_d_only
+                        else "single best predeclared arm chosen by guarded OOF validation error"
+                    ),
+                    "T+E": (
+                        "alias of D; architecture ensembling is intentionally disabled for this D-only evaluation"
+                        if adaptive_retouche_d_only
+                        else "greedy ensemble of guarded arms chosen by OOF validation only"
+                    ),
                 },
             }
         ),

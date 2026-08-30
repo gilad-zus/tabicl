@@ -305,6 +305,7 @@ def test_source_hashes_cover_public_model_and_spline_implementation():
         "scripts/direct_spline_openml_lite.py",
         "scripts/direct_spline_openml_standard.py",
         "scripts/direct_spline_openml_validation_selected_refit.py",
+        "scripts/direct_spline_openml_adaptive_retouche_d_tabarena.py",
         "src/tabicl/__init__.py",
         "src/tabicl/_experiments/direct_spline_openml.py",
         "src/tabicl/_experiments/direct_spline_openml_standard.py",
@@ -560,6 +561,33 @@ def test_adaptive_retouche_launcher_freezes_preserved_fold_bank(monkeypatch, tmp
     assert configs[1]["adaptive_expert_specs"] == [[1, 4], [2, 8], [3, 20]]
     assert configs[2]["conditional_interaction_rank"] == 4
     assert configs[2]["conditional_interaction_bound"] == 0.25
+
+
+def test_adaptive_retouche_d_only_freezes_only_the_fixed_cubic_arm(monkeypatch, tmp_path):
+    from scripts.direct_spline_openml_lite import parse_args
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "direct_spline_openml_adaptive_retouche_d_tabarena.py",
+            "--output-dir",
+            str(tmp_path),
+            "--pipeline",
+            "standard",
+        ],
+    )
+
+    args = parse_args(
+        default_pipeline="standard",
+        required_pipeline="standard",
+        adaptive_retouche=True,
+    )
+    labels, configs = _adaptive_retouche_configs(args, d_only=True)
+
+    assert labels == ["D"]
+    assert len(configs) == 1
+    assert configs[0]["adapter_architecture"] == "fixed_cubic"
+    assert configs[0]["adapter_patience"] == 12
 
 
 def test_standard_launcher_pipeline_can_be_enforced(monkeypatch, tmp_path):
