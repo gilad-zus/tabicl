@@ -20,11 +20,13 @@ from scripts.direct_spline_openml_lite import (
     _resolve_execution_environment,
     _restore_run_checkpoints,
     _adaptive_retouche_configs,
+    _binary_auc_objective_configs,
     _adaptive_phase1_validation_selected_refit_configs,
     _equivalent_hardware_resume_mismatches,
     _same_equivalent_hardware_resume_semantics,
     _same_experimental_semantics,
     _validate,
+    _validate_binary_auc_confirmation_task_bank,
     _validation_selected_refit_configs,
     _write_all_skipped_summary,
     _write_run_progress,
@@ -299,6 +301,78 @@ def test_adaptive_phase1_configs_are_stable_across_json_manifest_round_trip():
     assert restored == configs
 
 
+def test_binary_auc_objective_configs_are_fixed_loss_arms():
+    args = Namespace(
+        train_context_rows=0,
+        adapter_steps=500,
+        validation_interval=25,
+        adapter_seed=20_260_828,
+        cosine_min_lr_ratio=0.01,
+    )
+
+    labels, configs = _binary_auc_objective_configs(args)
+
+    assert labels == ["D_CE", "D_pairwise_auc", "D_CE_plus_pairwise_auc"]
+    assert [config["classification_objective"] for config in configs] == [
+        "cross_entropy",
+        "pairwise_auc",
+        "cross_entropy_plus_pairwise_auc",
+    ]
+    assert configs[2]["cross_entropy_weight"] == configs[2]["pairwise_auc_weight"] == 0.5
+
+
+def test_binary_auc_confirmation_requires_the_reviewed_binary_bank(tmp_path):
+    path = tmp_path / "bank.json"
+    payload = {
+        "format_version": 1,
+        "experiment": "DirectSpline unseen OpenML binary objective confirmation task bank",
+        "is_complete": True,
+        "selected_task_ids": [17],
+        "selected_tasks": [{"task_id": 17, "problem_type": "binary", "n_classes": 2}],
+        "tabarena_exclusion": {"task_ids": [1], "dataset_ids": [2]},
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    _validate_binary_auc_confirmation_task_bank(path)
+
+    payload["selected_tasks"][0]["n_classes"] = 3
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="non-binary"):
+        _validate_binary_auc_confirmation_task_bank(path)
+
+
+def test_binary_auc_objective_confirmation_rejects_skipping_regular_tabicl_baseline():
+    args = Namespace(
+        bags=8,
+        n_random_configs=0,
+        bootstrap_rounds=20,
+        max_tasks=None,
+        task_id=None,
+        task_id_file=None,
+        max_features=None,
+        context_cap=0,
+        train_context_rows=0,
+        adapter_steps=500,
+        adapter_patience=None,
+        validation_interval=25,
+        outer_repeat=0,
+        outer_fold=0,
+        outer_sample=0,
+        allow_compatible_code_resume=False,
+        allow_equivalent_hardware_resume=False,
+        allow_retouche_efficiency_resume=False,
+        retry_cuda_oom_skips=False,
+        dry_run=False,
+        pipeline="standard",
+        cosine_min_lr_ratio=0.01,
+        oof_source_dir=None,
+        skip_standard_baseline=True,
+    )
+
+    with pytest.raises(ValueError, match="requires the regular full-training TabICLv2 baseline"):
+        _validate(args, adaptive_retouche=True, binary_auc_objectives=True)
+
+
 def test_source_hashes_cover_public_model_and_spline_implementation():
     hashes = _experiment_source_hashes()
     expected = {
@@ -306,6 +380,7 @@ def test_source_hashes_cover_public_model_and_spline_implementation():
         "scripts/direct_spline_openml_standard.py",
         "scripts/direct_spline_openml_validation_selected_refit.py",
         "scripts/direct_spline_openml_adaptive_retouche_d_tabarena.py",
+        "scripts/direct_spline_openml_binary_auc_confirmation.py",
         "src/tabicl/__init__.py",
         "src/tabicl/_experiments/direct_spline_openml.py",
         "src/tabicl/_experiments/direct_spline_openml_standard.py",

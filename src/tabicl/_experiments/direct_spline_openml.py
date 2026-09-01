@@ -1126,6 +1126,7 @@ def summarize_task_tuning(
     output_dir: Path,
     ensemble_rounds: int,
     standard_tabarena: dict[str, Any] | None = None,
+    report_predeclared_config_arms: bool = False,
 ) -> dict[str, Any]:
     """Use OOF validation only to create raw and guarded outer-test outputs.
 
@@ -1144,6 +1145,9 @@ def summarize_task_tuning(
     guarded_test_predictions = [_load_config_prediction(path, "guarded_test") for path in prediction_paths]
     raw_adapted_test_predictions = [
         _load_config_prediction(path, "adapted_test") for path in prediction_paths
+    ]
+    identity_test_predictions = [
+        _load_config_prediction(path, "identity_test") for path in prediction_paths
     ]
     guarded_selected_index = int(
         np.argmin([float(summary["validation"]["guarded"]["deployment_error"]) for summary in summaries])
@@ -1169,7 +1173,7 @@ def summarize_task_tuning(
         )
         ensemble_test = np.mean([guarded_test_predictions[index] for index in ensemble_indices], axis=0)
     default = summaries[0]
-    identity_test = _load_config_prediction(prediction_paths[0], "identity_test")
+    identity_test = identity_test_predictions[0]
     # Config choice is now frozen. Only from this point onward may the outer
     # test labels be used to score the saved predictions.
     raw_adapted_default = _candidate_metric_bundle(
@@ -1202,6 +1206,82 @@ def summarize_task_tuning(
         standard_tabarena_test = _metric_bundle(
             task.problem_type, task.y_test, standard_prediction, task.n_classes
         )
+    predeclared_config_arms: dict[str, dict[str, Any]] | None = None
+    predeclared_config_identity_consistency: dict[str, Any] | None = None
+    if report_predeclared_config_arms:
+        # A loss-function ablation must expose each frozen arm directly.  The
+        # ordinary ``tuned`` keys below remain useful Retouche diagnostics,
+        # but they select among configurations with validation and therefore
+        # must not substitute for CE-versus-AUC arm comparisons.
+        identity_validation_predictions = [
+            _load_config_prediction(path, "identity_validation") for path in prediction_paths
+        ]
+        identity_atol = 1e-7
+        identity_rtol = 1e-6
+        identity_reference_test = identity_test_predictions[0]
+        identity_reference_validation = identity_validation_predictions[0]
+        max_abs_test_differences: dict[str, float] = {}
+        max_abs_validation_differences: dict[str, float] = {}
+        for label, arm_identity_test, arm_identity_validation in zip(
+            config_labels,
+            identity_test_predictions,
+            identity_validation_predictions,
+            strict=True,
+        ):
+            max_abs_test_differences[label] = float(
+                np.max(np.abs(arm_identity_test - identity_reference_test))
+            )
+            max_abs_validation_differences[label] = float(
+                np.max(np.abs(arm_identity_validation - identity_reference_validation))
+            )
+            if not (
+                np.allclose(arm_identity_test, identity_reference_test, rtol=identity_rtol, atol=identity_atol)
+                and np.allclose(
+                    arm_identity_validation,
+                    identity_reference_validation,
+                    rtol=identity_rtol,
+                    atol=identity_atol,
+                )
+            ):
+                raise RuntimeError(
+                    "predeclared loss arms must share the exact matched TabICLv2 identity prediction; "
+                    f"identity differed for config {label!r}"
+                )
+        predeclared_config_identity_consistency = {
+            "reference_config_label": config_labels[0],
+            "atol": identity_atol,
+            "rtol": identity_rtol,
+            "max_abs_test_difference_by_config": max_abs_test_differences,
+            "max_abs_validation_difference_by_config": max_abs_validation_differences,
+        }
+        predeclared_config_arms = {}
+        for label, summary, arm_identity, raw_prediction, guarded_prediction in zip(
+            config_labels,
+            summaries,
+            identity_test_predictions,
+            raw_adapted_test_predictions,
+            guarded_test_predictions,
+            strict=True,
+        ):
+            predeclared_config_arms[label] = {
+                "training_objective": str(
+                    summary["config"].get("classification_objective", "cross_entropy")
+                ),
+                "validation": summary["validation"],
+                "matched_identity": _candidate_metric_bundle(
+                    task.problem_type, task.y_test, arm_identity, task.n_classes
+                ),
+                "raw_adapted": _candidate_metric_bundle(
+                    task.problem_type, task.y_test, raw_prediction, task.n_classes
+                ),
+                "guarded": _candidate_metric_bundle(
+                    task.problem_type, task.y_test, guarded_prediction, task.n_classes
+                ),
+                "guard_selected_adapted_fraction": summary["guard_selected_adapted_fraction"],
+                "adapter_valid_learned_checkpoint_fraction": summary.get(
+                    "adapter_valid_learned_checkpoint_fraction"
+                ),
+            }
     reported_arm_aliases = {
         # Backward-compatible artifact names.
         "default": "guarded_default",
@@ -1285,6 +1365,9 @@ def summarize_task_tuning(
             "not the matched identity control that isolates the spline change."
         ),
     }
+    if predeclared_config_arms is not None:
+        result["predeclared_config_arms"] = predeclared_config_arms
+        result["predeclared_config_identity_consistency"] = predeclared_config_identity_consistency
     _json_dump(output_dir / "task_summaries" / f"task_{task.task_id}_{_safe_name(task.dataset_name)}.json", result)
     return result
 
@@ -1539,6 +1622,92 @@ def summarize_experiment(
             reference_label="full_outer_training_standard_tabicl",
             candidate_label=method,
         )
+    predeclared_config_objective_results: dict[str, dict[str, Any]] = {}
+    predeclared_config_labels: list[str] = []
+    if all(isinstance(item.get("predeclared_config_arms"), dict) for item in task_summaries):
+        first_arms = task_summaries[0]["predeclared_config_arms"]
+        predeclared_config_labels = list(first_arms)
+        if not predeclared_config_labels or any(
+            list(item["predeclared_config_arms"]) != predeclared_config_labels
+            for item in task_summaries
+        ):
+            raise ValueError("all objective-comparison task summaries must expose the same ordered arms")
+        for offset, label in enumerate(predeclared_config_labels):
+            arm_records = [item["predeclared_config_arms"][label] for item in task_summaries]
+            objective_names = {str(record["training_objective"]) for record in arm_records}
+            if len(objective_names) != 1:
+                raise ValueError(f"objective arm {label!r} has inconsistent training-objective metadata")
+            arm_result: dict[str, Any] = {
+                "training_objective": next(iter(objective_names)),
+                "raw_adapted_vs_matched_inner_bag_identity": _paired_comparison_summary(
+                    reference=np.asarray(
+                        [float(record["matched_identity"]["benchmark_error"]) for record in arm_records],
+                        dtype=float,
+                    ),
+                    candidate=np.asarray(
+                        [float(record["raw_adapted"]["benchmark_error"]) for record in arm_records],
+                        dtype=float,
+                    ),
+                    problem_types=problem_types,
+                    bootstrap_rounds=bootstrap_rounds,
+                    bootstrap_seed=bootstrap_seed + 20_000 + 2 * offset,
+                    reference_label="matched_inner_bag_identity",
+                    candidate_label=f"{label}_raw_adapted",
+                ),
+                "guarded_vs_matched_inner_bag_identity": _paired_comparison_summary(
+                    reference=np.asarray(
+                        [float(record["matched_identity"]["benchmark_error"]) for record in arm_records],
+                        dtype=float,
+                    ),
+                    candidate=np.asarray(
+                        [float(record["guarded"]["benchmark_error"]) for record in arm_records],
+                        dtype=float,
+                    ),
+                    problem_types=problem_types,
+                    bootstrap_rounds=bootstrap_rounds,
+                    bootstrap_seed=bootstrap_seed + 20_000 + 2 * offset + 1,
+                    reference_label="matched_inner_bag_identity",
+                    candidate_label=f"{label}_guarded",
+                ),
+            }
+            standard_items = [
+                (item, record)
+                for item, record in zip(task_summaries, arm_records, strict=True)
+                if item["standard_tabarena"] is not None
+            ]
+            if standard_items:
+                standard_errors = np.asarray(
+                    [float(item["standard_tabarena"]["benchmark_error"]) for item, _record in standard_items],
+                    dtype=float,
+                )
+                standard_problem_types = np.asarray(
+                    [str(item["problem_type"]) for item, _record in standard_items], dtype=object
+                )
+                arm_result["raw_adapted_vs_full_outer_training_standard_tabicl"] = _paired_comparison_summary(
+                    reference=standard_errors,
+                    candidate=np.asarray(
+                        [float(record["raw_adapted"]["benchmark_error"]) for _item, record in standard_items],
+                        dtype=float,
+                    ),
+                    problem_types=standard_problem_types,
+                    bootstrap_rounds=bootstrap_rounds,
+                    bootstrap_seed=bootstrap_seed + 30_000 + 2 * offset,
+                    reference_label="full_outer_training_standard_tabicl",
+                    candidate_label=f"{label}_raw_adapted",
+                )
+                arm_result["guarded_vs_full_outer_training_standard_tabicl"] = _paired_comparison_summary(
+                    reference=standard_errors,
+                    candidate=np.asarray(
+                        [float(record["guarded"]["benchmark_error"]) for _item, record in standard_items],
+                        dtype=float,
+                    ),
+                    problem_types=standard_problem_types,
+                    bootstrap_rounds=bootstrap_rounds,
+                    bootstrap_seed=bootstrap_seed + 30_000 + 2 * offset + 1,
+                    reference_label="full_outer_training_standard_tabicl",
+                    candidate_label=f"{label}_guarded",
+                )
+            predeclared_config_objective_results[label] = arm_result
     summary = {
         "n_tasks": len(task_summaries),
         "n_skipped_tasks": len(skipped_tasks),
@@ -1581,5 +1750,12 @@ def summarize_experiment(
         },
         "task_results_csv": str(csv_path),
     }
+    if predeclared_config_objective_results:
+        summary["predeclared_config_objective_results"] = predeclared_config_objective_results
+        summary["predeclared_config_objective_comparison_note"] = (
+            "These are the individually frozen CE, pairwise-AUC, and hybrid loss arms. Each retains its own "
+            "validation-selected checkpoint and per-bag identity guard. They are reported separately rather "
+            "than through the derived validation-selected tuned/ensemble aliases."
+        )
     _json_dump(output_dir / "summary.json", summary)
     return summary

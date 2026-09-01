@@ -105,6 +105,90 @@ STANDARD_DIRECT_SPLINE_CONFIG: dict[str, Any] = {
 }
 
 
+_BINARY_CLASSIFICATION_OBJECTIVES = frozenset(
+    {
+        "cross_entropy",
+        "pairwise_auc",
+        "cross_entropy_plus_pairwise_auc",
+    }
+)
+
+
+def _classification_training_objective_from_logits(
+    *,
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    problem_type: ProblemType,
+    n_classes: int | None,
+    softmax_temperature: float,
+    config: dict[str, Any],
+) -> torch.Tensor:
+    """Return the frozen task objective for one classification episode.
+
+    Multiclass keeps the normal cross-entropy/log-loss objective.  Binary
+    DirectSpline may instead use a pairwise logistic AUC surrogate, which
+    trains the positive-class logit to rank above the negative-class logit.
+    ``sample_episode_indices`` supplies every classification class to every
+    query episode, so the pairwise loss is defined without peeking at a
+    validation or outer-test label.
+    """
+
+    temperature = float(softmax_temperature)
+    if not temperature > 0.0:
+        raise ValueError("softmax_temperature must be positive")
+    target = target.long().flatten()
+    scaled_logits = logits / temperature
+    cross_entropy = F.cross_entropy(scaled_logits, target)
+    objective_name = str(config.get("classification_objective", "cross_entropy"))
+    if problem_type == "multiclass":
+        if objective_name != "cross_entropy":
+            raise ValueError(
+                "pairwise-AUC DirectSpline objectives are binary-only; "
+                f"received {objective_name!r} for a multiclass task"
+            )
+        return cross_entropy
+    if problem_type != "binary":
+        raise ValueError(f"classification objective received non-classification problem type {problem_type!r}")
+    if objective_name not in _BINARY_CLASSIFICATION_OBJECTIVES:
+        raise ValueError(f"unknown binary DirectSpline classification objective: {objective_name!r}")
+    if n_classes != 2 or scaled_logits.ndim != 2 or scaled_logits.shape[1] != 2:
+        raise ValueError("binary pairwise-AUC training requires two-class logits")
+    if objective_name == "cross_entropy":
+        return cross_entropy
+
+    positive_scores = scaled_logits[target == 1, 1] - scaled_logits[target == 1, 0]
+    negative_scores = scaled_logits[target == 0, 1] - scaled_logits[target == 0, 0]
+    if positive_scores.numel() == 0 or negative_scores.numel() == 0:
+        raise ValueError(
+            "binary pairwise-AUC training requires at least one positive and one negative query row"
+        )
+    # This smooth pairwise ranking loss is minimised when every positive
+    # score exceeds every negative score.  At the fixed query batch cap of
+    # 256 it has at most 16,384 pairs, which is small compared with a TabICL
+    # forward/backward pass and avoids an additional sampling hyperparameter.
+    pairwise_auc = F.softplus(-(positive_scores[:, None] - negative_scores[None, :])).mean()
+    if objective_name == "pairwise_auc":
+        return pairwise_auc
+    cross_entropy_weight = float(config.get("cross_entropy_weight", 0.5))
+    pairwise_auc_weight = float(config.get("pairwise_auc_weight", 0.5))
+    if cross_entropy_weight < 0.0 or pairwise_auc_weight < 0.0:
+        raise ValueError("hybrid binary-objective weights must be non-negative")
+    total_weight = cross_entropy_weight + pairwise_auc_weight
+    if total_weight <= 0.0:
+        raise ValueError("hybrid binary-objective weights must have positive total weight")
+    return (cross_entropy_weight * cross_entropy + pairwise_auc_weight * pairwise_auc) / total_weight
+
+
+def _training_objective_name(*, problem_type: ProblemType, config: dict[str, Any]) -> str:
+    """Expose the actual task-loss contract in bag/refit artifacts."""
+
+    if problem_type == "regression":
+        return "mse"
+    if problem_type == "multiclass":
+        return "cross_entropy"
+    return str(config.get("classification_objective", "cross_entropy"))
+
+
 @dataclass
 class _StandardBag:
     """One normal TabICLv2 estimator fitted on an adapter bag's fit rows."""
@@ -1543,8 +1627,13 @@ def _fit_one_bag_standard(
             if task.problem_type == "regression":
                 objective = F.mse_loss(output.flatten(), target.float().flatten())
             else:
-                objective = F.cross_entropy(
-                    output / float(bundle.estimator.softmax_temperature), target.long().flatten()
+                objective = _classification_training_objective_from_logits(
+                    logits=output,
+                    target=target,
+                    problem_type=task.problem_type,
+                    n_classes=task.n_classes,
+                    softmax_temperature=float(bundle.estimator.softmax_temperature),
+                    config=config,
                 )
             if not torch.isfinite(objective):
                 _emit(
@@ -1691,6 +1780,9 @@ def _fit_one_bag_standard(
         "adapted_error": float(adapted_error),
         "relative_improvement": float(decision.relative_improvement),
         "guard_selected_adapted": bool(decision.use_adapted),
+        "adapter_training_objective": _training_objective_name(
+            problem_type=task.problem_type, config=config
+        ),
         "adapter_first_objective": first_objective,
         "adapter_final_objective": final_objective,
         "adapter_steps_executed": executed_steps,
@@ -2108,8 +2200,13 @@ def _fit_full_context_refit_standard(
             if task.problem_type == "regression":
                 objective = F.mse_loss(output.flatten(), target.float().flatten())
             else:
-                objective = F.cross_entropy(
-                    output / float(bundle.estimator.softmax_temperature), target.long().flatten()
+                objective = _classification_training_objective_from_logits(
+                    logits=output,
+                    target=target,
+                    problem_type=task.problem_type,
+                    n_classes=task.n_classes,
+                    softmax_temperature=float(bundle.estimator.softmax_temperature),
+                    config=config,
                 )
             if not torch.isfinite(objective):
                 _emit(
@@ -2167,6 +2264,9 @@ def _fit_full_context_refit_standard(
         "public_path_input_parity_passed": True if public_parity_test else None,
         "fresh_spline_view_identity_passed": bool(adapters is None or parity_test == 0.0),
         "adapter_seed": int(adapter_seed),
+        "adapter_training_objective": _training_objective_name(
+            problem_type=task.problem_type, config=config
+        ),
         "adapter_refit_steps_requested": int(refit_steps),
         "adapter_steps_executed": int(executed_steps),
         "adapter_first_objective": first_objective,
@@ -2342,8 +2442,13 @@ def _fit_full_context_refit_checkpoint_audit_standard(
             if task.problem_type == "regression":
                 objective_tensor = F.mse_loss(output.flatten(), target.float().flatten())
             else:
-                objective_tensor = F.cross_entropy(
-                    output / float(bundle.estimator.softmax_temperature), target.long().flatten()
+                objective_tensor = _classification_training_objective_from_logits(
+                    logits=output,
+                    target=target,
+                    problem_type=task.problem_type,
+                    n_classes=task.n_classes,
+                    softmax_temperature=float(bundle.estimator.softmax_temperature),
+                    config=config,
                 )
             if not torch.isfinite(objective_tensor):
                 _emit(
@@ -2387,6 +2492,9 @@ def _fit_full_context_refit_checkpoint_audit_standard(
         "public_path_input_parity_passed": True if public_parity_test else None,
         "fresh_spline_view_identity_passed": bool(adapters is None or parity_test == 0.0),
         "adapter_seed": int(adapter_seed),
+        "adapter_training_objective": _training_objective_name(
+            problem_type=task.problem_type, config=config
+        ),
         "adapter_checkpoint_steps_requested": list(checkpoint_steps),
         "adapter_checkpoint_steps_frozen": sorted(checkpoint_predictions),
         "adapter_steps_executed": int(executed_steps),
@@ -2590,8 +2698,13 @@ def _adapter_training_objective(
     if bundle.problem_type == "regression":
         task_loss = F.mse_loss(output.flatten(), target.float().flatten())
     else:
-        task_loss = F.cross_entropy(
-            output / float(bundle.estimator.softmax_temperature), target.long().flatten()
+        task_loss = _classification_training_objective_from_logits(
+            logits=output,
+            target=target,
+            problem_type=bundle.problem_type,
+            n_classes=bundle.n_classes,
+            softmax_temperature=float(bundle.estimator.softmax_temperature),
+            config=config,
         )
     regularization_weight = float(config.get("identity_regularization", 0.0))
     if regularization_weight == 0.0:
@@ -2894,6 +3007,9 @@ def _fit_validation_selected_checkpoint_standard(
             adapters is None or (parity_validation == 0.0 and parity_test == 0.0)
         ),
         "adapter_seed": int(adapter_seed),
+        "adapter_training_objective": _training_objective_name(
+            problem_type=task.problem_type, config=config
+        ),
         "adapter_steps_requested": max_steps,
         "scheduler": {
             "kind": "cosine",
@@ -3111,6 +3227,9 @@ def _fit_selected_full_context_refit_standard(
         "public_path_input_parity_passed": True if public_parity_test else None,
         "fresh_spline_view_identity_passed": bool(adapters is None or parity_test == 0.0),
         "adapter_seed": int(adapter_seed),
+        "adapter_training_objective": _training_objective_name(
+            problem_type=task.problem_type, config=config
+        ),
         "selected_steps_requested": int(selected_steps),
         "adapter_steps_executed": int(executed_steps),
         "selected_duration_completed": bool(executed_steps == selected_steps),

@@ -469,6 +469,97 @@ def test_single_default_task_summary_marks_tuning_and_ensemble_as_aliases(tmp_pa
     assert result["reported_arm_aliases"]["guarded_tuned_ensemble"] == "guarded_default"
 
 
+def test_predeclared_loss_arms_require_and_record_matched_identity_predictions(tmp_path):
+    labels = np.array([0, 1, 0, 1])
+    identity = np.array([[0.7, 0.3], [0.4, 0.6], [0.6, 0.4], [0.3, 0.7]])
+    task = OpenMLTaskData(
+        task_id=1,
+        dataset_id=2,
+        dataset_name="tiny",
+        problem_type="binary",
+        n_classes=2,
+        x_train=pd.DataFrame({"x": np.arange(4)}),
+        y_train=labels,
+        x_test=pd.DataFrame({"x": np.arange(4, 8)}),
+        y_test=labels,
+        outer_split_hash="split",
+    )
+    identity_metrics = {
+        "benchmark_error": benchmark_error("binary", labels, identity),
+        "deployment_error": deployment_error("binary", labels, identity),
+    }
+    for label, objective in (
+        ("D_CE", "cross_entropy"),
+        ("D_pairwise_auc", "pairwise_auc"),
+        ("D_CE_plus_pairwise_auc", "cross_entropy_plus_pairwise_auc"),
+    ):
+        config_dir = tmp_path / "raw" / "task_1_tiny" / f"config_{label}"
+        config_dir.mkdir(parents=True)
+        direct_spline_openml._json_dump(
+            config_dir / "config_summary.json",
+            {
+                "pipeline": "standard",
+                "identity_definition": "matched",
+                "config": {"classification_objective": objective},
+                "validation": {
+                    "identity": identity_metrics,
+                    "adapted": identity_metrics,
+                    "guarded": identity_metrics,
+                },
+                "test_metrics_deferred_to_task_summary": True,
+                "guard_selected_adapted_fraction": 0.0,
+                "requested_bags": 8,
+                "effective_bags": 8,
+            },
+        )
+        np.savez_compressed(
+            config_dir / "config_predictions.npz",
+            identity_validation=identity,
+            adapted_validation=identity,
+            guarded_validation=identity,
+            identity_test=identity,
+            adapted_test=identity,
+            guarded_test=identity,
+        )
+
+    result = summarize_task_tuning(
+        task=task,
+        config_labels=["D_CE", "D_pairwise_auc", "D_CE_plus_pairwise_auc"],
+        output_dir=tmp_path,
+        ensemble_rounds=3,
+        report_predeclared_config_arms=True,
+    )
+
+    matched_identity = result["predeclared_config_arms"]["D_pairwise_auc"]["matched_identity"]
+    assert matched_identity["benchmark_error"] == result["identity"]["benchmark_error"]
+    assert matched_identity["deployment_error"] == result["identity"]["deployment_error"]
+    assert matched_identity["prediction_valid"] is True
+    assert result["predeclared_config_identity_consistency"]["max_abs_test_difference_by_config"] == {
+        "D_CE": 0.0,
+        "D_pairwise_auc": 0.0,
+        "D_CE_plus_pairwise_auc": 0.0,
+    }
+
+    mismatch_dir = tmp_path / "raw" / "task_1_tiny" / "config_D_pairwise_auc"
+    np.savez_compressed(
+        mismatch_dir / "config_predictions.npz",
+        identity_validation=identity,
+        adapted_validation=identity,
+        guarded_validation=identity,
+        identity_test=np.flip(identity, axis=1),
+        adapted_test=identity,
+        guarded_test=identity,
+    )
+    with pytest.raises(RuntimeError, match="identity differed"):
+        summarize_task_tuning(
+            task=task,
+            config_labels=["D_CE", "D_pairwise_auc", "D_CE_plus_pairwise_auc"],
+            output_dir=tmp_path,
+            ensemble_rounds=3,
+            report_predeclared_config_arms=True,
+        )
+
+
 def test_summary_separates_raw_guarded_and_end_to_end_standard_comparisons(tmp_path):
     task_summary = {
         "report_schema_version": 2,
@@ -511,6 +602,26 @@ def test_summary_separates_raw_guarded_and_end_to_end_standard_comparisons(tmp_p
         "direct_spline_effective_bags": 8,
         "tuned_ensemble_selected_config_labels": ["D"],
         "standard_tabarena": {"benchmark_error": 0.20, "deployment_error": 0.20},
+        "predeclared_config_arms": {
+            "D_CE": {
+                "training_objective": "cross_entropy",
+                "matched_identity": {"benchmark_error": 0.30, "deployment_error": 0.30},
+                "raw_adapted": {"benchmark_error": 0.32, "deployment_error": 0.32},
+                "guarded": {"benchmark_error": 0.25, "deployment_error": 0.25},
+            },
+            "D_pairwise_auc": {
+                "training_objective": "pairwise_auc",
+                "matched_identity": {"benchmark_error": 0.20, "deployment_error": 0.20},
+                "raw_adapted": {"benchmark_error": 0.25, "deployment_error": 0.25},
+                "guarded": {"benchmark_error": 0.24, "deployment_error": 0.24},
+            },
+            "D_CE_plus_pairwise_auc": {
+                "training_objective": "cross_entropy_plus_pairwise_auc",
+                "matched_identity": {"benchmark_error": 0.23, "deployment_error": 0.23},
+                "raw_adapted": {"benchmark_error": 0.22, "deployment_error": 0.22},
+                "guarded": {"benchmark_error": 0.22, "deployment_error": 0.22},
+            },
+        },
     }
     summary = summarize_experiment(
         task_summaries=[task_summary],
@@ -542,6 +653,11 @@ def test_summary_separates_raw_guarded_and_end_to_end_standard_comparisons(tmp_p
         (0.25 - 0.30) / 0.30
     )
     assert summary["paired_results"]["guarded_default"]["by_problem_type"]["binary"]["n_tasks"] == 1
+    pairwise_raw = summary["predeclared_config_objective_results"]["D_pairwise_auc"][
+        "raw_adapted_vs_matched_inner_bag_identity"
+    ]
+    assert pairwise_raw["candidate_wins"] == 0
+    assert pairwise_raw["identity_wins"] == 1
     end_to_end = summary["end_to_end_vs_standard_tabarena"]
     assert end_to_end["results"]["guarded_default"]["identity_wins"] == 1
     assert "not an isolated spline effect" in end_to_end["note"]

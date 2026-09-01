@@ -110,7 +110,7 @@ from tabicl._experiments.direct_spline_openml_standard import (
 # Increment this whenever a code change can alter predictions, validation
 # selection, or persisted artifact semantics.  Unlike the source hashes, this
 # value is deliberately *not* ignored by --allow-compatible-code-resume.
-EXPERIMENT_SEMANTICS_VERSION = 9
+EXPERIMENT_SEMANTICS_VERSION = 10
 _RESUME_LAUNCHER_SOURCE = "scripts/direct_spline_openml_lite.py"
 _RETOUCHE_EFFICIENCY_RESUME_SOURCE_PATHS = frozenset(
     {
@@ -457,6 +457,7 @@ def _experiment_source_hashes() -> dict[str, str]:
         root / "scripts" / "direct_spline_openml_adaptive_phase1.py",
         root / "scripts" / "direct_spline_openml_adaptive_retouche.py",
         root / "scripts" / "direct_spline_openml_adaptive_retouche_d_tabarena.py",
+        root / "scripts" / "direct_spline_openml_binary_auc_confirmation.py",
         root / "src" / "tabicl" / "__init__.py",
     }
     experiment_dir = root / "src" / "tabicl" / "_experiments"
@@ -1243,6 +1244,37 @@ def _adaptive_retouche_configs(
     return ["D", "adaptive_columns", "conditional_adaptive_columns"], [base, adaptive, conditional]
 
 
+def _binary_auc_objective_configs(args: argparse.Namespace) -> tuple[list[str], list[dict[str, Any]]]:
+    """Freeze the CE-versus-AUC binary DirectSpline objective comparison.
+
+    The spline architecture, train/validation bags, schedule, identity guard,
+    and optimizer are deliberately identical.  Only the task loss is changed:
+    CE is the historical control, pairwise AUC directly targets binary ranking,
+    and the hybrid gives both equally weighted losses without opening a tuning
+    sweep.  Individual arms are reported separately by the launcher.
+    """
+
+    _labels, configs = _adaptive_retouche_configs(args, d_only=True)
+    base = dict(configs[0])
+    cross_entropy = dict(base)
+    cross_entropy["classification_objective"] = "cross_entropy"
+    pairwise_auc = dict(base)
+    pairwise_auc["classification_objective"] = "pairwise_auc"
+    hybrid = dict(base)
+    hybrid.update(
+        {
+            "classification_objective": "cross_entropy_plus_pairwise_auc",
+            "cross_entropy_weight": 0.5,
+            "pairwise_auc_weight": 0.5,
+        }
+    )
+    return ["D_CE", "D_pairwise_auc", "D_CE_plus_pairwise_auc"], [
+        cross_entropy,
+        pairwise_auc,
+        hybrid,
+    ]
+
+
 def _validate(
     args: argparse.Namespace,
     *,
@@ -1251,6 +1283,7 @@ def _validate(
     validation_selected_refit: bool = False,
     adaptive_phase1: bool = False,
     adaptive_retouche: bool = False,
+    binary_auc_objectives: bool = False,
 ) -> None:
     if args.bags < 2:
         raise ValueError("--bags must be at least two")
@@ -1297,6 +1330,13 @@ def _validate(
     if adaptive_retouche and (checkpoint_audit or validation_selected_refit or adaptive_phase1 or full_context_refit):
         raise ValueError(
             "the Retouche-style adaptive experiment is incompatible with refit, checkpoint-audit, and Phase-1 modes"
+        )
+    if binary_auc_objectives and not adaptive_retouche:
+        raise ValueError("the binary AUC-objective comparison requires the Retouche-style preserved-fold protocol")
+    if binary_auc_objectives and args.skip_standard_baseline:
+        raise ValueError(
+            "the binary AUC-objective confirmation requires the regular full-training TabICLv2 baseline; "
+            "do not pass --skip-standard-baseline"
         )
     if adaptive_retouche:
         if args.pipeline != "standard":
@@ -1544,6 +1584,41 @@ def _task_file_provenance(path: Path) -> dict[str, Any]:
         "bytes": int(path.stat().st_size),
         "sha256": _sha256_file(path),
     }
+
+
+def _validate_binary_auc_confirmation_task_bank(path: Path) -> None:
+    """Require the reviewed binary bank rather than any arbitrary ID list.
+
+    The regular launcher intentionally accepts simple explicit task lists. The
+    objective confirmation is different: its credibility depends on the
+    precommitted task eligibility and TabArena-disjoint audit, so accepting a
+    hand-written list here would silently weaken the protocol.
+    """
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"cannot read binary AUC confirmation task bank {path}: {error}") from error
+    if not isinstance(payload, dict):
+        raise ValueError("binary AUC confirmation task bank must be a JSON object")
+    if payload.get("experiment") != "DirectSpline unseen OpenML binary objective confirmation task bank":
+        raise ValueError("--task-id-file is not a DirectSpline binary objective confirmation task bank")
+    if payload.get("format_version") != 1 or payload.get("is_complete") is not True:
+        raise ValueError("binary AUC confirmation task bank must have format_version 1 and is_complete=true")
+    task_ids = _task_ids_from_file(path)
+    selected = payload.get("selected_tasks")
+    if not isinstance(selected, list) or [item.get("task_id") for item in selected if isinstance(item, dict)] != task_ids:
+        raise ValueError("binary AUC confirmation task bank selected_tasks do not match selected_task_ids")
+    if any(
+        not isinstance(item, dict)
+        or item.get("problem_type") != "binary"
+        or item.get("n_classes") != 2
+        for item in selected
+    ):
+        raise ValueError("binary AUC confirmation task bank contains a non-binary selected task")
+    exclusion = payload.get("tabarena_exclusion")
+    if not isinstance(exclusion, dict) or not exclusion.get("task_ids") or not exclusion.get("dataset_ids"):
+        raise ValueError("binary AUC confirmation task bank is missing the TabArena task-and-dataset exclusion audit")
 
 
 def _load_oof_source_manifest(source_dir: Path) -> tuple[Path, dict[str, Any]]:
@@ -1798,6 +1873,7 @@ def main(
     adaptive_phase1: bool = False,
     adaptive_retouche: bool = False,
     adaptive_retouche_d_only: bool = False,
+    binary_auc_objectives: bool = False,
     description: str | None = None,
 ) -> None:
     if adaptive_phase1 and not validation_selected_refit:
@@ -1806,6 +1882,10 @@ def main(
         raise ValueError("adaptive_retouche and adaptive_phase1 are mutually exclusive")
     if adaptive_retouche_d_only and not adaptive_retouche:
         raise ValueError("adaptive_retouche_d_only requires adaptive_retouche=True")
+    if binary_auc_objectives and not adaptive_retouche:
+        raise ValueError("binary_auc_objectives requires adaptive_retouche=True")
+    if binary_auc_objectives and adaptive_retouche_d_only:
+        raise ValueError("binary_auc_objectives cannot disable its two AUC-comparison arms")
     args = parse_args(
         default_pipeline=default_pipeline,
         required_pipeline=required_pipeline,
@@ -1822,9 +1902,19 @@ def main(
         validation_selected_refit=validation_selected_refit,
         adaptive_phase1=adaptive_phase1,
         adaptive_retouche=adaptive_retouche,
+        binary_auc_objectives=binary_auc_objectives,
     )
+    if binary_auc_objectives and args.task_id_file is None:
+        raise ValueError(
+            "the binary AUC-objective confirmation requires a frozen --task-id-file; "
+            "build and review the unseen binary task bank first"
+        )
+    if binary_auc_objectives:
+        _validate_binary_auc_confirmation_task_bank(args.task_id_file)
     labels, configs = (
-        _adaptive_retouche_configs(args, d_only=adaptive_retouche_d_only)
+        _binary_auc_objective_configs(args)
+        if binary_auc_objectives
+        else _adaptive_retouche_configs(args, d_only=adaptive_retouche_d_only)
         if adaptive_retouche
         else _adaptive_phase1_validation_selected_refit_configs(args)
         if adaptive_phase1
@@ -1952,6 +2042,7 @@ def main(
         "validation_selected_refit": bool(validation_selected_refit),
         "adaptive_phase1": bool(adaptive_phase1),
         "adaptive_retouche": bool(adaptive_retouche),
+        "binary_auc_objectives": bool(binary_auc_objectives),
         "checkpoint_steps": list(args.checkpoint_steps) if checkpoint_audit else None,
         "validation_selected_refit_settings": (
             None
@@ -1982,6 +2073,19 @@ def main(
                 "early_stopping": {"stale_validation_checks": 12},
                 "identity_regularization": 0.0,
                 "guard_relative_improvement": 0.005,
+                "binary_objective_arms": (
+                    None
+                    if not binary_auc_objectives
+                    else [
+                        {
+                            "label": label,
+                            "classification_objective": config["classification_objective"],
+                            "cross_entropy_weight": config.get("cross_entropy_weight"),
+                            "pairwise_auc_weight": config.get("pairwise_auc_weight"),
+                        }
+                        for label, config in zip(labels, configs, strict=True)
+                    ]
+                ),
             }
         ),
         "oof_source": oof_source_provenance,
@@ -2134,7 +2238,9 @@ def main(
             if not adaptive_retouche
             else {
                 "purpose": (
-                    "final TabArena evaluation of the fixed cubic-20 DirectSpline adapter against TabICLv2"
+                    "unseen OpenML binary confirmation of CE versus pairwise-AUC DirectSpline training objectives"
+                    if binary_auc_objectives
+                    else "final TabArena evaluation of the fixed cubic-20 DirectSpline adapter against TabICLv2"
                     if adaptive_retouche_d_only
                     else "final matched TabICLv2 comparison of fixed, adaptive-column, and conditional DirectSpline adapters"
                 ),
@@ -2149,12 +2255,12 @@ def main(
                 "scheduler": "single-cycle cosine from base LR to 1% of base LR",
                 "early_stopping": {"stale_validation_checks": 12},
                 "identity_regularization": 0.0,
-                "adaptive_expert_specs": None if adaptive_retouche_d_only else [
+                "adaptive_expert_specs": None if (adaptive_retouche_d_only or binary_auc_objectives) else [
                     {"degree": 1, "n_control_points": 4},
                     {"degree": 2, "n_control_points": 8},
                     {"degree": 3, "n_control_points": 20},
                 ],
-                "conditional_interaction": None if adaptive_retouche_d_only else {
+                "conditional_interaction": None if (adaptive_retouche_d_only or binary_auc_objectives) else {
                     "rank": 4,
                     "residual_amplitude_bound": 0.25,
                     "enabled_only_for": "conditional_adaptive_columns",
@@ -2172,6 +2278,25 @@ def main(
                         else "greedy ensemble of guarded arms chosen by OOF validation only"
                     ),
                 },
+            }
+        ),
+        "binary_auc_objective_contract": (
+            None
+            if not binary_auc_objectives
+            else {
+                "purpose": "test whether training DirectSpline against the binary benchmark metric improves its paired outer-test result",
+                "task_bank": "a reviewed frozen --task-id-file that is disjoint from TabArena task and dataset IDs",
+                "architecture": "fixed DirectSpline cubic degree 3, 20 control points, with no cross-column experts",
+                "predeclared_training_objectives": {
+                    "D_CE": "cross entropy historical control",
+                    "D_pairwise_auc": "all-positive versus all-negative logistic ranking surrogate",
+                    "D_CE_plus_pairwise_auc": "equal-weight normalized combination of cross entropy and pairwise ranking",
+                },
+                "loss_scope": "query rows sampled only from each bag's fit partition; validation and outer-test labels never enter optimization",
+                "selection_metric": "validation 1 - ROC-AUC, independently per arm and bag",
+                "identity_guard": "after validation checkpoint selection, retain the spline only if it improves the matching bag identity by at least 0.5%",
+                "outer_test_policy": "mean the eight guarded bag predictions; all outer-test selection is forbidden",
+                "primary_reporting": "each arm is reported separately against its matched TabICLv2 bag ensemble and full outer-training TabICLv2 reference, including paired Bradley-Terry Elo",
             }
         ),
     }
@@ -2339,7 +2464,9 @@ def main(
     else:
         manifest = {
             "experiment": (
-                "DirectSpline OpenML standard-ensemble validation-selected checkpoint and full-context refit experiment"
+                "DirectSpline OpenML frozen binary AUC-objective confirmation experiment"
+                if binary_auc_objectives
+                else "DirectSpline OpenML standard-ensemble validation-selected checkpoint and full-context refit experiment"
                 if validation_selected_refit
                 else "DirectSpline OpenML standard-ensemble development-only full-context checkpoint audit"
                 if checkpoint_audit
@@ -2653,6 +2780,7 @@ def main(
                         output_dir=args.output_dir,
                         ensemble_rounds=immutable_run["ensemble_rounds"],
                         standard_tabarena=standard_tabarena,
+                        report_predeclared_config_arms=binary_auc_objectives,
                     )
             except json.JSONDecodeError:
                 if checkpoint_audit or validation_selected_refit:
@@ -2723,6 +2851,7 @@ def main(
                         output_dir=args.output_dir,
                         ensemble_rounds=immutable_run["ensemble_rounds"],
                         standard_tabarena=standard_tabarena,
+                        report_predeclared_config_arms=binary_auc_objectives,
                     )
         except ValidationSplitInfeasibleError as error:
             skipped = {
