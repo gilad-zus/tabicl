@@ -221,6 +221,42 @@ def _expected_config_from_manifest(
     return dict(config)
 
 
+def _source_config_matches_manifest(
+    *, source_config: Mapping[str, Any], expected_config: Mapping[str, Any], manifest: Mapping[str, Any]
+) -> tuple[bool, list[str]]:
+    """Allow only the documented Retouche patience-only resume migration.
+
+    The source run can retain completed full-horizon bags while unfinished bags
+    use a later patience-12 efficiency migration.  That changes
+    ``adapter_patience`` in individual config summaries without changing any
+    preprocessing or spline architecture.  The support audit uses the
+    per-config summary as the authoritative bag provenance, but refuses every
+    other manifest/config semantic difference.
+    """
+
+    keys = set(source_config) | set(expected_config)
+    differences = [
+        key
+        for key in sorted(keys)
+        if _canonical_json(source_config.get(key)) != _canonical_json(expected_config.get(key))
+    ]
+    if not differences:
+        return True, []
+    if differences != ["adapter_patience"]:
+        return False, differences
+    migrations = manifest.get("resume_protocol_migrations")
+    documented = isinstance(migrations, list) and any(
+        isinstance(item, Mapping)
+        and (
+            "retouche" in str(item.get("reason", "")).lower()
+            or "patience" in str(item.get("unfinished_artifact_policy", "")).lower()
+        )
+        for item in migrations
+    )
+    source_patience = source_config.get("adapter_patience")
+    return bool(documented and (source_patience is None or int(source_patience) > 0)), differences
+
+
 def _find_source_cases(
     *,
     source_dir: Path,
@@ -249,8 +285,14 @@ def _find_source_cases(
         config = summary.get("config")
         if not isinstance(config, dict):
             raise ValueError(f"source summary has no config object: {summary_path}")
-        if _canonical_json(config) != _canonical_json(expected_config):
-            raise ValueError(f"source config differs from frozen manifest for {summary_path}")
+        config_matches, differences = _source_config_matches_manifest(
+            source_config=config, expected_config=expected_config, manifest=manifest
+        )
+        if not config_matches:
+            raise ValueError(
+                f"source config differs from frozen manifest beyond an allowed documented resume migration "
+                f"for {summary_path}: {differences}"
+            )
         if summary.get("run_fingerprint_hash") != expected_fingerprint:
             raise ValueError(f"source config fingerprint differs from manifest: {summary_path}")
         predictions_path = summary_path.parent / "config_predictions.npz"

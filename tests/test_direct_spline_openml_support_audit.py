@@ -106,3 +106,22 @@ def test_task_level_association_has_bootstrap_quartiles_and_leave_one_out():
     assert summary["task_bootstrap"]["spearman_95"] is not None
     assert len(summary["rank_balanced_quartiles"]) == 4
     assert len(summary["leave_one_task_out"]) == 5
+
+
+def test_source_config_allows_only_documented_patience_resume_migration():
+    expected = {"adapter_steps": 500, "adapter_patience": None, "n_control_points": 20}
+    resumed = {"adapter_steps": 500, "adapter_patience": 12, "n_control_points": 20}
+    manifest = {"resume_protocol_migrations": [{"reason": "Retouche efficiency resume"}]}
+
+    allowed, differences = audit._source_config_matches_manifest(
+        source_config=resumed, expected_config=expected, manifest=manifest
+    )
+    assert allowed
+    assert differences == ["adapter_patience"]
+
+    changed_spline = {**resumed, "n_control_points": 12}
+    allowed, differences = audit._source_config_matches_manifest(
+        source_config=changed_spline, expected_config=expected, manifest=manifest
+    )
+    assert not allowed
+    assert differences == ["adapter_patience", "n_control_points"]
