@@ -608,7 +608,9 @@ def _audit_case(
         raise ValueError(
             f"row-local audit excludes {case.problem_type!r} task {case.task_id}: its deployed metric is not row-decomposable"
         )
-    task = load_tabarena_openml_task(case.task_id, cache_dir=args.openml_cache_dir)
+    # The project loader reads the optional cache location from OPENML_CACHE_DIR
+    # (set once in main), rather than taking a per-call cache argument.
+    task = load_tabarena_openml_task(case.task_id)
     _validate_task_against_source(case=case, task=task)
     config_summary = _load_json(case.config_summary_path, label="source config summary")
     predictions = _load_predictions(case.config_predictions_path)
