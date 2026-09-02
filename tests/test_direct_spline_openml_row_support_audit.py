@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -79,3 +80,25 @@ def test_cell_flip_summary_requires_adequate_rows_and_detects_validation_help_te
     summary = audit._cell_flip_summary(cell_records=records, minimum_query_rows=5)
     assert summary[0]["eligible_validation_test_cells"] == 1
     assert summary[0]["validation_help_test_harm_cells"] == 1
+
+
+def test_source_task_replay_uses_the_frozen_outer_split(monkeypatch):
+    observed = {}
+
+    def fake_loader(task_id, *, outer_repeat, outer_fold, outer_sample):
+        observed.update(
+            task_id=task_id,
+            outer_repeat=outer_repeat,
+            outer_fold=outer_fold,
+            outer_sample=outer_sample,
+        )
+        return "task"
+
+    monkeypatch.setattr(audit, "load_tabarena_openml_task", fake_loader)
+    result = audit._load_source_task(
+        case=SimpleNamespace(task_id=123),
+        immutable_run={"data_source": {"outer_split": {"repeat": 2, "fold": 3, "sample": 4}}},
+    )
+
+    assert result == "task"
+    assert observed == {"task_id": 123, "outer_repeat": 2, "outer_fold": 3, "outer_sample": 4}

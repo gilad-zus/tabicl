@@ -597,6 +597,23 @@ def _validate_task_against_source(*, case: SourceCase, task: Any) -> None:
             raise ValueError(f"OpenML {field} changed for task {case.task_id}: source={source_value!r}, current={actual_value!r}")
 
 
+def _load_source_task(*, case: SourceCase, immutable_run: Mapping[str, Any]) -> Any:
+    """Replay the source's exact OpenML outer split using its configured cache."""
+
+    # The project loader reads the optional cache location from OPENML_CACHE_DIR
+    # (set once in main).  Its repeat/fold/sample values are immutable source
+    # provenance and must be replayed exactly.
+    outer_split = immutable_run.get("data_source", {}).get("outer_split")
+    if not isinstance(outer_split, Mapping):
+        raise ValueError("source manifest has no immutable OpenML outer split")
+    return load_tabarena_openml_task(
+        case.task_id,
+        outer_repeat=_as_int(outer_split.get("repeat"), name="outer repeat"),
+        outer_fold=_as_int(outer_split.get("fold"), name="outer fold"),
+        outer_sample=_as_int(outer_split.get("sample"), name="outer sample"),
+    )
+
+
 def _audit_case(
     *,
     case: SourceCase,
@@ -608,9 +625,7 @@ def _audit_case(
         raise ValueError(
             f"row-local audit excludes {case.problem_type!r} task {case.task_id}: its deployed metric is not row-decomposable"
         )
-    # The project loader reads the optional cache location from OPENML_CACHE_DIR
-    # (set once in main), rather than taking a per-call cache argument.
-    task = load_tabarena_openml_task(case.task_id)
+    task = _load_source_task(case=case, immutable_run=immutable_run)
     _validate_task_against_source(case=case, task=task)
     config_summary = _load_json(case.config_summary_path, label="source config summary")
     predictions = _load_predictions(case.config_predictions_path)
