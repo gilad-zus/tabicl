@@ -27,7 +27,7 @@ import hashlib
 import json
 from pathlib import Path
 import time
-from typing import Any
+from typing import Any, Callable, Mapping
 
 import numpy as np
 import torch
@@ -1491,6 +1491,7 @@ def _fit_one_bag_standard(
     progress: Any,
     requested_bags: int,
     effective_bags: int,
+    diagnostic_callback: Callable[..., Mapping[str, Any] | None] | None = None,
 ) -> BagPredictions:
     """Fit one full-strength guarded DirectSpline adapter without test labels."""
 
@@ -1551,6 +1552,13 @@ def _fit_one_bag_standard(
         normal_estimators=int(STANDARD_TABICL_CONFIG["n_estimators"]),
     )
     training_context_sizes: list[int] = []
+    # A diagnostic callback is intentionally invoked only after checkpoint
+    # selection and the per-bag identity guard are frozen.  Existing benchmark
+    # callers leave it ``None``; specialised, post-selection audits can use it
+    # to persist the learned adapter or inspect unlabeled query geometry without
+    # changing optimisation, checkpoint choice, or deployment predictions.
+    identity_adapter_state: dict[str, torch.Tensor] | None = None
+    selected_adapted_adapter_state: dict[str, torch.Tensor] | None = None
     if adapters is None:
         # A numerical spline cannot alter a categorical-only (or wholly
         # constant-after-filtering) table.  Keep it as an explicit neutral tie.
@@ -1592,6 +1600,7 @@ def _fit_one_bag_standard(
             )
         episode_rng = np.random.default_rng(_seed(int(config["random_state"]), task.task_id, bag, 203))
         identity_state = _cpu_state_dict(adapters)
+        identity_adapter_state = identity_state
         best_state = identity_state
         best_error = float("inf")
         best_step = 0
@@ -1702,6 +1711,7 @@ def _fit_one_bag_standard(
                 if config.get("adapter_patience") is not None and stale >= int(config["adapter_patience"]):
                     break
         adapters.load_state_dict(best_state, strict=True)
+        selected_adapted_adapter_state = best_state
         del scheduler, optimizer
         gc.collect()
         if device.type == "cuda":
@@ -1745,6 +1755,23 @@ def _fit_one_bag_standard(
     )
     guarded_validation = adapted_validation if decision.use_adapted else identity_validation
     guarded_test = adapted_test if decision.use_adapted else identity_test
+    diagnostic_capture: Mapping[str, Any] | None = None
+    if diagnostic_callback is not None:
+        diagnostic_capture = diagnostic_callback(
+            task=task,
+            bundle=bundle,
+            adapters=adapters,
+            identity_adapter_state=identity_adapter_state,
+            selected_adapted_adapter_state=selected_adapted_adapter_state,
+            validation_x=validation_x,
+            deployment_x=test_x,
+            identity_validation=identity_validation,
+            adapted_validation=adapted_validation,
+            identity_deployment=identity_test,
+            adapted_deployment=adapted_test,
+            guard_selected_adapted=bool(decision.use_adapted),
+            device=device,
+        )
     peak_gib = 0.0 if device.type != "cuda" else torch.cuda.max_memory_allocated(device) / 2**30
     metadata = {
         "bag": int(bag),
@@ -1825,6 +1852,11 @@ def _fit_one_bag_standard(
         "peak_allocated_gib": float(peak_gib),
         "run_fingerprint_hash": run_fingerprint_hash,
     }
+    if diagnostic_capture is not None:
+        # Keep this strict: normal bag artefacts are JSON encoded, so a
+        # callback may report only JSON-compatible provenance and paths, never
+        # tensors or prediction arrays themselves.
+        metadata["diagnostic_capture"] = dict(diagnostic_capture)
     _emit(progress, event="bag_completed", task_id=task.task_id, **metadata)
     del adapters, bundle
     if device.type == "cuda":

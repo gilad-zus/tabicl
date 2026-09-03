@@ -453,6 +453,18 @@ def test_standard_runner_checks_public_identity_and_preserves_prediction_shapes(
         "cross_column_mixing_rank": 0,
     }
     backbone = _HalfPrecisionEvalBackbone()
+    captures = []
+
+    def capture(**values):
+        captures.append(values)
+        assert values["adapters"] is not None
+        assert values["selected_adapted_adapter_state"] is not None
+        assert values["identity_adapter_state"] is not None
+        # The capture is post-guard: diagnostic artefacts cannot influence
+        # checkpoint selection or whether the bag deploys identity.
+        assert isinstance(values["guard_selected_adapted"], bool)
+        return {"capture": "post_selection"}
+
     result = _fit_one_bag_standard(
         task=task,
         fit_indices=np.arange(16),
@@ -466,6 +478,7 @@ def test_standard_runner_checks_public_identity_and_preserves_prediction_shapes(
         progress=None,
         requested_bags=8,
         effective_bags=8,
+        diagnostic_callback=capture,
     )
     assert result.identity_validation.shape == (8, 2)
     assert result.adapted_validation.shape == (8, 2)
@@ -479,6 +492,8 @@ def test_standard_runner_checks_public_identity_and_preserves_prediction_shapes(
     assert result.metadata["fresh_spline_view_identity_passed"]
     assert result.metadata["adapter_has_valid_learned_checkpoint"]
     assert result.metadata["adapter_best_step"] > 0
+    assert result.metadata["diagnostic_capture"] == {"capture": "post_selection"}
+    assert len(captures) == 1
     # Evaluation/parity runs use the public inference mode; adapter updates
     # switch only the frozen backbone execution path back to autograd mode.
     assert any(backbone.forward_training_flags)
