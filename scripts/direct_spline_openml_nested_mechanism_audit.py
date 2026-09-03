@@ -295,7 +295,7 @@ def _per_row_loss(
     labels = np.asarray(labels)
     prediction = np.asarray(prediction, dtype=float)
     if problem_type == "regression":
-        return (prediction.reshape(-1) - labels.astype(float).reshape(-1)).square()
+        return np.square(prediction.reshape(-1) - labels.astype(float).reshape(-1))
     if problem_type != "multiclass" or n_classes is None:
         raise ValueError("row-local loss is available only for multiclass and regression")
     classes = np.arange(n_classes)

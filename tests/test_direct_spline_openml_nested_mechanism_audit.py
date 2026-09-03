@@ -64,6 +64,16 @@ def test_geometry_distortion_is_zero_for_identity_and_translation():
     assert np.any(mismatched > 0.0)
 
 
+def test_per_row_regression_loss_is_squared_error():
+    loss = audit._per_row_loss(
+        problem_type="regression",
+        labels=np.asarray([1.0, 4.0]),
+        prediction=np.asarray([3.0, 1.0]),
+        n_classes=None,
+    )
+    assert np.array_equal(loss, np.asarray([4.0, 9.0]))
+
+
 def test_nested_rotations_are_disjoint_and_audit_every_row_once(monkeypatch):
     from types import SimpleNamespace
 
