@@ -87,3 +87,38 @@ def test_nested_rotations_are_disjoint_and_audit_every_row_once(monkeypatch):
         assert not np.intersect1d(rotation.fit_indices, rotation.selection_indices).size
         assert not np.intersect1d(rotation.fit_indices, rotation.audit_indices).size
         assert not np.intersect1d(rotation.selection_indices, rotation.audit_indices).size
+
+
+def test_instability_aligns_function_curves_by_raw_column_not_filtered_ordinal(tmp_path):
+    """A fold-specific constant column must not misalign later spline curves."""
+
+    paths = []
+    for rotation, raw_positions, correction in (
+        (0, [3, 7], np.zeros((2, 3, 2), dtype=float)),
+        # Raw column 7 was removed by this rotation's ordinary unique filter;
+        # its second retained column is raw 11, not a replacement for 7.
+        (1, [3, 11], np.asarray([[[2.0, 100.0]] * 3, [[2.0, 100.0]] * 3], dtype=float)),
+    ):
+        geometry = tmp_path / f"geometry_{rotation}.npz"
+        probe = tmp_path / f"probe_{rotation}.npz"
+        np.savez_compressed(
+            geometry,
+            methods=np.asarray(["none", "power"]),
+            raw_numerical_feature_positions=np.asarray(raw_positions, dtype=np.int64),
+            function_grid_correction=correction,
+        )
+        np.savez_compressed(probe, spline_minus_identity=np.zeros((4, 3), dtype=float))
+        paths.append({"geometry": geometry, "probe": probe})
+
+    summary = audit._instability_summary(paths)
+
+    assert summary["available"] is True
+    functional = summary["functional_correction_variance"]
+    assert functional["available"] is True
+    # Only raw feature 3 exists in both rotations.  Its values are 0 and 2,
+    # hence population variance 1; the 100-valued unrelated raw column 11
+    # must not be compared to the missing raw column 7.
+    assert functional["n_method_feature_pairs_with_at_least_two_rotations"] == 2
+    assert functional["n_method_feature_pairs_present_in_all_rotations"] == 2
+    assert functional["n_method_feature_pairs_present_in_one_rotation_only"] == 4
+    assert functional["mean"] == 1.0

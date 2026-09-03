@@ -367,6 +367,7 @@ def _make_capture_callback(
             np.savez_compressed(
                 geometry_path,
                 methods=np.asarray([], dtype="U1"),
+                raw_numerical_feature_positions=np.asarray([], dtype=np.int64),
                 mean_basis_leverage=np.empty((0, len(deployment_x))),
                 max_basis_leverage=np.empty((0, len(deployment_x))),
                 mean_unmixed_deformation=np.empty((0, len(deployment_x))),
@@ -383,6 +384,13 @@ def _make_capture_callback(
         else:
             prepared = _prepare_query(bundle, deployment_x)
             numerical_indices = np.asarray(bundle.numerical_indices, dtype=int)
+            keep_mask = np.asarray(
+                bundle.estimator.ensemble_generator_.unique_filter_.features_to_keep_, dtype=bool
+            )
+            kept_original_positions = np.flatnonzero(keep_mask)
+            raw_numerical_feature_positions = kept_original_positions[numerical_indices]
+            if raw_numerical_feature_positions.shape != numerical_indices.shape:
+                raise RuntimeError("cannot map selected adapter features back to raw column positions")
             method_names: list[str] = []
             metric_values: dict[str, list[np.ndarray]] = {
                 "mean_basis_leverage": [],
@@ -465,6 +473,7 @@ def _make_capture_callback(
             np.savez_compressed(
                 geometry_path,
                 methods=np.asarray(method_names, dtype="U32"),
+                raw_numerical_feature_positions=raw_numerical_feature_positions.astype(np.int64, copy=False),
                 grid=grid,
                 function_grid_correction=np.stack(grid_corrections, axis=0),
                 **{name: np.stack(entries, axis=0) for name, entries in metric_values.items()},
@@ -534,7 +543,19 @@ def _rotation_complete(paths: Mapping[str, Path], fingerprint: str) -> bool:
     if not all(paths[name].is_file() for name in required):
         return False
     result = _load_bag(paths["bag"])
-    return result.metadata.get("run_fingerprint_hash") == fingerprint
+    if result.metadata.get("run_fingerprint_hash") != fingerprint:
+        return False
+    # A numerical column can be removed by TabICL's ordinary unique-feature
+    # filter in one nested fit, while remaining trainable in another.  The
+    # saved raw-column map is therefore required to align function curves
+    # honestly across rotations.  Treat captures from before that map was
+    # added as incomplete: their feature ordinal alone is not a stable
+    # identity after a preceding column has been removed.
+    try:
+        with np.load(paths["geometry"], allow_pickle=False) as payload:
+            return "raw_numerical_feature_positions" in payload.files
+    except (OSError, ValueError, KeyError):
+        return False
 
 
 def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
@@ -551,36 +572,97 @@ def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
 
 
 def _instability_summary(rotation_paths: Sequence[Mapping[str, Path]]) -> dict[str, Any]:
-    grids: list[np.ndarray] = []
+    """Summarize selected corrections only where their raw column is shared.
+
+    TabICL's standard unique-feature filter is fit independently inside each
+    nested rotation.  A raw numeric column can consequently disappear in one
+    rotation if it is constant there.  Comparing its replacement by ordinal
+    position would compare different columns; omitting the unavailable
+    rotation keeps the functional-instability measurement well-defined.
+    """
+
+    curves_by_method_feature: dict[tuple[str, int], list[np.ndarray]] = {}
     probes: list[np.ndarray] = []
+    n_functional_candidates = 0
     for paths in rotation_paths:
         with np.load(paths["geometry"], allow_pickle=False) as payload:
-            grids.append(np.asarray(payload["function_grid_correction"], dtype=float))
+            required = {"methods", "raw_numerical_feature_positions", "function_grid_correction"}
+            missing = required.difference(payload.files)
+            if missing:
+                return {
+                    "available": False,
+                    "reason": f"rotation geometry lacks raw-column alignment metadata: {sorted(missing)}",
+                    "n_rotations": len(rotation_paths),
+                }
+            methods = np.asarray(payload["methods"], dtype=str)
+            raw_positions = np.asarray(payload["raw_numerical_feature_positions"], dtype=int)
+            correction = np.asarray(payload["function_grid_correction"], dtype=float)
+        if correction.ndim != 3:
+            raise RuntimeError(f"function-grid correction must be 3D, got {correction.shape}")
+        expected_shape = (len(methods), correction.shape[1], len(raw_positions))
+        if correction.shape != expected_shape:
+            raise RuntimeError(
+                "invalid function-grid correction shape: "
+                f"got {correction.shape}, expected (methods, grid, raw_numerical_features)={expected_shape}"
+            )
+        for method_index, method in enumerate(methods):
+            for feature_index, raw_position in enumerate(raw_positions):
+                curves_by_method_feature.setdefault((str(method), int(raw_position)), []).append(
+                    correction[method_index, :, feature_index]
+                )
+                n_functional_candidates += 1
         with np.load(paths["probe"], allow_pickle=False) as payload:
             probes.append(np.asarray(payload["spline_minus_identity"], dtype=float))
-    if not grids or grids[0].size == 0:
-        return {
-            "available": False,
-            "reason": "no trainable numerical features",
-            "n_rotations": len(rotation_paths),
-        }
-    grid_stack = np.stack(grids, axis=0)
-    probe_stack = np.stack(probes, axis=0)
-    grid_variance = np.var(grid_stack, axis=0)
-    probe_variance = np.var(probe_stack, axis=0)
-    return {
-        "available": True,
-        "n_rotations": len(rotation_paths),
-        "functional_correction_variance": {
+
+    aligned_curve_variances: list[np.ndarray] = []
+    n_present_all_rotations = 0
+    n_single_rotation_only = 0
+    for curves in curves_by_method_feature.values():
+        if len(curves) == len(rotation_paths):
+            n_present_all_rotations += 1
+        if len(curves) < 2:
+            n_single_rotation_only += 1
+            continue
+        aligned_curve_variances.append(np.var(np.stack(curves, axis=0), axis=0))
+    functional_summary: dict[str, Any]
+    if aligned_curve_variances:
+        grid_variance = np.concatenate(aligned_curve_variances)
+        functional_summary = {
+            "available": True,
             "mean": float(grid_variance.mean()),
             "p95": float(np.quantile(grid_variance, 0.95)),
             "max": float(grid_variance.max()),
-        },
-        "unlabeled_outer_test_prediction_correction_variance": {
+            "n_method_feature_pairs_with_at_least_two_rotations": len(aligned_curve_variances),
+            "n_method_feature_pairs_present_in_all_rotations": n_present_all_rotations,
+            "n_method_feature_pairs_present_in_one_rotation_only": n_single_rotation_only,
+        }
+    else:
+        functional_summary = {
+            "available": False,
+            "reason": "no raw numerical method-feature pair is available in at least two rotations",
+            "n_method_feature_pairs_present_in_one_rotation_only": n_single_rotation_only,
+        }
+
+    probe_shapes = {probe.shape for probe in probes}
+    if len(probe_shapes) == 1:
+        probe_variance = np.var(np.stack(probes, axis=0), axis=0)
+        probe_summary: dict[str, Any] = {
+            "available": True,
             "mean": float(probe_variance.mean()),
             "p95": float(np.quantile(probe_variance, 0.95)),
             "max": float(probe_variance.max()),
-        },
+        }
+    else:
+        probe_summary = {
+            "available": False,
+            "reason": f"outer-test correction shapes differ across rotations: {sorted(probe_shapes)}",
+        }
+    return {
+        "available": bool(functional_summary["available"] or probe_summary["available"]),
+        "n_rotations": len(rotation_paths),
+        "n_rotation_method_feature_observations": n_functional_candidates,
+        "functional_correction_variance": functional_summary,
+        "unlabeled_outer_test_prediction_correction_variance": probe_summary,
     }
 
 
