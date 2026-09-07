@@ -14,6 +14,7 @@ from tabicl._experiments.direct_spline_openml_standard import (
     _aggregate_public_classification_members,
     _cosine_scheduler,
     _differentiable_row_interaction,
+    _encode_appended_context_labels,
     _enable_frozen_training_path,
     _fit_standard_bag,
     _forward_method,
@@ -23,6 +24,7 @@ from tabicl._experiments.direct_spline_openml_standard import (
     _make_adapters,
     _many_class_training_logits,
     _normal_prediction,
+    _normal_prediction_with_appended_context,
     _single_validation_split,
     _StandardBag,
     run_task_full_context_refit_checkpoint_audit_standard,
@@ -285,6 +287,11 @@ def test_standard_regression_reuses_public_estimator_scaled_labels_exactly():
     )
     assert np.array_equal(bundle.fit_labels, public_labels)
     assert not np.array_equal(caller_recomputed, public_labels)
+    appended_targets = targets[-3:]
+    assert np.array_equal(
+        _encode_appended_context_labels(bundle=bundle, raw_labels=appended_targets),
+        bundle.estimator.y_scaler_.transform(appended_targets.reshape(-1, 1)).ravel().astype(np.float32),
+    )
 
 
 def test_standard_adapter_identity_changes_only_numeric_positions():
@@ -1405,6 +1412,17 @@ def test_regression_evaluation_uses_the_public_batch_forward():
     public = _identity_prediction(bundle, task.x_test)
     assert calls >= len(bundle.estimator.ensemble_generator_.preprocessors_)
     assert np.array_equal(reconstructed, public)
+    expanded = _normal_prediction_with_appended_context(
+        bundle=bundle,
+        query_x=task.x_test,
+        context_indices=bundle.support_indices,
+        appended_context_x=task.x_train.iloc[12:16].reset_index(drop=True),
+        appended_context_y=task.y_train[12:16],
+        adapters=None,
+        device=torch.device("cpu"),
+    )
+    assert expanded.shape == reconstructed.shape
+    assert np.isfinite(expanded).all()
 
 
 def test_all_nan_query_mask_is_a_full_exact_input_check_without_mutation():

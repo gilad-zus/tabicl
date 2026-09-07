@@ -1132,6 +1132,133 @@ def _normal_prediction(
     return _aggregate_public_classification_members(bundle, classification_members, class_patterns)
 
 
+def _encode_appended_context_labels(
+    *, bundle: _StandardBag, raw_labels: np.ndarray
+) -> np.ndarray:
+    """Encode labels for rows appended to an already-fitted ICL context.
+
+    The estimator's target encoder/scaler is fitted strictly on the bag's
+    original fitting rows.  Reusing it here is important: fitting a fresh
+    scaler or label encoder on appended validation rows would silently change
+    the model's coordinate system and turn a context-only ablation into a
+    preprocessing refit.
+    """
+
+    labels = np.asarray(raw_labels)
+    if labels.ndim != 1:
+        raise ValueError("appended context labels must be one-dimensional")
+    if bundle.problem_type == "regression":
+        estimator = bundle.estimator
+        if not isinstance(estimator, TabICLRegressor):
+            raise TypeError("regression context labels require TabICLRegressor")
+        encoded = estimator.y_scaler_.transform(labels.reshape(-1, 1)).reshape(-1)
+    else:
+        estimator = bundle.estimator
+        if not isinstance(estimator, TabICLClassifier):
+            raise TypeError("classification context labels require TabICLClassifier")
+        encoded = estimator.y_encoder_.transform(labels)
+    encoded = np.asarray(encoded, dtype=np.float32)
+    if not np.isfinite(encoded).all():
+        raise ValueError("appended context label encoding produced non-finite values")
+    return encoded
+
+
+def _normal_prediction_with_appended_context(
+    *,
+    bundle: _StandardBag,
+    query_x: Any,
+    context_indices: np.ndarray,
+    appended_context_x: Any,
+    appended_context_y: np.ndarray,
+    adapters: _AdapterSet | None,
+    device: torch.device,
+) -> np.ndarray:
+    """Predict after appending labelled rows without refitting any component.
+
+    The original bag preprocessor, target encoder/scaler, ensemble views, and
+    optional DirectSpline adapter are all frozen.  Only the rows handed to the
+    ICL context grow.  This is deliberately separate from ``_normal_prediction``
+    so the ordinary path remains bit-for-bit identical to public TabICLv2.
+    """
+
+    context_indices = np.asarray(context_indices, dtype=int)
+    if context_indices.ndim != 1 or context_indices.size == 0:
+        raise ValueError("context indices must be a non-empty one-dimensional array")
+    if np.any(context_indices < 0) or np.any(context_indices >= bundle.fit_labels.size):
+        raise ValueError("context indices are outside the fitted bag")
+    if len(appended_context_x) != len(appended_context_y):
+        raise ValueError("appended context features and labels must have equal row counts")
+    if len(appended_context_y) == 0:
+        return _normal_prediction(
+            bundle=bundle,
+            query_x=query_x,
+            context_indices=context_indices,
+            adapters=adapters,
+            device=device,
+        )
+
+    bundle.backbone.eval()
+    generator = bundle.estimator.ensemble_generator_
+    prepared_query = _prepare_query(bundle, query_x)
+    prepared_append = _prepare_query(bundle, appended_context_x)
+    appended_labels = _encode_appended_context_labels(
+        bundle=bundle, raw_labels=np.asarray(appended_context_y)
+    )
+    original_labels = np.asarray(bundle.fit_labels[context_indices], dtype=np.float32)
+    context_labels = np.concatenate((original_labels, appended_labels), axis=0)
+    classification_members: list[np.ndarray] = []
+    class_patterns: list[np.ndarray | None] = []
+    regression_members: list[np.ndarray] = []
+    for method, preprocessor in generator.preprocessors_.items():
+        original_context = preprocessor.X_transformed_[context_indices]
+        appended_context = preprocessor.transform(prepared_append.filtered)
+        context = np.concatenate((original_context, appended_context), axis=0)
+        query = preprocessor.transform(prepared_query.filtered)
+        public_views, public_labels, feature_shuffles, method_patterns = (
+            _build_public_method_arrays(
+                bundle=bundle,
+                method=method,
+                context_canonical=context,
+                query_canonical=query,
+                context_labels=context_labels,
+                adapters=adapters,
+                device=device,
+                filtered_feature_mask=prepared_query.filtered_feature_mask,
+            )
+        )
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        if bundle.problem_type == "regression":
+            estimator = bundle.estimator
+            if not isinstance(estimator, TabICLRegressor):
+                raise TypeError("regression prediction requires TabICLRegressor")
+            regression_members.append(
+                np.asarray(
+                    estimator._batch_forward(public_views, public_labels, output_type="mean"),
+                    dtype=np.float32,
+                )
+            )
+        else:
+            estimator = bundle.estimator
+            if not isinstance(estimator, TabICLClassifier):
+                raise TypeError("classification prediction requires TabICLClassifier")
+            classification_members.append(
+                np.asarray(
+                    estimator._batch_forward(public_views, public_labels, feature_shuffles),
+                    dtype=np.float32,
+                )
+            )
+            class_patterns.extend(method_patterns)
+        del public_views, public_labels
+    if bundle.problem_type == "regression":
+        if not regression_members:
+            raise RuntimeError("normal regressor produced no ensemble outputs")
+        return _aggregate_public_regression_members(bundle, regression_members)
+    if bundle.n_classes is None:
+        raise RuntimeError("classification bag has no class count")
+    return _aggregate_public_classification_members(bundle, classification_members, class_patterns)
+
+
 def _identity_prediction(bundle: _StandardBag, query_x: Any) -> np.ndarray:
     """Use the public estimator itself as the authoritative identity control."""
 
