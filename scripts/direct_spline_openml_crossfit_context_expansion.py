@@ -444,17 +444,22 @@ def _fit_context_expansion_bag(
         original_identity_a = _normal_prediction(bundle=bundle, query_x=selection_a_x, context_indices=bundle.support_indices, adapters=None, device=device)
         original_identity_b = _normal_prediction(bundle=bundle, query_x=selection_b_x, context_indices=bundle.support_indices, adapters=None, device=device)
         original_identity_test = _normal_prediction(bundle=bundle, query_x=task.x_test, context_indices=bundle.support_indices, adapters=None, device=device)
+        adapters.load_state_dict(best["original_a"]["state"], strict=True)
+        original_spline_a_on_b = _normal_prediction(bundle=bundle, query_x=selection_b_x, context_indices=bundle.support_indices, adapters=adapters, device=device)
+        original_spline_a_test = _normal_prediction(bundle=bundle, query_x=task.x_test, context_indices=bundle.support_indices, adapters=adapters, device=device)
+        adapters.load_state_dict(best["original_b"]["state"], strict=True)
+        original_spline_b_on_a = _normal_prediction(bundle=bundle, query_x=selection_a_x, context_indices=bundle.support_indices, adapters=adapters, device=device)
+        original_spline_b_test = _normal_prediction(bundle=bundle, query_x=task.x_test, context_indices=bundle.support_indices, adapters=adapters, device=device)
+        # First complete the original-context replay exactly as the reference
+        # cross-fit runner did. Appended-context calls can populate estimator
+        # inference caches, so they must not be interleaved with this guard.
         expanded_identity_a = _append_prediction(bundle=bundle, task=task, query_x=selection_a_x, appended_indices=selection_b_indices, adapters=None, device=device)
         expanded_identity_b = _append_prediction(bundle=bundle, task=task, query_x=selection_b_x, appended_indices=selection_a_indices, adapters=None, device=device)
         expanded_identity_test = _append_prediction(bundle=bundle, task=task, query_x=task.x_test, appended_indices=validation_indices, adapters=None, device=device)
         adapters.load_state_dict(best["original_a"]["state"], strict=True)
-        original_spline_a_on_b = _normal_prediction(bundle=bundle, query_x=selection_b_x, context_indices=bundle.support_indices, adapters=adapters, device=device)
-        original_spline_a_test = _normal_prediction(bundle=bundle, query_x=task.x_test, context_indices=bundle.support_indices, adapters=adapters, device=device)
         expanded_spline_a_on_b = _append_prediction(bundle=bundle, task=task, query_x=selection_b_x, appended_indices=selection_a_indices, adapters=adapters, device=device)
         expanded_spline_a_test = _append_prediction(bundle=bundle, task=task, query_x=task.x_test, appended_indices=validation_indices, adapters=adapters, device=device)
         adapters.load_state_dict(best["original_b"]["state"], strict=True)
-        original_spline_b_on_a = _normal_prediction(bundle=bundle, query_x=selection_a_x, context_indices=bundle.support_indices, adapters=adapters, device=device)
-        original_spline_b_test = _normal_prediction(bundle=bundle, query_x=task.x_test, context_indices=bundle.support_indices, adapters=adapters, device=device)
         expanded_spline_b_on_a = _append_prediction(bundle=bundle, task=task, query_x=selection_a_x, appended_indices=selection_b_indices, adapters=adapters, device=device)
         expanded_spline_b_test = _append_prediction(bundle=bundle, task=task, query_x=task.x_test, appended_indices=validation_indices, adapters=adapters, device=device)
 
