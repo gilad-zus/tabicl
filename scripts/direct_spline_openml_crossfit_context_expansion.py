@@ -2,8 +2,9 @@
 
 Each ordinary eight-fold bag has fitting rows ``T`` and a held-out fold split
 into disjoint halves ``A`` and ``B``.  A single adapter trajectory is fitted on
-``T`` only.  It supplies two independent checkpoint choices: the checkpoint
-selected on A predicts B, and vice versa.
+``T`` only.  It supplies two independent checkpoint choices under the original
+T-only context: the checkpoint selected on A predicts B, and vice versa.  The
+same two frozen states are then reused in the expanded-context arm.
 
 The experiment evaluates two otherwise identical contexts:
 
@@ -16,8 +17,9 @@ Thus neither an OOF prediction nor a selected checkpoint receives that row's
 label in context.  The expanded identity arm is a necessary control: it tells
 us whether any benefit comes from extra ICL examples alone rather than from
 the spline.  The selected table blend is chosen independently from each
-condition's cross-fitted OOF predictions; outer-test labels are read only for
-the final report.
+condition's cross-fitted OOF predictions, but the underlying adapter states
+are identical across conditions.  Outer-test labels are read only for the
+final report.
 
 The selected states were not retained by prior cross-fit runs, so this script
 replays their training trajectory.  It requires the matching completed run as
@@ -353,7 +355,10 @@ def _fit_context_expansion_bag(
         expanded_spline_a_on_b = expanded_identity_b.copy()
         expanded_spline_a_test = expanded_identity_test.copy()
         expanded_spline_b_test = expanded_identity_test.copy()
-        best = {key: {"step": 0, "error": 0.0, "valid": False, "state": None} for key in ("original_a", "original_b", "expanded_a", "expanded_b")}
+        best = {
+            key: {"step": 0, "error": 0.0, "valid": False, "state": None}
+            for key in ("original_a", "original_b")
+        }
     else:
         optimizer = _optimizer(adapters, config)
         scheduler = None if config.get("cosine_schedule_steps") is None else _cosine_scheduler(
@@ -365,7 +370,7 @@ def _fit_context_expansion_bag(
         identity_state = _cpu_state_dict(adapters)
         best = {
             key: {"step": 0, "error": float("inf"), "valid": False, "state": identity_state}
-            for key in ("original_a", "original_b", "expanded_a", "expanded_b")
+            for key in ("original_a", "original_b")
         }
         for step in range(1, int(config["adapter_steps"]) + 1):
             configured_context_rows = config.get("train_context_rows")
@@ -416,10 +421,8 @@ def _fit_context_expansion_bag(
             candidates = {
                 "original_a": _normal_prediction(bundle=bundle, query_x=selection_a_x, context_indices=bundle.support_indices, adapters=adapters, device=device),
                 "original_b": _normal_prediction(bundle=bundle, query_x=selection_b_x, context_indices=bundle.support_indices, adapters=adapters, device=device),
-                "expanded_a": _append_prediction(bundle=bundle, task=task, query_x=selection_a_x, appended_indices=selection_b_indices, adapters=adapters, device=device),
-                "expanded_b": _append_prediction(bundle=bundle, task=task, query_x=selection_b_x, appended_indices=selection_a_indices, adapters=adapters, device=device),
             }
-            labels = {"original_a": selection_a_y, "original_b": selection_b_y, "expanded_a": selection_a_y, "expanded_b": selection_b_y}
+            labels = {"original_a": selection_a_y, "original_b": selection_b_y}
             errors = {
                 name: _candidate_deployment_error(task.problem_type, labels[name], prediction, n_classes=task.n_classes)
                 for name, prediction in candidates.items()
@@ -431,8 +434,6 @@ def _fit_context_expansion_bag(
                 "step": int(step),
                 "original_selection_a_error": float(errors["original_a"]),
                 "original_selection_b_error": float(errors["original_b"]),
-                "expanded_selection_a_error": float(errors["expanded_a"]),
-                "expanded_selection_b_error": float(errors["expanded_b"]),
                 "learning_rates": [float(group["lr"]) for group in optimizer.param_groups],
             })
             del candidates
@@ -449,13 +450,11 @@ def _fit_context_expansion_bag(
         adapters.load_state_dict(best["original_a"]["state"], strict=True)
         original_spline_a_on_b = _normal_prediction(bundle=bundle, query_x=selection_b_x, context_indices=bundle.support_indices, adapters=adapters, device=device)
         original_spline_a_test = _normal_prediction(bundle=bundle, query_x=task.x_test, context_indices=bundle.support_indices, adapters=adapters, device=device)
+        expanded_spline_a_on_b = _append_prediction(bundle=bundle, task=task, query_x=selection_b_x, appended_indices=selection_a_indices, adapters=adapters, device=device)
+        expanded_spline_a_test = _append_prediction(bundle=bundle, task=task, query_x=task.x_test, appended_indices=validation_indices, adapters=adapters, device=device)
         adapters.load_state_dict(best["original_b"]["state"], strict=True)
         original_spline_b_on_a = _normal_prediction(bundle=bundle, query_x=selection_a_x, context_indices=bundle.support_indices, adapters=adapters, device=device)
         original_spline_b_test = _normal_prediction(bundle=bundle, query_x=task.x_test, context_indices=bundle.support_indices, adapters=adapters, device=device)
-        adapters.load_state_dict(best["expanded_a"]["state"], strict=True)
-        expanded_spline_a_on_b = _append_prediction(bundle=bundle, task=task, query_x=selection_b_x, appended_indices=selection_a_indices, adapters=adapters, device=device)
-        expanded_spline_a_test = _append_prediction(bundle=bundle, task=task, query_x=task.x_test, appended_indices=validation_indices, adapters=adapters, device=device)
-        adapters.load_state_dict(best["expanded_b"]["state"], strict=True)
         expanded_spline_b_on_a = _append_prediction(bundle=bundle, task=task, query_x=selection_a_x, appended_indices=selection_b_indices, adapters=adapters, device=device)
         expanded_spline_b_test = _append_prediction(bundle=bundle, task=task, query_x=task.x_test, appended_indices=validation_indices, adapters=adapters, device=device)
 
@@ -472,7 +471,7 @@ def _fit_context_expansion_bag(
         "effective_bags": int(effective_bags),
         "pipeline": "crossfit_frozen_context_expansion",
         "adapter_training_rows": "T only",
-        "expanded_context_policy": "A uses T+B; B uses T+A; test uses T+A+B; target preprocessing and adapter remain fitted on T",
+        "expanded_context_policy": "The original T-context-selected states are frozen; A uses T+B, B uses T+A, and test uses T+A+B",
         "adapter_steps_requested": int(config["adapter_steps"]),
         "adapter_steps_executed": int(executed_steps),
         "adapter_first_objective": first_objective,
@@ -590,12 +589,12 @@ def _manifest(
         "requested_bags": args.bags,
         "reference_atol": float(args.reference_atol),
         "fixed_arm_requirement": {"adapter_architecture": "fixed_cubic", "n_control_points": 20},
-        "training": "One fixed T-only adapter trajectory per bag; no adapter, input-preprocessor, target-scaler, or ensemble refit after A/B rows are appended.",
+        "training": "One fixed T-only adapter trajectory per bag; checkpoints are selected under the original T-only context, then no adapter, input-preprocessor, target-scaler, or ensemble refit occurs after A/B rows are appended.",
         "crossfit_contexts": {
             "original": "A/B/test use T",
             "expanded": "A uses T+B, B uses T+A, test uses T+A+B",
         },
-        "selection": "Each context condition selects its own alpha from its independently cross-fitted OOF predictions; exact ties choose lower alpha.",
+        "selection": "Both context conditions reuse the same original-context-selected adapter states. Each condition selects its own alpha from its independently cross-fitted OOF predictions; exact ties choose lower alpha.",
         "label_policy": "A/B labels may enter the opposite half's ICL context but never their own OOF context; outer-test labels are read only after both condition alphas and test predictions are frozen.",
         "script_sha256": _sha256(Path(__file__)),
     }
