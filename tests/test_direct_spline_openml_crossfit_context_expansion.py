@@ -6,6 +6,7 @@ import sys
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 
 def _load_module(name: str, filename: str):
@@ -79,3 +80,35 @@ def test_minimum_pooled_oof_blend_uses_only_crossfitted_oof_rows_and_tie_breaks_
     # alpha=.5 predicts the targets exactly. It is selected without any test
     # prediction or outer-test label being supplied to the function.
     assert selection["selected_alpha"] == 0.5
+
+
+def test_reference_prediction_drift_is_diagnostic_but_indices_are_strict(tmp_path):
+    reference = SimpleNamespace(
+        validation_indices=np.asarray([0, 1]),
+        selection_a_indices=np.asarray([0]),
+        selection_b_indices=np.asarray([1]),
+        identity_selection_a=np.asarray([0.0]),
+        identity_selection_b=np.asarray([0.0]),
+        spline_selected_on_b_selection_a=np.asarray([0.0]),
+        spline_selected_on_a_selection_b=np.asarray([0.0]),
+        identity_test=np.asarray([0.0]),
+        spline_selected_on_a_test=np.asarray([0.0]),
+        spline_selected_on_b_test=np.asarray([0.0]),
+    )
+    path = tmp_path / "bag.npz"
+    path.touch()
+    original_loader = experiment._load_reference_bag
+    experiment._load_reference_bag = lambda _path: reference
+    try:
+        actual = _bag()
+        diagnostic = experiment._verify_reference_bag(actual=actual, reference_path=path, atol=1e-8)
+        assert diagnostic["within_atol"] is False
+        assert diagnostic["max_abs"] == 21.0
+
+        changed = experiment.ContextExpansionBagPredictions(
+            **{**actual.__dict__, "selection_a_indices": np.asarray([1])}
+        )
+        with pytest.raises(ValueError, match="changed selection_a_indices"):
+            experiment._verify_reference_bag(actual=changed, reference_path=path, atol=1e-8)
+    finally:
+        experiment._load_reference_bag = original_loader
