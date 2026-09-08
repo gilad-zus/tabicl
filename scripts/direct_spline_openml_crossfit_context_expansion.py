@@ -22,8 +22,8 @@ are identical across conditions.  Outer-test labels are read only for the
 final report.
 
 The selected states were not retained by prior cross-fit runs, so this script
-replays their training trajectory.  It requires the matching completed run as
-a reference and refuses a replay whose original-context predictions diverge.
+replays their training trajectory.  A matching completed cross-fit run may be
+supplied to audit deterministic indices, array shapes, and numerical drift.
 """
 
 from __future__ import annotations
@@ -88,7 +88,7 @@ from tabicl._experiments.direct_spline_openml_standard import (
 from tabicl._experiments.direct_spline_protocol import deployment_error, sample_episode_indices
 
 
-CONTEXT_EXPANSION_SCHEMA_VERSION = 1
+CONTEXT_EXPANSION_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -121,13 +121,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--reference-crossfit-dir",
         type=Path,
-        required=True,
-        help="Completed matching cross-fit run used to verify the original-context replay.",
+        help="Optional completed matching cross-fit run used for a diagnostic old-run comparison.",
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--config-label", default="D")
-    parser.add_argument("--task-id", type=int, action="append", required=True, help="Fixed pilot task ID. Repeatable.")
-    parser.add_argument("--protocol-seed", type=int, required=True, help="Must equal the reference cross-fit partition seed.")
+    parser.add_argument("--task-id", type=int, action="append", required=True, help="OpenML task ID. Repeatable.")
+    parser.add_argument("--protocol-seed", type=int, required=True, help="Seed for inner folds and cross-fit validation halves.")
     parser.add_argument("--bags", type=int, default=None)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--classifier-checkpoint", type=Path, default=None)
@@ -587,7 +586,7 @@ def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
 
 
 def _manifest(
-    *, source_dir: Path, source_manifest: Mapping[str, Any], reference_dir: Path, reference_manifest: Mapping[str, Any], cases: Sequence[SourceCase], args: argparse.Namespace
+    *, source_dir: Path, source_manifest: Mapping[str, Any], reference_dir: Path | None, reference_manifest: Mapping[str, Any] | None, cases: Sequence[SourceCase], args: argparse.Namespace
 ) -> dict[str, Any]:
     return {
         "context_expansion_schema_version": CONTEXT_EXPANSION_SCHEMA_VERSION,
@@ -595,9 +594,9 @@ def _manifest(
         "source_dir": str(source_dir.resolve()),
         "source_manifest_sha256": _sha256(source_dir / "experiment_manifest.json"),
         "source_repository_revision": source_manifest.get("immutable_run", {}).get("repository_revision"),
-        "reference_crossfit_dir": str(reference_dir.resolve()),
-        "reference_crossfit_manifest_sha256": _sha256(reference_dir / "experiment_manifest.json"),
-        "reference_crossfit_fingerprint": reference_manifest.get("run_fingerprint_sha256"),
+        "reference_crossfit_dir": None if reference_dir is None else str(reference_dir.resolve()),
+        "reference_crossfit_manifest_sha256": None if reference_dir is None else _sha256(reference_dir / "experiment_manifest.json"),
+        "reference_crossfit_fingerprint": None if reference_manifest is None else reference_manifest.get("run_fingerprint_sha256"),
         "config_label": str(args.config_label),
         "task_ids": sorted(case.task_id for case in cases),
         "protocol_seed": int(args.protocol_seed),
@@ -694,7 +693,7 @@ def _run_task(
             "effective_config": config,
             "source_adapter_patience": source_patience,
             "checkpoint": checkpoint_metadata,
-            "reference_crossfit_dir": str(args.reference_crossfit_dir.resolve()),
+            "reference_crossfit_dir": None if args.reference_crossfit_dir is None else str(args.reference_crossfit_dir.resolve()),
             "bag_splits": [{"bag": bag, "fit_rows": len(fit), "heldout_rows": len(heldout)} for bag, fit, heldout in missing],
         })
         for position, (bag, fit_indices, validation_indices) in enumerate(missing, start=1):
@@ -712,9 +711,10 @@ def _run_task(
                 requested_bags=requested_bags,
                 effective_bags=effective_bags,
             )
-            reference_path = _task_dir(args.reference_crossfit_dir, task) / f"bag_{bag}.npz"
-            comparison = _verify_reference_bag(actual=result, reference_path=reference_path, atol=float(args.reference_atol))
-            result.metadata["reference_replay_diagnostic"] = comparison
+            if args.reference_crossfit_dir is not None:
+                reference_path = _task_dir(args.reference_crossfit_dir, task) / f"bag_{bag}.npz"
+                comparison = _verify_reference_bag(actual=result, reference_path=reference_path, atol=float(args.reference_atol))
+                result.metadata["reference_replay_diagnostic"] = comparison
             _save_bag(task_dir / f"bag_{bag}.npz", result)
         del backbone
         if device.type == "cuda":
@@ -799,20 +799,23 @@ def _comparison(
 def main() -> None:
     args = _parse_args()
     source_dir = args.source_dir.resolve()
-    args.reference_crossfit_dir = args.reference_crossfit_dir.resolve()
+    if args.reference_crossfit_dir is not None:
+        args.reference_crossfit_dir = args.reference_crossfit_dir.resolve()
     if args.openml_cache_dir is not None:
         os.environ["OPENML_CACHE_DIR"] = str(args.openml_cache_dir.resolve())
     source_manifest = _load_json(source_dir / "experiment_manifest.json", label="source manifest")
     immutable_run = source_manifest.get("immutable_run")
     if not isinstance(immutable_run, Mapping):
         raise ValueError("source manifest has no immutable_run")
-    reference_manifest = _load_json(args.reference_crossfit_dir / "experiment_manifest.json", label="reference cross-fit manifest")
-    if reference_manifest.get("crossfit_blend_schema_version") != CROSSFIT_BLEND_SCHEMA_VERSION:
-        raise ValueError("reference run has unsupported cross-fit artifact schema")
-    if int(reference_manifest.get("protocol_seed")) != int(args.protocol_seed):
-        raise ValueError("--protocol-seed must equal the reference cross-fit run's protocol_seed")
-    if str(reference_manifest.get("source_dir", "")) != str(source_dir):
-        raise ValueError("reference cross-fit run was not built from this exact source directory")
+    reference_manifest = None
+    if args.reference_crossfit_dir is not None:
+        reference_manifest = _load_json(args.reference_crossfit_dir / "experiment_manifest.json", label="reference cross-fit manifest")
+        if reference_manifest.get("crossfit_blend_schema_version") != CROSSFIT_BLEND_SCHEMA_VERSION:
+            raise ValueError("reference run has unsupported cross-fit artifact schema")
+        if int(reference_manifest.get("protocol_seed")) != int(args.protocol_seed):
+            raise ValueError("--protocol-seed must equal the reference cross-fit run's protocol_seed")
+        if str(reference_manifest.get("source_dir", "")) != str(source_dir):
+            raise ValueError("reference cross-fit run was not built from this exact source directory")
     requested = set(args.task_id)
     cases = _find_source_cases(source_dir=source_dir, manifest=source_manifest, config_label=args.config_label, requested_task_ids=requested)
     cases = [case for case in cases if case.problem_type in {"multiclass", "regression"}]
@@ -846,7 +849,7 @@ def main() -> None:
         },
         "selection_metric_note": "Multiclass uses log loss; regression uses MSE. Benchmark reporting uses log loss and RMSE respectively.",
         "label_policy": "The selected state and OOF prediction for a row exclude that row's label from both checkpoint selection context and prediction context. Outer-test labels are report-only.",
-        "reference_replay_note": "Reference indices and shapes are strict invariants. Prediction differences are diagnostic only because separately optimized CUDA trajectories are not required to be bit-identical; the causal original/expanded arms share the exact same checkpoint tensors within this run.",
+        "reference_replay_note": "When a reference run is supplied, its indices and shapes are strict invariants and prediction differences are diagnostic. The causal original/expanded arms always share the exact same checkpoint tensors within this run.",
     }
     _write_json(args.output_dir / "summary.json", summary)
     rows = []
