@@ -61,8 +61,8 @@ try:  # Import works both as ``python scripts/...`` and as a pytest module.
         _dataset_ids_for_task_ids,
         _file_provenance,
         _openml_task_listing,
+        _resolve_prior_task_exclusions,
         _sha256_json,
-        _task_ids_from_exclusion_file,
         select_distinct_openml_candidates,
     )
 except ModuleNotFoundError:  # pragma: no cover - direct script invocation.
@@ -79,19 +79,15 @@ except ModuleNotFoundError:  # pragma: no cover - direct script invocation.
         _dataset_ids_for_task_ids,
         _file_provenance,
         _openml_task_listing,
+        _resolve_prior_task_exclusions,
         _sha256_json,
-        _task_ids_from_exclusion_file,
         select_distinct_openml_candidates,
     )
-from tabicl._experiments.direct_spline_openml import (
-    TABARENA_V0PT1_OPENML_SUITE_ID,
-    load_tabarena_openml_task,
-    tabarena_v0pt1_task_ids,
-)
+from tabicl._experiments.direct_spline_openml import load_tabarena_openml_task
 
 
-MULTICLASS_CONFIRMATION_BANK_VERSION = 1
-SELECTION_NAMESPACE = "direct-spline-openml-multiclass-confirmation-v1"
+MULTICLASS_CONFIRMATION_BANK_VERSION = 2
+SELECTION_NAMESPACE = "direct-spline-openml-multiclass-confirmation-v2"
 DEFAULT_SELECTION_SEED = 20_260_823
 DEFAULT_TASK_COUNT = 20
 DEFAULT_MIN_CLASSES = 3
@@ -198,10 +194,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--exclude-task-id-file",
         type=Path,
+        action="append",
         default=None,
         help=(
             "Prior DirectSpline experiment_manifest.json or task-bank JSON whose task IDs must be excluded. "
-            "Use the completed 51-task manifest to avoid a fresh OpenML suite lookup."
+            "Repeat to union cohorts. If omitted, exclude the public TabArena-v0.1 suite."
         ),
     )
     parser.add_argument("--task-count", type=int, default=DEFAULT_TASK_COUNT)
@@ -259,23 +256,12 @@ def main() -> None:
         raise FileExistsError(f"refusing to overwrite an existing bank: {args.output}; pass --overwrite to replace it")
 
     listed_records = _openml_classification_listing()
-    if args.exclude_task_id_file is None:
-        suite_task_ids = set(tabarena_v0pt1_task_ids())
-        exclusion_source = {
-            "kind": "OpenML TabArena-v0.1 suite lookup",
-            "suite_id": TABARENA_V0PT1_OPENML_SUITE_ID,
-        }
-    else:
-        suite_task_ids = set(_task_ids_from_exclusion_file(args.exclude_task_id_file))
-        exclusion_source = {
-            "kind": "reviewed task-ID file",
-            **_file_provenance(args.exclude_task_id_file),
-        }
-    suite_dataset_ids = _dataset_ids_for_task_ids(suite_task_ids)
+    excluded_task_ids, exclusion_source = _resolve_prior_task_exclusions(args.exclude_task_id_file)
+    excluded_dataset_ids = _dataset_ids_for_task_ids(excluded_task_ids)
     candidates, metadata_rejections = select_distinct_openml_candidates(
         listed_records,
-        excluded_task_ids=suite_task_ids,
-        excluded_dataset_ids=suite_dataset_ids,
+        excluded_task_ids=excluded_task_ids,
+        excluded_dataset_ids=excluded_dataset_ids,
         min_total_rows=args.min_total_rows,
         max_total_rows=args.max_total_rows,
         max_features=args.max_features,
@@ -340,14 +326,13 @@ def main() -> None:
         "selection_seed": args.selection_seed,
         "selection_rule": (
             "Published OpenML supervised-classification metadata only; retain 3..10-class candidates; exclude "
-            "TabArena-v0.1 task and dataset IDs; then use deterministic hash rank, one task per dataset, and "
+            "every prior task and underlying dataset; then use deterministic hash rank, one task per dataset, and "
             "structural split audit. No outer-test metric participates in selection."
         ),
-        "tabarena_exclusion": {
-            "suite_id": TABARENA_V0PT1_OPENML_SUITE_ID,
+        "prior_task_exclusion": {
             "source": exclusion_source,
-            "task_ids": sorted(suite_task_ids),
-            "dataset_ids": sorted(suite_dataset_ids),
+            "task_ids": sorted(excluded_task_ids),
+            "dataset_ids": sorted(excluded_dataset_ids),
         },
         "outer_split": {"repeat": args.outer_repeat, "fold": args.outer_fold, "sample": args.outer_sample},
         "eligibility": {

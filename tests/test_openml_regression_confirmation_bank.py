@@ -11,6 +11,7 @@ import pytest
 
 from scripts.build_openml_regression_confirmation_bank import (
     _dataset_ids_for_task_ids,
+    _resolve_prior_task_exclusions,
     _task_ids_from_exclusion_file,
     audit_candidate_task,
     select_distinct_regression_candidates,
@@ -40,6 +41,20 @@ def test_exclusion_file_reads_the_prior_experiment_manifest(tmp_path):
         json.dumps({"immutable_run": {"data_source": {"task_ids": [11, 12, 13]}}}), encoding="utf-8"
     )
     assert _task_ids_from_exclusion_file(manifest) == [11, 12, 13]
+
+
+def test_multiple_prior_task_banks_are_unioned_with_file_provenance(tmp_path):
+    first = tmp_path / "first.json"
+    second = tmp_path / "second.json"
+    first.write_text(json.dumps({"selected_task_ids": [11, 12]}), encoding="utf-8")
+    second.write_text(json.dumps({"task_ids": [12, 13]}), encoding="utf-8")
+
+    task_ids, provenance = _resolve_prior_task_exclusions([first, second])
+
+    assert task_ids == {11, 12, 13}
+    assert provenance["kind"] == "reviewed prior task-ID files"
+    assert provenance["n_unique_task_ids"] == 3
+    assert [entry["n_task_ids"] for entry in provenance["files"]] == [2, 2]
 
 
 def test_exclusion_dataset_lookup_is_cross_problem_and_metadata_only(monkeypatch):
