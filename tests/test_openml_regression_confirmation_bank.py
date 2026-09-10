@@ -88,6 +88,37 @@ def test_family_filter_blocks_prior_variants_and_deduplicates_new_variants(tmp_p
     assert rejected["duplicate_dataset_family"] == 1
 
 
+def test_family_keys_include_prior_run_summaries_and_known_aliases(tmp_path):
+    run_dir = tmp_path / "run"
+    summary_dir = run_dir / "task_summaries"
+    summary_dir.mkdir(parents=True)
+    manifest = run_dir / "experiment_manifest.json"
+    manifest.write_text(json.dumps({"task_ids": [1]}), encoding="utf-8")
+    (summary_dir / "task_1.json").write_text(
+        json.dumps({"dataset_name": "satimage"}), encoding="utf-8"
+    )
+
+    assert _prior_dataset_family_keys([manifest]) == {"satimage"}
+
+    records = [
+        {"tid": 2, "did": 102, "name": "Fetal_cardiotocography_dataset", "status": "active", "NumberOfInstances": 1000, "NumberOfFeatures": 8, "NumberOfNumericFeatures": 8},
+        {"tid": 3, "did": 103, "name": "satellite_image", "status": "active", "NumberOfInstances": 1000, "NumberOfFeatures": 8, "NumberOfNumericFeatures": 8},
+    ]
+    selected, rejected = select_distinct_regression_candidates(
+        records,
+        excluded_task_ids=set(),
+        excluded_dataset_ids=set(),
+        excluded_family_keys={"cardiotocography", "satimage"},
+        min_total_rows=600,
+        max_total_rows=18_000,
+        max_features=200,
+        selection_seed=17,
+    )
+
+    assert selected == []
+    assert rejected["prior_dataset_family"] == 2
+
+
 def test_exclusion_dataset_lookup_is_cross_problem_and_metadata_only(monkeypatch):
     calls = []
 

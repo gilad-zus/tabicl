@@ -131,6 +131,12 @@ def _dataset_family_key(name: object) -> str:
     """Conservatively group obvious OpenML dataset variants by their first name token."""
 
     tokens = re.findall(r"[a-z0-9]+", str(name).lower())
+    if "cardiotocography" in tokens:
+        return "cardiotocography"
+    if "satimage" in tokens or tokens[:2] == ["satellite", "image"]:
+        return "satimage"
+    if "hazelnut" in tokens and "contaminant" in tokens:
+        return "contaminant"
     return tokens[0] if tokens else ""
 
 
@@ -146,12 +152,24 @@ def _prior_dataset_family_keys(paths: Sequence[Path] | None) -> set[str]:
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
             raise ValueError(f"cannot read prior task-bank names: {path} ({type(error).__name__}: {error})") from error
         raw_tasks = payload.get("selected_tasks") if isinstance(payload, dict) else None
-        if not isinstance(raw_tasks, list):
-            continue
-        for task in raw_tasks:
-            if not isinstance(task, dict) or not isinstance(task.get("dataset_name"), str):
+        if isinstance(raw_tasks, list):
+            for task in raw_tasks:
+                if not isinstance(task, dict) or not isinstance(task.get("dataset_name"), str):
+                    continue
+                key = _dataset_family_key(task["dataset_name"])
+                if key:
+                    keys.add(key)
+        task_summaries_dir = path.parent / "task_summaries"
+        for summary_path in sorted(task_summaries_dir.glob("*.json")):
+            try:
+                summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise ValueError(
+                    f"cannot read prior task summary: {summary_path} ({type(error).__name__}: {error})"
+                ) from error
+            if not isinstance(summary, dict) or not isinstance(summary.get("dataset_name"), str):
                 continue
-            key = _dataset_family_key(task["dataset_name"])
+            key = _dataset_family_key(summary["dataset_name"])
             if key:
                 keys.add(key)
     return keys
