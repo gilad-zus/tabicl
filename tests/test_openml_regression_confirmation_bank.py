@@ -11,6 +11,7 @@ import pytest
 
 from scripts.build_openml_regression_confirmation_bank import (
     _dataset_ids_for_task_ids,
+    _prior_dataset_family_keys,
     _resolve_prior_task_exclusions,
     _task_ids_from_exclusion_file,
     audit_candidate_task,
@@ -55,6 +56,36 @@ def test_multiple_prior_task_banks_are_unioned_with_file_provenance(tmp_path):
     assert provenance["kind"] == "reviewed prior task-ID files"
     assert provenance["n_unique_task_ids"] == 3
     assert [entry["n_task_ids"] for entry in provenance["files"]] == [2, 2]
+
+
+def test_family_filter_blocks_prior_variants_and_deduplicates_new_variants(tmp_path):
+    prior = tmp_path / "prior.json"
+    prior.write_text(
+        json.dumps({"selected_task_ids": [1], "selected_tasks": [{"dataset_name": "mfeat-factors"}]}),
+        encoding="utf-8",
+    )
+    records = [
+        {"tid": 2, "did": 102, "name": "mfeat-zernike", "status": "active", "NumberOfInstances": 1000, "NumberOfFeatures": 8, "NumberOfNumericFeatures": 8},
+        {"tid": 3, "did": 103, "name": "thyroid-allbp", "status": "active", "NumberOfInstances": 1000, "NumberOfFeatures": 8, "NumberOfNumericFeatures": 8},
+        {"tid": 4, "did": 104, "name": "thyroid-ann", "status": "active", "NumberOfInstances": 1000, "NumberOfFeatures": 8, "NumberOfNumericFeatures": 8},
+    ]
+
+    selected, rejected = select_distinct_regression_candidates(
+        records,
+        excluded_task_ids=set(),
+        excluded_dataset_ids=set(),
+        excluded_family_keys=_prior_dataset_family_keys([prior]),
+        min_total_rows=600,
+        max_total_rows=18_000,
+        max_features=200,
+        selection_seed=17,
+    )
+
+    assert {item["task_id"] for item in selected}.issubset({3, 4})
+    assert len(selected) == 1
+    assert selected[0]["dataset_family_key"] == "thyroid"
+    assert rejected["prior_dataset_family"] == 1
+    assert rejected["duplicate_dataset_family"] == 1
 
 
 def test_exclusion_dataset_lookup_is_cross_problem_and_metadata_only(monkeypatch):

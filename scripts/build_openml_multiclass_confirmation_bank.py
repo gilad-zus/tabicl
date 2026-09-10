@@ -61,6 +61,7 @@ try:  # Import works both as ``python scripts/...`` and as a pytest module.
         _dataset_ids_for_task_ids,
         _file_provenance,
         _openml_task_listing,
+        _prior_dataset_family_keys,
         _resolve_prior_task_exclusions,
         _sha256_json,
         select_distinct_openml_candidates,
@@ -79,6 +80,7 @@ except ModuleNotFoundError:  # pragma: no cover - direct script invocation.
         _dataset_ids_for_task_ids,
         _file_provenance,
         _openml_task_listing,
+        _prior_dataset_family_keys,
         _resolve_prior_task_exclusions,
         _sha256_json,
         select_distinct_openml_candidates,
@@ -154,6 +156,7 @@ def audit_multiclass_candidate_task(
         "task_id": int(task.task_id),
         "dataset_id": int(task.dataset_id),
         "dataset_name": str(task.dataset_name),
+        "dataset_family_key": str(candidate.get("dataset_family_key", "")),
         "problem_type": str(task.problem_type),
         "n_classes": n_classes,
         "outer_train_class_counts": [int(value) for value in class_counts],
@@ -258,6 +261,7 @@ def main() -> None:
     listed_records = _openml_classification_listing()
     excluded_task_ids, exclusion_source = _resolve_prior_task_exclusions(args.exclude_task_id_file)
     excluded_dataset_ids = _dataset_ids_for_task_ids(excluded_task_ids)
+    excluded_family_keys = _prior_dataset_family_keys(args.exclude_task_id_file)
     candidates, metadata_rejections = select_distinct_openml_candidates(
         listed_records,
         excluded_task_ids=excluded_task_ids,
@@ -269,6 +273,7 @@ def main() -> None:
         selection_namespace=SELECTION_NAMESPACE,
         min_listed_classes=args.min_classes,
         max_listed_classes=args.max_classes,
+        excluded_family_keys=excluded_family_keys,
     )
     candidate_universe = [
         {"task_id": item["task_id"], "dataset_id": item["dataset_id"], "selection_key": item["selection_key"]}
@@ -326,13 +331,15 @@ def main() -> None:
         "selection_seed": args.selection_seed,
         "selection_rule": (
             "Published OpenML supervised-classification metadata only; retain 3..10-class candidates; exclude "
-            "every prior task and underlying dataset; then use deterministic hash rank, one task per dataset, and "
-            "structural split audit. No outer-test metric participates in selection."
+            "every prior task and underlying dataset; exclude name-family roots recorded by prior frozen banks; "
+            "then use deterministic hash rank, one task per dataset family, and structural split audit. "
+            "No outer-test metric participates in selection."
         ),
         "prior_task_exclusion": {
             "source": exclusion_source,
             "task_ids": sorted(excluded_task_ids),
             "dataset_ids": sorted(excluded_dataset_ids),
+            "dataset_family_keys_from_prior_banks": sorted(excluded_family_keys),
         },
         "outer_split": {"repeat": args.outer_repeat, "fold": args.outer_fold, "sample": args.outer_sample},
         "eligibility": {

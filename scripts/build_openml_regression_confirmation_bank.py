@@ -41,6 +41,7 @@ import argparse
 import hashlib
 import json
 import math
+import re
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -126,6 +127,36 @@ def _resolve_prior_task_exclusions(paths: Sequence[Path] | None) -> tuple[set[in
     }
 
 
+def _dataset_family_key(name: object) -> str:
+    """Conservatively group obvious OpenML dataset variants by their first name token."""
+
+    tokens = re.findall(r"[a-z0-9]+", str(name).lower())
+    return tokens[0] if tokens else ""
+
+
+def _prior_dataset_family_keys(paths: Sequence[Path] | None) -> set[str]:
+    """Recover name-family exclusions available from prior frozen task banks."""
+
+    if not paths:
+        return set()
+    keys: set[str] = set()
+    for path in paths:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError(f"cannot read prior task-bank names: {path} ({type(error).__name__}: {error})") from error
+        raw_tasks = payload.get("selected_tasks") if isinstance(payload, dict) else None
+        if not isinstance(raw_tasks, list):
+            continue
+        for task in raw_tasks:
+            if not isinstance(task, dict) or not isinstance(task.get("dataset_name"), str):
+                continue
+            key = _dataset_family_key(task["dataset_name"])
+            if key:
+                keys.add(key)
+    return keys
+
+
 def _file_provenance(path: Path) -> dict[str, Any]:
     return {
         "path": str(path.resolve()),
@@ -163,10 +194,12 @@ def _normalise_task_record(record: dict[str, Any]) -> dict[str, Any] | None:
     dataset_id = _as_int(_first_present(record, ("did", "dataset_id", "data_id")))
     if task_id is None or task_id <= 0 or dataset_id is None or dataset_id <= 0:
         return None
+    dataset_name = str(_first_present(record, ("name", "dataset_name")) or f"OpenML-{dataset_id}")
     return {
         "task_id": task_id,
         "dataset_id": dataset_id,
-        "listed_dataset_name": str(_first_present(record, ("name", "dataset_name")) or f"OpenML-{dataset_id}"),
+        "listed_dataset_name": dataset_name,
+        "dataset_family_key": _dataset_family_key(dataset_name),
         "listed_status": _first_present(record, ("status", "Status")),
         "listed_total_rows": _as_int(_first_present(record, ("NumberOfInstances", "number_of_instances"))),
         "listed_features": _as_int(_first_present(record, ("NumberOfFeatures", "number_of_features"))),
@@ -198,6 +231,7 @@ def select_distinct_openml_candidates(
     selection_namespace: str = SELECTION_NAMESPACE,
     min_listed_classes: int | None = None,
     max_listed_classes: int | None = None,
+    excluded_family_keys: set[str] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     """Filter public metadata, then rank one task per unseen dataset deterministically.
 
@@ -207,6 +241,7 @@ def select_distinct_openml_candidates(
     """
 
     rejected: Counter[str] = Counter()
+    excluded_family_keys = set() if excluded_family_keys is None else set(excluded_family_keys)
     eligible: list[dict[str, Any]] = []
     for raw in listed_records:
         candidate = _normalise_task_record(raw)
@@ -218,6 +253,9 @@ def select_distinct_openml_candidates(
             continue
         if candidate["dataset_id"] in excluded_dataset_ids:
             rejected["tabarena_dataset"] += 1
+            continue
+        if candidate["dataset_family_key"] in excluded_family_keys:
+            rejected["prior_dataset_family"] += 1
             continue
         status = candidate["listed_status"]
         if status is not None and str(status).lower() != "active":
@@ -262,11 +300,16 @@ def select_distinct_openml_candidates(
     # deterministic first task for each underlying dataset ID.
     selected: list[dict[str, Any]] = []
     seen_dataset_ids: set[int] = set()
+    seen_family_keys: set[str] = set()
     for candidate in sorted(eligible, key=lambda item: (item["selection_key"], item["task_id"])):
         if candidate["dataset_id"] in seen_dataset_ids:
             rejected["duplicate_dataset_task"] += 1
             continue
+        if candidate["dataset_family_key"] in seen_family_keys:
+            rejected["duplicate_dataset_family"] += 1
+            continue
         seen_dataset_ids.add(candidate["dataset_id"])
+        seen_family_keys.add(candidate["dataset_family_key"])
         selected.append(candidate)
     return selected, dict(sorted(rejected.items()))
 
@@ -280,6 +323,7 @@ def select_distinct_regression_candidates(
     max_total_rows: int,
     max_features: int,
     selection_seed: int,
+    excluded_family_keys: set[str] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     """Backward-compatible name for the regression confirmation selector."""
 
@@ -291,6 +335,7 @@ def select_distinct_regression_candidates(
         max_total_rows=max_total_rows,
         max_features=max_features,
         selection_seed=selection_seed,
+        excluded_family_keys=excluded_family_keys,
     )
 
 
@@ -364,6 +409,9 @@ def audit_candidate_task(
         "task_id": int(task.task_id),
         "dataset_id": int(task.dataset_id),
         "dataset_name": str(task.dataset_name),
+        "dataset_family_key": str(
+            candidate.get("dataset_family_key") or _dataset_family_key(candidate.get("listed_dataset_name", ""))
+        ),
         "problem_type": str(task.problem_type),
         "outer_train_rows": n_train,
         "outer_test_rows": n_test,
@@ -545,6 +593,7 @@ def main() -> None:
     listed_records = _openml_regression_listing()
     excluded_task_ids, exclusion_source = _resolve_prior_task_exclusions(args.exclude_task_id_file)
     excluded_dataset_ids = _dataset_ids_for_task_ids(excluded_task_ids)
+    excluded_family_keys = _prior_dataset_family_keys(args.exclude_task_id_file)
     candidates, metadata_rejections = select_distinct_regression_candidates(
         listed_records,
         excluded_task_ids=excluded_task_ids,
@@ -553,6 +602,7 @@ def main() -> None:
         max_total_rows=args.max_total_rows,
         max_features=args.max_features,
         selection_seed=args.selection_seed,
+        excluded_family_keys=excluded_family_keys,
     )
     candidate_universe = [
         {"task_id": item["task_id"], "dataset_id": item["dataset_id"], "selection_key": item["selection_key"]}
@@ -605,13 +655,15 @@ def main() -> None:
         "selection_seed": args.selection_seed,
         "selection_rule": (
             "Published OpenML supervised-regression metadata only; exclude every prior task and underlying dataset; "
-            "then use a deterministic hash rank, one task per dataset, and structural split audit in that order. "
+            "exclude name-family roots recorded by prior frozen banks; then use a deterministic hash rank, one task "
+            "per dataset family, and structural split audit in that order. "
             "No outer-test metric participates in selection."
         ),
         "prior_task_exclusion": {
             "source": exclusion_source,
             "task_ids": sorted(excluded_task_ids),
             "dataset_ids": sorted(excluded_dataset_ids),
+            "dataset_family_keys_from_prior_banks": sorted(excluded_family_keys),
         },
         "outer_split": {"repeat": args.outer_repeat, "fold": args.outer_fold, "sample": args.outer_sample},
         "eligibility": {
