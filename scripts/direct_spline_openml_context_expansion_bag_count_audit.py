@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import csv
 import itertools
+import json
 import os
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -62,6 +63,7 @@ from tabicl._experiments.direct_spline_protocol import deployment_error
 
 
 BAG_COUNT_AUDIT_SCHEMA_VERSION = 1
+_SUPPORTED_CONTEXT_EXPANSION_SCHEMA_VERSIONS = frozenset({1, CONTEXT_EXPANSION_SCHEMA_VERSION})
 _DEFAULT_BAG_COUNTS = (1, 2, 4, 8)
 _POLICIES = ("fixed_eight_bag_alpha", "subset_oof_alpha")
 _TIE_ATOL = 1e-12
@@ -95,6 +97,32 @@ def _parse_args() -> argparse.Namespace:
 
 def _task_dir(crossfit_dir: Path, task: OpenMLTaskData) -> Path:
     return crossfit_dir / "raw" / f"task_{task.task_id}_{_safe_name(task.dataset_name)}"
+
+
+def _load_archived_task_summaries(crossfit_dir: Path) -> dict[int, Mapping[str, Any]]:
+    """Read the root-level summaries emitted by every context-expansion version."""
+
+    path = crossfit_dir / "task_summaries.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"cannot read context-expansion task summaries: {path} ({type(error).__name__}: {error})") from error
+    if not isinstance(payload, list):
+        raise ValueError("context-expansion task summaries must be a list")
+    summaries: dict[int, Mapping[str, Any]] = {}
+    for item in payload:
+        if not isinstance(item, Mapping):
+            raise ValueError("context-expansion task summary must be an object")
+        try:
+            task_id = int(item["task_id"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("context-expansion task summary has no valid task_id") from error
+        if task_id in summaries:
+            raise ValueError(f"duplicate context-expansion task summary for task {task_id}")
+        summaries[task_id] = item
+    if not summaries:
+        raise ValueError("context-expansion run has no completed task summaries")
+    return summaries
 
 
 def _outcome(reference: float, candidate: float) -> str:
@@ -234,10 +262,14 @@ def _summarize_subsets(
 
 
 def _audit_task(
-    *, case: SourceCase, task: OpenMLTaskData, crossfit_dir: Path, bag_counts: Sequence[int]
+    *,
+    case: SourceCase,
+    task: OpenMLTaskData,
+    crossfit_dir: Path,
+    stored: Mapping[str, Any],
+    bag_counts: Sequence[int],
 ) -> dict[str, Any]:
     task_dir = _task_dir(crossfit_dir, task)
-    stored = _load_json(task_dir / "task_summary.json", label="context-expansion task summary")
     effective_bags = int(stored["effective_bags"])
     paths = [task_dir / f"bag_{bag}.npz" for bag in range(effective_bags)]
     missing = [str(path) for path in paths if not path.is_file()]
@@ -377,8 +409,15 @@ def main() -> None:
     if args.openml_cache_dir is not None:
         os.environ["OPENML_CACHE_DIR"] = str(args.openml_cache_dir.resolve())
     crossfit_manifest = _load_json(crossfit_dir / "experiment_manifest.json", label="context-expansion manifest")
-    if crossfit_manifest.get("context_expansion_schema_version") != CONTEXT_EXPANSION_SCHEMA_VERSION:
-        raise ValueError("unsupported context-expansion artifact schema")
+    schema_version = crossfit_manifest.get("context_expansion_schema_version")
+    if schema_version not in _SUPPORTED_CONTEXT_EXPANSION_SCHEMA_VERSIONS:
+        raise ValueError(f"unsupported context-expansion artifact schema: {schema_version!r}")
+    archived_summaries = _load_archived_task_summaries(crossfit_dir)
+    available_task_ids = set(archived_summaries)
+    requested_task_ids = available_task_ids if args.task_id is None else set(int(item) for item in args.task_id)
+    unavailable = sorted(requested_task_ids - available_task_ids)
+    if unavailable:
+        raise ValueError(f"requested tasks are absent from the completed context-expansion run: {unavailable}")
     source_value = crossfit_manifest.get("source_dir")
     if not isinstance(source_value, str) or not source_value:
         raise ValueError("context-expansion manifest has no source_dir")
@@ -391,9 +430,13 @@ def main() -> None:
         source_dir=source_dir,
         manifest=source_manifest,
         config_label=args.config_label,
-        requested_task_ids=None if args.task_id is None else set(int(item) for item in args.task_id),
+        requested_task_ids=requested_task_ids,
     )
     cases = [case for case in cases if case.problem_type in {"multiclass", "regression"}]
+    found_task_ids = {case.task_id for case in cases}
+    missing_source_cases = sorted(requested_task_ids - found_task_ids)
+    if missing_source_cases:
+        raise ValueError(f"requested tasks are absent from the source run: {missing_source_cases}")
     if not cases:
         raise ValueError("no requested multiclass or regression D source tasks")
     for case in cases:
@@ -411,7 +454,13 @@ def main() -> None:
     subset_rows: list[dict[str, Any]] = []
     for position, case in enumerate(cases, start=1):
         task = _load_source_task(case=case, immutable_run=immutable_run)
-        item = _audit_task(case=case, task=task, crossfit_dir=crossfit_dir, bag_counts=args.bag_count)
+        item = _audit_task(
+            case=case,
+            task=task,
+            crossfit_dir=crossfit_dir,
+            stored=archived_summaries[case.task_id],
+            bag_counts=args.bag_count,
+        )
         task_summaries.append(item)
         for bag_count, count_record in item["bag_counts"].items():
             for subset_record in count_record["subsets"]:

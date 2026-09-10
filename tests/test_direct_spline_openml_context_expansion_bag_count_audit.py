@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -29,6 +30,23 @@ audit = _load_module(
     "direct_spline_openml_context_expansion_bag_count_audit.py",
 )
 context = sys.modules["direct_spline_openml_crossfit_context_expansion"]
+
+
+def test_load_archived_task_summaries_uses_root_level_run_file(tmp_path):
+    (tmp_path / "task_summaries.json").write_text(
+        json.dumps(
+            [
+                {"task_id": 7, "effective_bags": 8, "expanded_context": {}},
+                {"task_id": 11, "effective_bags": 8, "expanded_context": {}},
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    summaries = audit._load_archived_task_summaries(tmp_path)
+
+    assert set(summaries) == {7, 11}
+    assert summaries[11]["effective_bags"] == 8
 
 
 def _bag(*, index: int, identity_oof: float, spline_oof: float, identity_test: float, spline_a: float, spline_b: float):
