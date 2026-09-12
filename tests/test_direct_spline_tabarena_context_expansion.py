@@ -12,6 +12,7 @@ from direct_spline_tabarena_context_expansion import (  # noqa: E402
     TABARENA_LITE_MULTICLASS_TASK_IDS,
     TABARENA_LITE_REGRESSION_TASK_IDS,
     TABARENA_LITE_SUPPORTED_TASK_IDS,
+    _effective_config,
     frozen_config,
 )
 
@@ -36,3 +37,9 @@ def test_frozen_config_matches_heldout_context_expansion_source() -> None:
     assert config["random_state"] == 0
     assert config["identity_regularization"] == 0.0
     assert "cosine_schedule_steps" not in config
+
+
+def test_training_cap_does_not_cap_deployment_context() -> None:
+    config = _effective_config(frozen_config(), train_context_cap=16_384)
+    assert config["train_context_rows"] == 16_384
+    assert config["max_context_rows"] is None

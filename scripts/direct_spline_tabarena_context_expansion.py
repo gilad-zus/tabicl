@@ -15,7 +15,9 @@ compute only the full TabICLv2 reference and run the frozen expansion once.
 
 The default task bank is the 21 supported TabArena-Lite tasks (8 multiclass,
 13 regression). Existing full-training TabICLv2 predictions can be supplied
-as reusable baseline sources, avoiding repeated reference inference.
+as reusable baseline sources, avoiding repeated reference inference. Training
+episodes have a fixed context ceiling for large tables; deployment contexts
+remain uncapped.
 """
 
 from __future__ import annotations
@@ -90,6 +92,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--task-id", type=int, action="append", help="Optional TabArena-Lite task ID; repeatable.")
     parser.add_argument("--protocol-seed", type=int, default=20260910)
     parser.add_argument("--bags", type=int, default=8)
+    parser.add_argument(
+        "--train-context-cap",
+        type=int,
+        default=16_384,
+        help="Maximum labelled context rows per training episode; deployment still uses every fold row.",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--classifier-checkpoint", type=Path, default=None)
     parser.add_argument("--regressor-checkpoint", type=Path, default=None)
@@ -107,6 +115,8 @@ def _parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.bags < 2:
         raise ValueError("--bags must be at least two")
+    if args.train_context_cap < 1:
+        raise ValueError("--train-context-cap must be positive")
     if args.bootstrap_rounds < 1:
         raise ValueError("--bootstrap-rounds must be positive")
     task_ids = list(TABARENA_LITE_SUPPORTED_TASK_IDS if args.task_id is None else args.task_id)
@@ -135,6 +145,11 @@ def _manifest(args: argparse.Namespace, config: dict[str, Any]) -> dict[str, Any
         "baseline_source_dirs": [str(path.resolve()) for path in args.baseline_source_dir],
         "protocol_seed": int(args.protocol_seed),
         "requested_bags": int(args.bags),
+        "training_context_policy": {
+            "maximum_rows_per_episode": int(args.train_context_cap),
+            "deployment_context_cap": None,
+            "purpose": "bound differentiable-backbone memory on large TabArena tables",
+        },
         "config_label": "D",
         "frozen_source_config": config,
         "effective_training_note": "The A/B experiment disables early termination and independently selects two checkpoints from the full frozen 500-step trajectory, exactly as in the held-out confirmation run.",
@@ -224,12 +239,19 @@ def _existing_baseline_source(task: Any, source_dirs: list[Path]) -> Path | None
     return None
 
 
+def _effective_config(config: dict[str, Any], *, train_context_cap: int) -> dict[str, Any]:
+    effective = dict(config)
+    effective["train_context_rows"] = int(train_context_cap)
+    return effective
+
+
 def main() -> None:
     args = _parse_args()
     args.output_dir = args.output_dir.resolve()
     if args.openml_cache_dir is not None:
         os.environ["OPENML_CACHE_DIR"] = str(args.openml_cache_dir.resolve())
-    config = frozen_config()
+    frozen_source_config = frozen_config()
+    config = _effective_config(frozen_source_config, train_context_cap=args.train_context_cap)
     args.baseline_source_dir = [path.resolve() for path in args.baseline_source_dir]
     fingerprint = _prepare_output(args.output_dir, _manifest(args, config), resume=bool(args.resume))
     generated_source_dir = args.output_dir / "full_training_reference"
