@@ -244,6 +244,7 @@ def sample_episode_indices(
     context_rows: int,
     query_rows: int,
     rng: np.random.Generator,
+    query_fraction_range: tuple[float, float] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Draw disjoint train-only context/query rows for one adapter update."""
     labels = np.asarray(labels)
@@ -251,31 +252,62 @@ def sample_episode_indices(
         raise ValueError("context_rows and query_rows must be positive")
     if labels.size < 2:
         raise ValueError("at least two fitting rows are required")
-    if problem_type == "regression":
+    if query_fraction_range is None and problem_type == "regression":
         total = min(labels.size, context_rows + query_rows)
-        if total < 2:
-            raise ValueError("regression episode needs context and query rows")
         context_size = min(context_rows, total - 1)
         query_size = min(query_rows, labels.size - context_size)
         permutation = rng.permutation(labels.size)
         return permutation[:context_size], permutation[context_size : context_size + query_size]
+    if query_fraction_range is None:
+        classes = np.unique(labels)
+        if np.any(np.unique(labels, return_counts=True)[1] < 2):
+            raise ValueError("each classification class needs at least two fitting rows")
+        context_size = min(context_rows, labels.size - classes.size)
+        context_size = max(context_size, classes.size)
+        context = _stratified_sample(labels, context_size, rng)
+        remaining_mask = np.ones(labels.size, dtype=bool)
+        remaining_mask[context] = False
+        remaining = np.flatnonzero(remaining_mask)
+        query_size = max(min(query_rows, remaining.size), classes.size)
+        query_relative = _stratified_sample(labels[remaining], query_size, rng)
+        return context, remaining[query_relative]
 
-    classes, counts = np.unique(labels, return_counts=True)
-    if np.any(counts < 2):
-        raise ValueError("each classification class needs at least two fitting rows")
-    # Reserve one row per class for the labelled query episode before choosing
-    # the context.  This prevents accidental class disappearance in a step.
-    context_size = min(context_rows, labels.size - classes.size)
-    context_size = max(context_size, classes.size)
-    context = _stratified_sample(labels, context_size, rng)
-    remaining_mask = np.ones(labels.size, dtype=bool)
-    remaining_mask[context] = False
-    remaining = np.flatnonzero(remaining_mask)
-    remaining_labels = labels[remaining]
-    query_size = min(query_rows, remaining.size)
-    query_size = max(query_size, classes.size)
-    query_relative = _stratified_sample(remaining_labels, query_size, rng)
-    return context, remaining[query_relative]
+    low, high = (float(value) for value in query_fraction_range)
+    if not 0.0 < low <= high < 1.0:
+        raise ValueError("query fractions must satisfy 0 < low <= high < 1")
+    requested_query_rows = max(1, int(round(float(rng.uniform(low, high)) * labels.size)))
+    if problem_type == "regression":
+        query_size = min(requested_query_rows, labels.size - 1)
+        permutation = rng.permutation(labels.size)
+        query = permutation[:query_size]
+        context_size = min(context_rows, labels.size - query_size)
+        return permutation[query_size : query_size + context_size], query
+
+    classes = np.unique(labels)
+    if context_rows < classes.size:
+        raise ValueError("classification context must have room for every class")
+
+    # Keep one randomly chosen row from every class unavailable to the query.
+    # Query supervision then follows the empirical row distribution rather
+    # than forcing rare classes into every update, while context always retains
+    # class coverage (including singleton classes).
+    reserved_context = np.asarray(
+        [rng.choice(np.flatnonzero(labels == label)) for label in classes], dtype=int
+    )
+    query_pool_mask = np.ones(labels.size, dtype=bool)
+    query_pool_mask[reserved_context] = False
+    query_pool = np.flatnonzero(query_pool_mask)
+    if query_pool.size == 0:
+        raise ValueError("classification episode needs at least one non-reserved query row")
+    query_size = min(requested_query_rows, query_pool.size)
+    query = rng.permutation(query_pool)[:query_size]
+
+    context_pool_mask = np.ones(labels.size, dtype=bool)
+    context_pool_mask[query] = False
+    context_pool = np.flatnonzero(context_pool_mask)
+    context_size = min(context_rows, context_pool.size)
+    context_relative = _stratified_sample(labels[context_pool], context_size, rng)
+    return context_pool[context_relative], query
 
 
 def sample_prediction_context(
@@ -396,6 +428,8 @@ DEFAULT_DIRECT_SPLINE_CONFIG: dict[str, Any] = {
     "max_context_rows": 512,
     "train_context_rows": 384,
     "query_batch_rows": 256,
+    "query_fraction_min": None,
+    "query_fraction_max": None,
     "evaluation_query_chunk_rows": 256,
     "n_control_points": 20,
     "learning_rate": 0.005,

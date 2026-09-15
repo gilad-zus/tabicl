@@ -99,6 +99,37 @@ def test_classification_episode_is_disjoint_and_preserves_classes():
     assert set(labels[query]) == {0, 1, 2}
 
 
+def test_percentage_classification_episode_preserves_classes_in_context_only():
+    labels = np.array([0] + [1] * 49 + [2] * 50)
+    context, query = sample_episode_indices(
+        labels,
+        problem_type="multiclass",
+        context_rows=60,
+        query_rows=256,
+        rng=np.random.default_rng(5),
+        query_fraction_range=(0.1, 0.1),
+    )
+    assert not np.intersect1d(context, query).size
+    assert set(labels[context]) == {0, 1, 2}
+    assert 0 not in labels[query]
+    assert query.size == 10
+
+
+def test_regression_episode_uses_percentage_query_before_context_cap():
+    labels = np.arange(1_000, dtype=float)
+    context, query = sample_episode_indices(
+        labels,
+        problem_type="regression",
+        context_rows=700,
+        query_rows=256,
+        rng=np.random.default_rng(7),
+        query_fraction_range=(0.2, 0.2),
+    )
+    assert query.size == 200
+    assert context.size == 700
+    assert not np.intersect1d(context, query).size
+
+
 def test_prediction_context_is_train_only_stratified_subset():
     labels = np.array([0] * 8 + [1] * 4)
     rows = sample_prediction_context(

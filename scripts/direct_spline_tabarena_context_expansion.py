@@ -65,7 +65,7 @@ TABARENA_LITE_REGRESSION_TASK_IDS = (
 TABARENA_LITE_SUPPORTED_TASK_IDS = TABARENA_LITE_MULTICLASS_TASK_IDS + TABARENA_LITE_REGRESSION_TASK_IDS
 
 
-def frozen_config() -> dict[str, Any]:
+def frozen_config(*, training_seed: int = 0) -> dict[str, Any]:
     """Return the configuration frozen before the held-out 10+10 evaluation."""
 
     config = standard_direct_spline_config(
@@ -76,7 +76,7 @@ def frozen_config() -> dict[str, Any]:
     )
     config.update(
         {
-            "random_state": 0,
+            "random_state": int(training_seed),
             "adapter_patience": 10,
             "guard_relative_improvement": 0.005,
             "identity_regularization": 0.0,
@@ -91,6 +91,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--task-id", type=int, action="append", help="Optional TabArena-Lite task ID; repeatable.")
     parser.add_argument("--protocol-seed", type=int, default=20260910)
+    parser.add_argument(
+        "--training-seed",
+        type=int,
+        default=0,
+        help="Seed for adapter initialization and training episodes; use with --protocol-seed for a full replication.",
+    )
     parser.add_argument("--bags", type=int, default=8)
     parser.add_argument(
         "--train-context-cap",
@@ -144,6 +150,7 @@ def _manifest(args: argparse.Namespace, config: dict[str, Any]) -> dict[str, Any
         "problem_type_scope": ["multiclass", "regression"],
         "baseline_source_dirs": [str(path.resolve()) for path in args.baseline_source_dir],
         "protocol_seed": int(args.protocol_seed),
+        "training_seed": int(args.training_seed),
         "requested_bags": int(args.bags),
         "training_context_policy": {
             "maximum_rows_per_episode": int(args.train_context_cap),
@@ -233,9 +240,11 @@ def _summary(task_summaries: list[dict[str, Any]], args: argparse.Namespace) -> 
 
 
 def _existing_baseline_source(task: Any, source_dirs: list[Path]) -> Path | None:
+    """Accept both legacy baseline roots and this launcher's run directories."""
     for source_dir in source_dirs:
-        if (_standard_baseline_dir(source_dir, task) / "predictions.npz").is_file():
-            return source_dir
+        for baseline_root in (source_dir, source_dir / "full_training_reference"):
+            if (_standard_baseline_dir(baseline_root, task) / "predictions.npz").is_file():
+                return baseline_root
     return None
 
 
@@ -250,7 +259,7 @@ def main() -> None:
     args.output_dir = args.output_dir.resolve()
     if args.openml_cache_dir is not None:
         os.environ["OPENML_CACHE_DIR"] = str(args.openml_cache_dir.resolve())
-    frozen_source_config = frozen_config()
+    frozen_source_config = frozen_config(training_seed=args.training_seed)
     config = _effective_config(frozen_source_config, train_context_cap=args.train_context_cap)
     args.baseline_source_dir = [path.resolve() for path in args.baseline_source_dir]
     fingerprint = _prepare_output(args.output_dir, _manifest(args, config), resume=bool(args.resume))

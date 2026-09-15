@@ -410,7 +410,7 @@ def _make_adapters(bundle: _StandardBag, config: dict[str, Any], device: torch.d
             adapter: nn.Module = DirectSplineTransform(
                 coordinate_dummy,
                 n_control_points=int(config["n_control_points"]),
-                trainable_shape=True,
+                trainable_shape=bool(config.get("trainable_shape", True)),
                 trainable_location_scale=bool(config["trainable_location_scale"]),
                 knot_placement="uniform",
                 control_mode="monotone",

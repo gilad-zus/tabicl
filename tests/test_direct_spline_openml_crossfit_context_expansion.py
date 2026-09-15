@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 from pathlib import Path
 import sys
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
 
 
 def _load_module(name: str, filename: str):
@@ -80,6 +82,60 @@ def test_minimum_pooled_oof_blend_uses_only_crossfitted_oof_rows_and_tie_breaks_
     # alpha=.5 predicts the targets exactly. It is selected without any test
     # prediction or outer-test label being supplied to the function.
     assert selection["selected_alpha"] == 0.5
+
+
+def test_selected_adapter_weights_roundtrip_without_backbone_or_optimizer():
+    destination = io.BytesIO()
+    best = {
+        "original_a": {"step": 10, "error": 0.2, "valid": True, "state": {"shape": torch.tensor([1.0])}},
+        "original_b": {"step": 30, "error": 0.1, "valid": True, "state": {"shape": torch.tensor([2.0])}},
+    }
+    experiment._save_selected_adapters(
+        destination,
+        best=best,
+        config={"adapter_architecture": "fixed_cubic", "random_state": 123},
+        provenance={"bag": 0, "split_artifact": "bag_0.npz", "outer_split_hash": "test-split"},
+    )
+    destination.seek(0)
+    saved = torch.load(destination, map_location="cpu", weights_only=True)
+    assert set(saved) == {"adapter_checkpoint_schema_version", "config", "provenance", "checkpoints"}
+    for name, record in best.items():
+        selected = saved["checkpoints"][name]
+        assert selected["step"] == record["step"]
+        assert selected["valid"]
+        assert torch.equal(selected["state_dict"]["shape"], record["state"]["shape"])
+    assert saved["provenance"]["outer_split_hash"] == "test-split"
+
+
+def test_ablation_manifest_records_arm_sampler_and_implementation_hashes(monkeypatch):
+    source_dir = Path.cwd()
+    monkeypatch.setattr(experiment, "_sha256", lambda _path: "hash")
+    args = SimpleNamespace(
+        config_label="D",
+        protocol_seed=9,
+        bags=4,
+        reference_atol=1e-8,
+        adapter_arm="affine_mixing",
+        query_fraction_min=0.05,
+        query_fraction_max=0.2,
+    )
+    case = SimpleNamespace(task_id=1)
+    manifest = experiment._manifest(
+        source_dir=source_dir,
+        source_manifest={"immutable_run": {"repository_revision": "abc"}},
+        reference_dir=None,
+        reference_manifest=None,
+        cases=[case],
+        args=args,
+    )
+    assert manifest["adapter_arm"] == "affine_mixing"
+    assert manifest["query_fraction_range"] == [0.05, 0.2]
+    assert set(manifest["implementation_sha256"]) == {
+        "script",
+        "standard_adapter",
+        "episode_protocol",
+        "adapter_module",
+    }
 
 
 def test_reference_prediction_drift_is_diagnostic_but_indices_are_strict(tmp_path):

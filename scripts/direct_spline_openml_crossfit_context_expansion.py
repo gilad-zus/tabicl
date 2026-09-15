@@ -29,6 +29,7 @@ supplied to audit deterministic indices, array shapes, and numerical drift.
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import csv
 import gc
 import hashlib
@@ -128,6 +129,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--task-id", type=int, action="append", required=True, help="OpenML task ID. Repeatable.")
     parser.add_argument("--protocol-seed", type=int, required=True, help="Seed for inner folds and cross-fit validation halves.")
     parser.add_argument("--bags", type=int, default=None)
+    parser.add_argument(
+        "--adapter-arm",
+        choices=("source", "full_spline", "affine_mixing"),
+        default="source",
+        help="Optionally compare full nonlinear shape against shape frozen at identity.",
+    )
+    parser.add_argument("--query-fraction-min", type=float, default=None)
+    parser.add_argument("--query-fraction-max", type=float, default=None)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--classifier-checkpoint", type=Path, default=None)
     parser.add_argument("--regressor-checkpoint", type=Path, default=None)
@@ -150,6 +159,12 @@ def _parse_args() -> argparse.Namespace:
         raise ValueError("--bootstrap-rounds must be positive")
     if args.reference_atol < 0.0:
         raise ValueError("--reference-atol must be non-negative")
+    if (args.query_fraction_min is None) != (args.query_fraction_max is None):
+        raise ValueError("provide both query-fraction bounds or neither")
+    if args.query_fraction_min is not None and not (
+        0.0 < args.query_fraction_min <= args.query_fraction_max < 1.0
+    ):
+        raise ValueError("query fractions must satisfy 0 < min <= max < 1")
     return args
 
 
@@ -175,6 +190,38 @@ def _append_prediction(
         appended_context_y=np.asarray(task.y_train[appended_indices]),
         adapters=adapters,
         device=device,
+    )
+
+
+def _save_selected_adapters(
+    destination: Any,
+    *,
+    best: dict[str, dict[str, Any]],
+    config: dict[str, Any],
+    provenance: dict[str, Any],
+) -> None:
+    """Save the two selected CPU adapter states, without backbone/optimizer data.
+
+    The companion bag NPZ contains the validation and A/B row indices. Its
+    validation complement identifies the fitting rows used to reconstruct
+    preprocessing from the original outer-training data.
+    """
+    torch.save(
+        {
+            "adapter_checkpoint_schema_version": 1,
+            "config": dict(config),
+            "provenance": dict(provenance),
+            "checkpoints": {
+                name: {
+                    "step": int(record["step"]),
+                    "validation_error": float(record["error"]),
+                    "valid": bool(record["valid"]),
+                    "state_dict": record["state"],
+                }
+                for name, record in best.items()
+            },
+        },
+        destination,
     )
 
 
@@ -302,6 +349,7 @@ def _fit_context_expansion_bag(
     run_fingerprint_hash: str,
     requested_bags: int,
     effective_bags: int,
+    adapter_checkpoint_path: Path | None = None,
 ) -> ContextExpansionBagPredictions:
     """Fit on T once, then select/evaluate original and expanded contexts."""
 
@@ -346,6 +394,8 @@ def _fit_context_expansion_bag(
         task_id=task.task_id, bag=bag, split="context_expansion_test",
     )
     train_context_sizes: list[int] = []
+    train_query_sizes: list[int] = []
+    queried_rows = np.zeros(bundle.fit_labels.size, dtype=bool)
     checkpoint_records: list[dict[str, Any]] = []
     first_objective = final_objective = float("nan")
     executed_steps = 0
@@ -384,7 +434,11 @@ def _fit_context_expansion_bag(
         for step in range(1, int(config["adapter_steps"]) + 1):
             configured_context_rows = config.get("train_context_rows")
             context_row_limit = (
-                max(1, bundle.fit_labels.size - int(config["query_batch_rows"]))
+                max(
+                    1,
+                    bundle.fit_labels.size
+                    - (1 if config.get("query_fraction_min") is not None else int(config["query_batch_rows"])),
+                )
                 if configured_context_rows is None
                 else int(configured_context_rows)
             )
@@ -394,8 +448,18 @@ def _fit_context_expansion_bag(
                 context_rows=context_row_limit,
                 query_rows=int(config["query_batch_rows"]),
                 rng=episode_rng,
+                query_fraction_range=(
+                    None
+                    if config.get("query_fraction_min") is None
+                    else (
+                        float(config["query_fraction_min"]),
+                        float(config["query_fraction_max"]),
+                    )
+                ),
             )
             train_context_sizes.append(int(context_rows.size))
+            train_query_sizes.append(int(query_rows.size))
+            queried_rows[query_rows] = True
             optimizer.zero_grad(set_to_none=True)
             output = _training_logits(
                 bundle=bundle, adapters=adapters, context_indices=context_rows, query_indices=query_rows, device=device
@@ -504,10 +568,36 @@ def _fit_context_expansion_bag(
         "adapter_observed_train_context_rows_min": None if not train_context_sizes else int(min(train_context_sizes)),
         "adapter_observed_train_context_rows_max": None if not train_context_sizes else int(max(train_context_sizes)),
         "adapter_observed_train_context_rows_mean": None if not train_context_sizes else float(np.mean(train_context_sizes)),
+        "adapter_observed_train_query_rows_min": None if not train_query_sizes else int(min(train_query_sizes)),
+        "adapter_observed_train_query_rows_max": None if not train_query_sizes else int(max(train_query_sizes)),
+        "adapter_observed_train_query_rows_mean": None if not train_query_sizes else float(np.mean(train_query_sizes)),
+        "adapter_distinct_query_rows": int(queried_rows.sum()),
+        "adapter_distinct_query_row_fraction": float(queried_rows.mean()),
         "train_seconds": float(time.perf_counter() - started),
         "peak_allocated_gib": float(peak_gib),
         "run_fingerprint_hash": run_fingerprint_hash,
     }
+    if adapter_checkpoint_path is not None and adapters is not None:
+        _save_selected_adapters(
+            adapter_checkpoint_path,
+            best=best,
+            config=config,
+            provenance={
+                "task_id": int(task.task_id),
+                "dataset_id": int(task.dataset_id),
+                "outer_split_hash": str(task.outer_split_hash),
+                "run_fingerprint_hash": run_fingerprint_hash,
+                "protocol_seed": int(protocol_seed),
+                "bag": int(bag),
+                "split_artifact": f"bag_{bag}.npz",
+                "backbone_provenance_artifact": "task_provenance.json",
+                "numerical_indices": bundle.numerical_indices.tolist(),
+                "normalization_methods": list(bundle.estimator.ensemble_generator_.preprocessors_),
+                "preprocessing_policy": "Reconstruct from original outer-training data on the ascending complement of validation_indices; never refit on appended context.",
+            },
+        )
+        metadata["adapter_checkpoint_file"] = adapter_checkpoint_path.name
+        metadata["adapter_checkpoint_bytes"] = adapter_checkpoint_path.stat().st_size
     del adapters, bundle
     if device.type == "cuda":
         torch.cuda.empty_cache()
@@ -601,6 +691,12 @@ def _manifest(
         "task_ids": sorted(case.task_id for case in cases),
         "protocol_seed": int(args.protocol_seed),
         "requested_bags": args.bags,
+        "adapter_arm": str(args.adapter_arm),
+        "query_fraction_range": (
+            None
+            if args.query_fraction_min is None
+            else [float(args.query_fraction_min), float(args.query_fraction_max)]
+        ),
         "reference_atol": float(args.reference_atol),
         "fixed_arm_requirement": {"adapter_architecture": "fixed_cubic", "n_control_points": 20},
         "training": "One fixed T-only adapter trajectory per bag; checkpoints are selected under the original T-only context, then no adapter, input-preprocessor, target-scaler, or ensemble refit occurs after A/B rows are appended.",
@@ -610,6 +706,20 @@ def _manifest(
         },
         "selection": "Both context conditions reuse the same original-context-selected adapter states. Each condition selects its own alpha from its independently cross-fitted OOF predictions; exact ties choose lower alpha.",
         "label_policy": "A/B labels may enter the opposite half's ICL context but never their own OOF context; outer-test labels are read only after both condition alphas and test predictions are frozen.",
+        "implementation_sha256": {
+            "script": _sha256(Path(__file__)),
+            "standard_adapter": _sha256(
+                Path(__file__).resolve().parents[1]
+                / "src/tabicl/_experiments/direct_spline_openml_standard.py"
+            ),
+            "episode_protocol": _sha256(
+                Path(__file__).resolve().parents[1]
+                / "src/tabicl/_experiments/tabarena_direct_spline_protocol.py"
+            ),
+            "adapter_module": _sha256(
+                Path(__file__).resolve().parents[1] / "src/tabicl/_hyperspline/module.py"
+            ),
+        },
         "script_sha256": _sha256(Path(__file__)),
     }
 
@@ -710,6 +820,7 @@ def _run_task(
                 run_fingerprint_hash=fingerprint,
                 requested_bags=requested_bags,
                 effective_bags=effective_bags,
+                adapter_checkpoint_path=task_dir / f"bag_{bag}.adapters.pt",
             )
             if args.reference_crossfit_dir is not None:
                 reference_path = _task_dir(args.reference_crossfit_dir, task) / f"bag_{bag}.npz"
@@ -821,6 +932,17 @@ def main() -> None:
     cases = [case for case in cases if case.problem_type in {"multiclass", "regression"}]
     if {case.task_id for case in cases} != requested:
         raise ValueError("one or more requested task IDs are absent or not multiclass/regression D cases")
+    if args.adapter_arm != "source" or args.query_fraction_min is not None:
+        configured_cases = []
+        for case in cases:
+            config = dict(case.config)
+            if args.adapter_arm != "source":
+                config["trainable_shape"] = args.adapter_arm == "full_spline"
+            if args.query_fraction_min is not None:
+                config["query_fraction_min"] = float(args.query_fraction_min)
+                config["query_fraction_max"] = float(args.query_fraction_max)
+            configured_cases.append(replace(case, config=config))
+        cases = configured_cases
     manifest = _manifest(source_dir=source_dir, source_manifest=source_manifest, reference_dir=args.reference_crossfit_dir, reference_manifest=reference_manifest, cases=cases, args=args)
     fingerprint = _prepare_output(output_dir=args.output_dir, manifest=manifest, resume=bool(args.resume))
     task_summaries = []
