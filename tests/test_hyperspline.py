@@ -629,6 +629,43 @@ def test_direct_spline_can_isolate_location_scale_from_nonlinear_shape():
     assert affine_only.log_scale_offsets.grad is not None
 
 
+def test_direct_spline_arctan_mapping_is_matched_with_and_without_trainable_shape():
+    context = torch.zeros(1, 1, 2)
+    control = DirectSplineTransform(
+        context,
+        n_control_points=8,
+        trainable_shape=False,
+        trainable_location_scale=True,
+        coordinate_mapping="arctan",
+    )
+    spline = DirectSplineTransform(
+        context,
+        n_control_points=8,
+        trainable_shape=True,
+        trainable_location_scale=True,
+        coordinate_mapping="arctan",
+    )
+    with torch.no_grad():
+        for adapter in (control, spline):
+            adapter.location.zero_()
+            adapter.scale.fill_(1.0)
+    probe = torch.tensor([[[-100.0, -4.0], [0.0, 0.0], [4.0, 100.0]]])
+    expected = 4.0 * (2.0 / torch.pi) * torch.atan(torch.pi * probe / 8.0)
+
+    assert torch.equal(control.transform(probe), expected)
+    assert torch.equal(spline.transform(probe), expected)
+    assert control.transform(probe).abs().max() < 4.0
+    with torch.no_grad():
+        spline.gap_logits[..., 2].fill_(0.5)
+        spline.gate_logits.fill_(torch.logit(torch.tensor(0.5)))
+    assert not torch.allclose(spline.transform(probe), control.transform(probe))
+
+
+def test_direct_spline_rejects_unknown_coordinate_mapping():
+    with pytest.raises(ValueError, match="coordinate_mapping"):
+        DirectSplineTransform(torch.zeros(1, 1, 1), coordinate_mapping="cauchy")
+
+
 def test_direct_spline_low_rank_mixing_starts_at_identity_and_is_bounded():
     context = torch.randn(1, 9, 4)
     baseline = DirectSplineTransform(context, n_control_points=8, trainable_location_scale=True)

@@ -421,6 +421,7 @@ def _make_adapters(bundle: _StandardBag, config: dict[str, Any], device: torch.d
                 n_control_points=int(config["n_control_points"]),
                 trainable_shape=bool(config.get("trainable_shape", True)),
                 trainable_location_scale=bool(config["trainable_location_scale"]),
+                coordinate_mapping=str(config.get("coordinate_mapping", "linear")),
                 knot_placement="uniform",
                 control_mode="monotone",
                 cross_column_mixing_rank=int(config["cross_column_mixing_rank"]),
@@ -437,6 +438,7 @@ def _make_adapters(bundle: _StandardBag, config: dict[str, Any], device: torch.d
                 control_points_by_column=capacities,
                 trainable_shape=bool(config.get("trainable_shape", True)),
                 trainable_location_scale=bool(config["trainable_location_scale"]),
+                coordinate_mapping=str(config.get("coordinate_mapping", "linear")),
                 cross_column_mixing_rank=int(config["cross_column_mixing_rank"]),
                 cross_column_mixing_bound=float(config["cross_column_mixing_bound"]),
             ).to(device)
@@ -470,8 +472,22 @@ def _make_adapters(bundle: _StandardBag, config: dict[str, Any], device: torch.d
             else:
                 adapter.location.zero_()
                 adapter.scale.fill_(1.0)
-            if not torch.equal(adapter.transform(identity_probe), identity_probe):  # type: ignore[attr-defined]
-                raise RuntimeError("standard-pipeline DirectSpline did not initialise to bit-exact identity")
+            transformed_probe = adapter.transform(identity_probe)  # type: ignore[attr-defined]
+            coordinate_mapping = str(config.get("coordinate_mapping", "linear"))
+            if coordinate_mapping == "linear":
+                expected_probe = identity_probe
+            elif coordinate_mapping == "arctan":
+                standardized_range = float(config.get("standardized_range", 4.0))
+                expected_probe = standardized_range * (
+                    (2.0 / torch.pi)
+                    * torch.atan(torch.pi * identity_probe / (2.0 * standardized_range))
+                )
+            else:
+                raise ValueError(f"unknown DirectSpline coordinate mapping: {coordinate_mapping!r}")
+            if not torch.equal(transformed_probe, expected_probe):
+                raise RuntimeError(
+                    "standard-pipeline DirectSpline did not initialise to its declared coordinate mapping"
+                )
         adapters[method] = adapter
     return _AdapterSet(adapters)
 

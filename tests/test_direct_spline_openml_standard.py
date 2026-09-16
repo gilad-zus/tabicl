@@ -487,6 +487,25 @@ def test_standard_adapter_factory_accepts_the_frozen_adaptive_phase1_config():
         assert torch.equal(adapter.transform(probe), probe)
 
 
+def test_standard_adapter_factory_accepts_the_arctan_coordinate_mapping():
+    bundle = SimpleNamespace(
+        numerical_indices=np.array([0, 1]),
+        estimator=SimpleNamespace(ensemble_generator_=SimpleNamespace(preprocessors_=["none"])),
+    )
+    config = {
+        **standard_direct_spline_config(),
+        "coordinate_mapping": "arctan",
+        "trainable_shape": False,
+        "cross_column_mixing_rank": 0,
+    }
+
+    adapters = _make_adapters(bundle, config, torch.device("cpu"))
+    probe = torch.tensor([[[-4.0, 0.0], [1.0, 100.0]]])
+    expected = 4.0 * (2.0 / torch.pi) * torch.atan(torch.pi * probe / 8.0)
+
+    assert torch.equal(adapters.for_method("none").transform(probe), expected)
+
+
 def test_standard_runner_checks_public_identity_and_preserves_prediction_shapes():
     rows = 32
     features = pd.DataFrame(

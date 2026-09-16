@@ -116,6 +116,7 @@ def test_ablation_manifest_records_arm_sampler_and_implementation_hashes(monkeyp
         bags=4,
         reference_atol=1e-8,
         adapter_arm="affine_mixing",
+        coordinate_mapping="arctan",
         query_fraction_min=0.05,
         query_fraction_max=0.2,
         column_control_points=(4, 20, 4),
@@ -130,6 +131,7 @@ def test_ablation_manifest_records_arm_sampler_and_implementation_hashes(monkeyp
         args=args,
     )
     assert manifest["adapter_arm"] == "affine_mixing"
+    assert manifest["coordinate_mapping"] == "arctan"
     assert manifest["query_fraction_range"] == [0.05, 0.2]
     assert manifest["column_control_points"] == [4, 20, 4]
     assert set(manifest["implementation_sha256"]) == {

@@ -135,6 +135,15 @@ def _parse_args() -> argparse.Namespace:
         default="source",
         help="Optionally compare full nonlinear shape against shape frozen at identity.",
     )
+    parser.add_argument(
+        "--coordinate-mapping",
+        choices=("linear", "arctan"),
+        default="linear",
+        help=(
+            "Coordinate map applied after learned location/scale and before the spline. "
+            "Arctan is smooth, bounded, and has unit derivative at zero."
+        ),
+    )
     parser.add_argument("--query-fraction-min", type=float, default=None)
     parser.add_argument("--query-fraction-max", type=float, default=None)
     parser.add_argument(
@@ -703,6 +712,7 @@ def _manifest(
         "protocol_seed": int(args.protocol_seed),
         "requested_bags": args.bags,
         "adapter_arm": str(args.adapter_arm),
+        "coordinate_mapping": str(getattr(args, "coordinate_mapping", "linear")),
         "query_fraction_range": (
             None
             if args.query_fraction_min is None
@@ -955,6 +965,7 @@ def main() -> None:
         _validate_case(case)
     if (
         args.adapter_arm != "source"
+        or args.coordinate_mapping != "linear"
         or args.query_fraction_min is not None
         or args.column_control_points is not None
     ):
@@ -963,6 +974,7 @@ def main() -> None:
             config = dict(case.config)
             if args.adapter_arm != "source":
                 config["trainable_shape"] = args.adapter_arm == "full_spline"
+            config["coordinate_mapping"] = str(args.coordinate_mapping)
             if args.query_fraction_min is not None:
                 config["query_fraction_min"] = float(args.query_fraction_min)
                 config["query_fraction_max"] = float(args.query_fraction_max)

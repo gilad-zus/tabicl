@@ -781,6 +781,7 @@ class DirectSplineTransform(nn.Module):
         trainable_shape: bool = True,
         trainable_range: bool = False,
         trainable_location_scale: bool = False,
+        coordinate_mapping: str = "linear",
         knot_placement: str = "uniform",
         control_mode: str = "monotone",
         free_control_bound: float = 1.0,
@@ -801,6 +802,8 @@ class DirectSplineTransform(nn.Module):
             raise ValueError("DirectSplineTransform fixes cubic degree=3 unless allow_non_cubic=True")
         if knot_placement not in {"uniform", "quantile", "learned"}:
             raise ValueError("knot_placement must be one of: uniform, quantile, learned")
+        if coordinate_mapping not in {"linear", "arctan"}:
+            raise ValueError("coordinate_mapping must be one of: linear, arctan")
         if control_mode not in {"monotone", "free"}:
             raise ValueError("control_mode must be one of: monotone, free")
         if free_control_bound <= 0:
@@ -815,6 +818,7 @@ class DirectSplineTransform(nn.Module):
         self.trainable_shape = trainable_shape
         self.trainable_range = trainable_range
         self.trainable_location_scale = trainable_location_scale
+        self.coordinate_mapping = coordinate_mapping
         self.knot_placement = knot_placement
         self.control_mode = control_mode
         self.free_control_bound = free_control_bound
@@ -1073,7 +1077,18 @@ class DirectSplineTransform(nn.Module):
         params = self.parameters_for_transform()
         _, _, standardized_range = self._location_scale_range()
         z = (x.float() - params.location.unsqueeze(1)) / params.scale.unsqueeze(1)
-        u = (z / standardized_range.unsqueeze(1)).clamp(-1.0, 1.0)
+        expanded_range = standardized_range.unsqueeze(1)
+        if self.coordinate_mapping == "linear":
+            base = z
+            u = (z / expanded_range).clamp(-1.0, 1.0)
+        else:
+            # A smooth, globally defined alternative to the hard-clamped
+            # spline coordinate.  The scale factor makes the map locally
+            # identity: d/dz [2R/pi * atan(pi*z/(2R))] at z=0 is exactly 1.
+            # Both the shape-frozen and learned-spline arms use this same
+            # bounded base representation, isolating the spline residual.
+            u = (2.0 / torch.pi) * torch.atan(torch.pi * z / (2.0 * expanded_range))
+            base = expanded_range * u
         knots = self.knots_for_transform()
         identity_controls = greville_abscissae(knots, self.degree, params.control_points.shape[-1])
         # B-spline evaluation is linear in its controls.  Evaluating only the
@@ -1087,7 +1102,7 @@ class DirectSplineTransform(nn.Module):
             knots,
             self.degree,
         )
-        return z + params.gate.unsqueeze(1) * standardized_range.unsqueeze(1) * spline_residual
+        return base + params.gate.unsqueeze(1) * expanded_range * spline_residual
 
     def transform(self, x: torch.Tensor) -> torch.Tensor:
         output = self.unmixed_transform(x)
@@ -1116,6 +1131,7 @@ class HeterogeneousDirectSplineTransform(nn.Module):
         standardized_range: float = 4.0,
         trainable_shape: bool = True,
         trainable_location_scale: bool = False,
+        coordinate_mapping: str = "linear",
         cross_column_mixing_rank: int = 0,
         cross_column_mixing_bound: float = 0.1,
     ) -> None:
@@ -1132,6 +1148,7 @@ class HeterogeneousDirectSplineTransform(nn.Module):
         self.control_points_by_column = capacities
         self.degree = int(degree)
         self.standardized_range = float(standardized_range)
+        self.coordinate_mapping = str(coordinate_mapping)
         self.cross_column_mixing_rank = min(int(cross_column_mixing_rank), x_context.shape[2])
         self.cross_column_mixing_bound = float(cross_column_mixing_bound)
         self.columns = nn.ModuleList(
@@ -1142,6 +1159,7 @@ class HeterogeneousDirectSplineTransform(nn.Module):
                 standardized_range=standardized_range,
                 trainable_shape=trainable_shape,
                 trainable_location_scale=trainable_location_scale,
+                coordinate_mapping=coordinate_mapping,
                 knot_placement="uniform",
                 control_mode="monotone",
                 cross_column_mixing_rank=0,
