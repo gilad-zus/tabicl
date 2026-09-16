@@ -782,7 +782,6 @@ def _condition_record(
 def _run_task(
     *, case: SourceCase, task: OpenMLTaskData, output_dir: Path, args: argparse.Namespace, fingerprint: str
 ) -> dict[str, Any]:
-    _validate_case(case)
     requested_bags = case.requested_bags if args.bags is None else int(args.bags)
     splits = list(_bag_splits(task, requested_bags=requested_bags, seed=_seed(args.protocol_seed, task.task_id, 0)))
     effective_bags = effective_inner_bag_count(task, requested_bags=requested_bags)
@@ -948,6 +947,12 @@ def main() -> None:
     cases = [case for case in cases if case.problem_type in {"multiclass", "regression"}]
     if {case.task_id for case in cases} != requested:
         raise ValueError("one or more requested task IDs are absent or not multiclass/regression D cases")
+    # Validate the immutable source arm before applying an explicitly requested
+    # experimental adapter override.  Validating the replaced config would
+    # incorrectly reject the heterogeneous diagnostic for not itself being the
+    # fixed-cubic K20 source from which all other protocol settings are inherited.
+    for case in cases:
+        _validate_case(case)
     if (
         args.adapter_arm != "source"
         or args.query_fraction_min is not None
