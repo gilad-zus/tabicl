@@ -3,6 +3,7 @@
 from .module import (
     AdaptiveDirectSplineTransform,
     DirectSplineTransform,
+    HeterogeneousDirectSplineTransform,
     FrozenTabICLHyperSpline,
     HyperSplineParameters,
     HyperSplineTransform,
@@ -15,6 +16,7 @@ __all__ = [
     "AdaptiveDirectSplineTransform",
     "backbone_state_dict_hash",
     "DirectSplineTransform",
+    "HeterogeneousDirectSplineTransform",
     "FrozenTabICLHyperSpline",
     "HyperSplineParameters",
     "HyperSplineTransform",

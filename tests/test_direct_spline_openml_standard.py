@@ -39,7 +39,11 @@ from tabicl._experiments.direct_spline_openml_standard import (
     summarize_validation_selected_full_refit_experiment,
     summarize_validation_selected_full_refit_task,
 )
-from tabicl._hyperspline import AdaptiveDirectSplineTransform, DirectSplineTransform
+from tabicl._hyperspline import (
+    AdaptiveDirectSplineTransform,
+    DirectSplineTransform,
+    HeterogeneousDirectSplineTransform,
+)
 from tabicl._model.inference_config import InferenceConfig
 from tabicl._model.tabicl import TabICL
 
@@ -151,6 +155,59 @@ def test_standard_config_accepts_explicit_adapter_schedule():
     assert config["adapter_steps"] == 500
     assert config["adapter_patience"] == 10
     assert config["validation_interval"] == 10
+
+
+def test_heterogeneous_direct_spline_is_exact_identity_and_trains_declared_capacities():
+    support = torch.zeros(1, 1, 3)
+    adapter = HeterogeneousDirectSplineTransform(
+        support,
+        control_points_by_column=(4, 20, 4),
+        trainable_location_scale=True,
+        cross_column_mixing_rank=3,
+    )
+    adapter.use_standard_coordinates()
+    probe = torch.tensor([[[-5.0, -1.25, 0.0], [0.5, 2.0, 5.0]]])
+
+    assert adapter.control_points_by_column == (4, 20, 4)
+    assert [column.gap_logits.shape[-1] + 1 for column in adapter.columns] == [4, 20, 4]
+    assert torch.equal(adapter.transform(probe), probe)
+    adapter.transform(probe).sum().backward()
+    assert all(column.gap_logits.grad is not None for column in adapter.columns)
+
+
+def test_heterogeneous_all20_matches_the_fixed_adapter_mapping():
+    support = torch.zeros(1, 1, 3)
+    torch.manual_seed(17)
+    fixed = DirectSplineTransform(
+        support,
+        n_control_points=20,
+        trainable_location_scale=True,
+        cross_column_mixing_rank=3,
+    )
+    torch.manual_seed(17)
+    heterogeneous = HeterogeneousDirectSplineTransform(
+        support,
+        control_points_by_column=(20, 20, 20),
+        trainable_location_scale=True,
+        cross_column_mixing_rank=3,
+    )
+    with torch.no_grad():
+        fixed.gap_logits.normal_(0.0, 0.2)
+        fixed.gate_logits.normal_(-1.0, 0.2)
+        fixed.location_offsets.normal_(0.0, 0.1)
+        fixed.log_scale_offsets.normal_(0.0, 0.1)
+        for index, column in enumerate(heterogeneous.columns):
+            column.gap_logits.copy_(fixed.gap_logits[..., index : index + 1, :])
+            column.gate_logits.copy_(fixed.gate_logits[..., index : index + 1])
+            column.location_offsets.copy_(fixed.location_offsets[..., index : index + 1])
+            column.log_scale_offsets.copy_(fixed.log_scale_offsets[..., index : index + 1])
+        heterogeneous.mixing_left.copy_(fixed.mixing_left)
+        heterogeneous.mixing_right.copy_(fixed.mixing_right)
+        heterogeneous.mixing_weight_logits.copy_(fixed.mixing_weight_logits)
+        heterogeneous.mixing_gate.copy_(fixed.mixing_gate)
+    probe = torch.randn(1, 19, 3)
+
+    assert torch.allclose(heterogeneous.transform(probe), fixed.transform(probe), atol=1e-7, rtol=1e-6)
 
 
 def test_validation_selected_split_is_deterministic_disjoint_and_stratified():

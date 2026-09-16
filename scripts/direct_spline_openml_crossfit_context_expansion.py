@@ -137,6 +137,11 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--query-fraction-min", type=float, default=None)
     parser.add_argument("--query-fraction-max", type=float, default=None)
+    parser.add_argument(
+        "--column-control-points",
+        default=None,
+        help="Comma-separated cubic control-point counts, one per numerical column.",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--classifier-checkpoint", type=Path, default=None)
     parser.add_argument("--regressor-checkpoint", type=Path, default=None)
@@ -165,6 +170,12 @@ def _parse_args() -> argparse.Namespace:
         0.0 < args.query_fraction_min <= args.query_fraction_max < 1.0
     ):
         raise ValueError("query fractions must satisfy 0 < min <= max < 1")
+    if args.column_control_points is not None:
+        args.column_control_points = tuple(
+            int(item.strip()) for item in args.column_control_points.split(",") if item.strip()
+        )
+        if not args.column_control_points or any(value <= 3 for value in args.column_control_points):
+            raise ValueError("column control-point counts must all exceed cubic degree 3")
     return args
 
 
@@ -697,6 +708,11 @@ def _manifest(
             if args.query_fraction_min is None
             else [float(args.query_fraction_min), float(args.query_fraction_max)]
         ),
+        "column_control_points": (
+            None
+            if args.column_control_points is None
+            else list(args.column_control_points)
+        ),
         "reference_atol": float(args.reference_atol),
         "fixed_arm_requirement": {"adapter_architecture": "fixed_cubic", "n_control_points": 20},
         "training": "One fixed T-only adapter trajectory per bag; checkpoints are selected under the original T-only context, then no adapter, input-preprocessor, target-scaler, or ensemble refit occurs after A/B rows are appended.",
@@ -932,7 +948,11 @@ def main() -> None:
     cases = [case for case in cases if case.problem_type in {"multiclass", "regression"}]
     if {case.task_id for case in cases} != requested:
         raise ValueError("one or more requested task IDs are absent or not multiclass/regression D cases")
-    if args.adapter_arm != "source" or args.query_fraction_min is not None:
+    if (
+        args.adapter_arm != "source"
+        or args.query_fraction_min is not None
+        or args.column_control_points is not None
+    ):
         configured_cases = []
         for case in cases:
             config = dict(case.config)
@@ -941,6 +961,9 @@ def main() -> None:
             if args.query_fraction_min is not None:
                 config["query_fraction_min"] = float(args.query_fraction_min)
                 config["query_fraction_max"] = float(args.query_fraction_max)
+            if args.column_control_points is not None:
+                config["adapter_architecture"] = "heterogeneous_fixed_cubic"
+                config["column_control_points"] = list(args.column_control_points)
             configured_cases.append(replace(case, config=config))
         cases = configured_cases
     manifest = _manifest(source_dir=source_dir, source_manifest=source_manifest, reference_dir=args.reference_crossfit_dir, reference_manifest=reference_manifest, cases=cases, args=args)

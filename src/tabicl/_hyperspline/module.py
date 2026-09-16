@@ -1097,6 +1097,143 @@ class DirectSplineTransform(nn.Module):
         return output.to(x.dtype)
 
 
+class HeterogeneousDirectSplineTransform(nn.Module):
+    """Independent cubic DirectSplines with a fixed capacity per column.
+
+    This is a diagnostic architecture: unlike :class:`AdaptiveDirectSplineTransform`,
+    it has no router or extra experts.  Each numerical column owns exactly one
+    DirectSpline with the predeclared number of control points, while the affine
+    residuals and final low-rank cross-column mixing have the same form as the
+    ordinary fixed-capacity adapter.
+    """
+
+    def __init__(
+        self,
+        x_context: torch.Tensor,
+        *,
+        control_points_by_column: tuple[int, ...],
+        degree: int = 3,
+        standardized_range: float = 4.0,
+        trainable_shape: bool = True,
+        trainable_location_scale: bool = False,
+        cross_column_mixing_rank: int = 0,
+        cross_column_mixing_bound: float = 0.1,
+    ) -> None:
+        super().__init__()
+        if x_context.ndim != 3:
+            raise ValueError("x_context must have shape (B, N, D)")
+        capacities = tuple(int(value) for value in control_points_by_column)
+        if len(capacities) != x_context.shape[2]:
+            raise ValueError("control_points_by_column must contain one value per column")
+        if any(value <= degree for value in capacities):
+            raise ValueError("every column requires n_control_points > degree")
+        if cross_column_mixing_rank < 0 or cross_column_mixing_bound < 0:
+            raise ValueError("cross-column mixing rank and bound must be non-negative")
+        self.control_points_by_column = capacities
+        self.degree = int(degree)
+        self.standardized_range = float(standardized_range)
+        self.cross_column_mixing_rank = min(int(cross_column_mixing_rank), x_context.shape[2])
+        self.cross_column_mixing_bound = float(cross_column_mixing_bound)
+        self.columns = nn.ModuleList(
+            DirectSplineTransform(
+                x_context[..., index : index + 1],
+                n_control_points=capacity,
+                degree=degree,
+                standardized_range=standardized_range,
+                trainable_shape=trainable_shape,
+                trainable_location_scale=trainable_location_scale,
+                knot_placement="uniform",
+                control_mode="monotone",
+                cross_column_mixing_rank=0,
+                cross_column_mixing_bound=cross_column_mixing_bound,
+            )
+            for index, capacity in enumerate(capacities)
+        )
+        if self.cross_column_mixing_rank:
+            factor_shape = (x_context.shape[0], x_context.shape[2], self.cross_column_mixing_rank)
+            self.mixing_left = nn.Parameter(torch.randn(factor_shape) * 0.02)
+            self.mixing_right = nn.Parameter(torch.randn(factor_shape) * 0.02)
+            self.mixing_weight_logits = nn.Parameter(
+                torch.full(
+                    (x_context.shape[0], self.cross_column_mixing_rank),
+                    torch.atanh(torch.tensor(0.5)),
+                )
+            )
+            self.mixing_gate = nn.Parameter(torch.zeros(x_context.shape[0], x_context.shape[2]))
+        else:
+            self.register_parameter("mixing_left", None)
+            self.register_parameter("mixing_right", None)
+            self.register_parameter("mixing_weight_logits", None)
+            self.register_parameter("mixing_gate", None)
+
+    @torch.no_grad()
+    def use_standard_coordinates(self) -> None:
+        """Make every column consume the existing preprocessor coordinates."""
+
+        for column in self.columns:
+            column.location.zero_()
+            column.scale.fill_(1.0)
+
+    def mixing_matrix(self) -> torch.Tensor | None:
+        if self.mixing_left is None or self.mixing_right is None:
+            return None
+        left, _ = torch.linalg.qr(self.mixing_left, mode="reduced")
+        right, _ = torch.linalg.qr(self.mixing_right, mode="reduced")
+        weights = torch.tanh(self.mixing_weight_logits)
+        return torch.matmul(left * weights.unsqueeze(-2), right.transpose(-1, -2))
+
+    def effective_mixing_matrix(self) -> torch.Tensor | None:
+        mixing = self.mixing_matrix()
+        if mixing is None:
+            return None
+        return self.cross_column_mixing_bound * torch.tanh(self.mixing_gate).unsqueeze(-2) * mixing
+
+    def mixing_diagnostics(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        effective = self.effective_mixing_matrix()
+        if effective is None:
+            zero = next(self.parameters()).new_zeros(())
+            return zero, zero, zero
+        gate = self.cross_column_mixing_bound * torch.tanh(self.mixing_gate)
+        return gate.abs().mean(), gate.abs().max(), torch.linalg.matrix_norm(effective, ord=2).amax()
+
+    def unmixed_transform(self, x: torch.Tensor) -> torch.Tensor:
+        if x.shape[-1] != len(self.columns):
+            raise ValueError("input column count differs from the configured capacities")
+        return torch.cat(
+            [column.unmixed_transform(x[..., index : index + 1]) for index, column in enumerate(self.columns)],
+            dim=-1,
+        )
+
+    def transform(self, x: torch.Tensor) -> torch.Tensor:
+        output = self.unmixed_transform(x)
+        effective = self.effective_mixing_matrix()
+        if effective is not None:
+            output = output + torch.matmul(output, effective)
+        return output.to(x.dtype)
+
+    @torch.no_grad()
+    def checkpoint_diagnostics(self) -> dict[str, float]:
+        probe = torch.linspace(
+            -self.standardized_range,
+            self.standardized_range,
+            33,
+            device=next(self.parameters()).device,
+        ).view(1, -1, 1).expand(-1, -1, len(self.columns))
+        output = self.transform(probe)
+        gates = torch.cat([torch.sigmoid(column.gate_logits).flatten() for column in self.columns])
+        locations = torch.cat([column._location_scale_range()[0].flatten() for column in self.columns])
+        scales = torch.cat([column._location_scale_range()[1].flatten() for column in self.columns])
+        _mean_mixing, _max_mixing, mixing_spectral = self.mixing_diagnostics()
+        return {
+            "grid_deformation": float((output - probe).square().mean()),
+            "mean_gate": float(gates.mean()),
+            "max_gate": float(gates.max()),
+            "mean_abs_location": float(locations.abs().mean()),
+            "mean_abs_log_scale": float(scales.log().abs().mean()),
+            "mixing_spectral_norm": float(mixing_spectral),
+        }
+
+
 class AdaptiveDirectSplineTransform(nn.Module):
     """A per-column mixture of small, medium, and flexible DirectSplines.
 

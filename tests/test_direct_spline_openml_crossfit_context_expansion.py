@@ -118,6 +118,7 @@ def test_ablation_manifest_records_arm_sampler_and_implementation_hashes(monkeyp
         adapter_arm="affine_mixing",
         query_fraction_min=0.05,
         query_fraction_max=0.2,
+        column_control_points=(4, 20, 4),
     )
     case = SimpleNamespace(task_id=1)
     manifest = experiment._manifest(
@@ -130,6 +131,7 @@ def test_ablation_manifest_records_arm_sampler_and_implementation_hashes(monkeyp
     )
     assert manifest["adapter_arm"] == "affine_mixing"
     assert manifest["query_fraction_range"] == [0.05, 0.2]
+    assert manifest["column_control_points"] == [4, 20, 4]
     assert set(manifest["implementation_sha256"]) == {
         "script",
         "standard_adapter",

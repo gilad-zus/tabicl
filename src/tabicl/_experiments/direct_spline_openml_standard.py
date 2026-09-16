@@ -69,7 +69,11 @@ from tabicl._experiments.direct_spline_protocol import (
     sample_episode_indices,
     sample_prediction_context,
 )
-from tabicl._hyperspline import AdaptiveDirectSplineTransform, DirectSplineTransform
+from tabicl._hyperspline import (
+    AdaptiveDirectSplineTransform,
+    DirectSplineTransform,
+    HeterogeneousDirectSplineTransform,
+)
 from tabicl._model.attention import flash_attn3_toggle
 from tabicl._model.tabicl import TabICL
 
@@ -393,9 +397,14 @@ def _make_adapters(bundle: _StandardBag, config: dict[str, Any], device: torch.d
     adapters: OrderedDict[str, nn.Module] = OrderedDict()
     n_numerical = int(bundle.numerical_indices.size)
     architecture = str(config.get("adapter_architecture", "fixed_cubic"))
-    if architecture not in {"fixed_cubic", "adaptive_columns", "conditional_adaptive_columns"}:
+    if architecture not in {
+        "fixed_cubic",
+        "heterogeneous_fixed_cubic",
+        "adaptive_columns",
+        "conditional_adaptive_columns",
+    }:
         raise ValueError(f"unknown DirectSpline adapter architecture: {architecture!r}")
-    if architecture != "fixed_cubic" and float(config.get("identity_regularization", 0.0)) != 0.0:
+    if architecture not in {"fixed_cubic"} and float(config.get("identity_regularization", 0.0)) != 0.0:
         raise ValueError("adaptive DirectSpline phase-1 arms require identity_regularization=0")
     # Standard preprocessing already defines the coordinates consumed by
     # TabICL.  DirectSpline's context statistics are therefore deliberately
@@ -414,6 +423,20 @@ def _make_adapters(bundle: _StandardBag, config: dict[str, Any], device: torch.d
                 trainable_location_scale=bool(config["trainable_location_scale"]),
                 knot_placement="uniform",
                 control_mode="monotone",
+                cross_column_mixing_rank=int(config["cross_column_mixing_rank"]),
+                cross_column_mixing_bound=float(config["cross_column_mixing_bound"]),
+            ).to(device)
+        elif architecture == "heterogeneous_fixed_cubic":
+            capacities = tuple(int(value) for value in config["column_control_points"])
+            if len(capacities) != n_numerical:
+                raise ValueError(
+                    f"column_control_points has {len(capacities)} values for {n_numerical} numerical columns"
+                )
+            adapter = HeterogeneousDirectSplineTransform(
+                coordinate_dummy,
+                control_points_by_column=capacities,
+                trainable_shape=bool(config.get("trainable_shape", True)),
+                trainable_location_scale=bool(config["trainable_location_scale"]),
                 cross_column_mixing_rank=int(config["cross_column_mixing_rank"]),
                 cross_column_mixing_bound=float(config["cross_column_mixing_bound"]),
             ).to(device)
@@ -442,6 +465,8 @@ def _make_adapters(bundle: _StandardBag, config: dict[str, Any], device: torch.d
                 for expert in adapter.experts:
                     expert.location.zero_()
                     expert.scale.fill_(1.0)
+            elif isinstance(adapter, HeterogeneousDirectSplineTransform):
+                adapter.use_standard_coordinates()
             else:
                 adapter.location.zero_()
                 adapter.scale.fill_(1.0)
