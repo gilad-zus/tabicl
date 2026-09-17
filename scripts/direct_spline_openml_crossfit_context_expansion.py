@@ -146,6 +146,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--query-fraction-min", type=float, default=None)
     parser.add_argument("--query-fraction-max", type=float, default=None)
+    parser.add_argument("--adapter-steps", type=int, default=None)
     parser.add_argument(
         "--column-control-points",
         default=None,
@@ -155,6 +156,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--classifier-checkpoint", type=Path, default=None)
     parser.add_argument("--regressor-checkpoint", type=Path, default=None)
     parser.add_argument("--openml-cache-dir", type=Path, default=None)
+    parser.add_argument(
+        "--initial-adapter-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Optional completed direct-line run. Each continuation trajectory starts from "
+            "the corresponding A- or B-selected line checkpoint saved for the same task/bag."
+        ),
+    )
     parser.add_argument("--bootstrap-rounds", type=int, default=1_000)
     parser.add_argument("--bootstrap-seed", type=int, default=20260907)
     parser.add_argument(
@@ -171,6 +181,8 @@ def _parse_args() -> argparse.Namespace:
         raise ValueError("--bags must be at least two")
     if args.bootstrap_rounds < 1:
         raise ValueError("--bootstrap-rounds must be positive")
+    if args.adapter_steps is not None and args.adapter_steps < 1:
+        raise ValueError("--adapter-steps must be positive")
     if args.reference_atol < 0.0:
         raise ValueError("--reference-atol must be non-negative")
     if (args.query_fraction_min is None) != (args.query_fraction_max is None):
@@ -370,6 +382,7 @@ def _fit_context_expansion_bag(
     requested_bags: int,
     effective_bags: int,
     adapter_checkpoint_path: Path | None = None,
+    initial_adapter_checkpoint_path: Path | None = None,
 ) -> ContextExpansionBagPredictions:
     """Fit on T once, then select/evaluate original and expanded contexts."""
 
@@ -423,6 +436,7 @@ def _fit_context_expansion_bag(
     checkpoint_records: list[dict[str, Any]] = []
     first_objective = final_objective = float("nan")
     executed_steps = 0
+    total_trajectory_steps = 0
     if adapters is None:
         original_identity_a = _normal_prediction(bundle=bundle, query_x=selection_a_x, context_indices=bundle.support_indices, adapters=None, device=device)
         original_identity_b = _normal_prediction(bundle=bundle, query_x=selection_b_x, context_indices=bundle.support_indices, adapters=None, device=device)
@@ -443,56 +457,141 @@ def _fit_context_expansion_bag(
             for key in ("original_a", "original_b")
         }
     else:
-        optimizer = _optimizer(adapters, config)
-        scheduler = None if config.get("cosine_schedule_steps") is None else _cosine_scheduler(
+        initial_checkpoint = None
+        if initial_adapter_checkpoint_path is not None:
+            if not initial_adapter_checkpoint_path.is_file():
+                raise FileNotFoundError(
+                    f"missing staged initial adapter checkpoint: {initial_adapter_checkpoint_path}"
+                )
+            initial_checkpoint = torch.load(
+                initial_adapter_checkpoint_path, map_location="cpu", weights_only=True
+            )
+            provenance = initial_checkpoint.get("provenance", {})
+            if int(provenance.get("task_id", -1)) != int(task.task_id) or int(
+                provenance.get("bag", -1)
+            ) != int(bag):
+                raise ValueError("staged initial checkpoint task/bag provenance mismatch")
+            if str(provenance.get("outer_split_hash", "")) != str(task.outer_split_hash):
+                raise ValueError("staged initial checkpoint outer split mismatch")
+            if int(provenance.get("protocol_seed", -1)) != int(protocol_seed):
+                raise ValueError("staged initial checkpoint protocol seed mismatch")
+            initial_config = initial_checkpoint.get("config", {})
+            if not bool(initial_config.get("direct_spline_output")) or bool(
+                initial_config.get("trainable_shape")
+            ):
+                raise ValueError("staged continuation requires checkpoints from a direct-line arm")
+            matched_config_fields = (
+                "adapter_architecture",
+                "n_control_points",
+                "coordinate_mapping",
+                "query_fraction_min",
+                "query_fraction_max",
+                "random_state",
+                "cross_column_mixing_rank",
+                "cross_column_mixing_bound",
+            )
+            mismatched = [
+                name
+                for name in matched_config_fields
+                if initial_config.get(name) != config.get(name)
+            ]
+            if mismatched:
+                raise ValueError(
+                    "staged continuation changed initial-line semantics: " + ", ".join(mismatched)
+                )
+
+        optimizer = None if initial_checkpoint is not None else _optimizer(adapters, config)
+        scheduler = None if optimizer is None or config.get("cosine_schedule_steps") is None else _cosine_scheduler(
             optimizer,
             total_steps=int(config["cosine_schedule_steps"]),
             min_lr_ratio=float(config["cosine_min_lr_ratio"]),
         )
-        episode_rng = np.random.default_rng(_seed(int(config["random_state"]), task.task_id, bag, 203))
         identity_state = _cpu_state_dict(adapters)
-        best = {
-            key: {"step": 0, "error": float("inf"), "valid": False, "state": identity_state}
-            for key in ("original_a", "original_b")
-        }
-        for step in range(1, int(config["adapter_steps"]) + 1):
-            configured_context_rows = config.get("train_context_rows")
-            context_row_limit = (
-                max(
-                    1,
-                    bundle.fit_labels.size
-                    - (1 if config.get("query_fraction_min") is not None else int(config["query_batch_rows"])),
+        best = {key: {"step": 0, "error": float("inf"), "valid": False, "state": identity_state} for key in ("original_a", "original_b")}
+
+        def train_trajectory(*, target_name: str | None = None) -> tuple[float, float, int]:
+            nonlocal adapters, optimizer, scheduler, best, checkpoint_records
+            if target_name is not None:
+                source_record = initial_checkpoint["checkpoints"][target_name]
+                adapters.load_state_dict(source_record["state_dict"], strict=True)
+                optimizer = _optimizer(adapters, config)
+                scheduler = None if config.get("cosine_schedule_steps") is None else _cosine_scheduler(
+                    optimizer,
+                    total_steps=int(config["cosine_schedule_steps"]),
+                    min_lr_ratio=float(config["cosine_min_lr_ratio"]),
                 )
-                if configured_context_rows is None
-                else int(configured_context_rows)
-            )
-            context_rows, query_rows = sample_episode_indices(
-                bundle.fit_labels,
-                problem_type=task.problem_type,
-                context_rows=context_row_limit,
-                query_rows=int(config["query_batch_rows"]),
-                rng=episode_rng,
-                query_fraction_range=(
-                    None
-                    if config.get("query_fraction_min") is None
-                    else (
-                        float(config["query_fraction_min"]),
-                        float(config["query_fraction_max"]),
+            assert optimizer is not None
+            local_rng = np.random.default_rng(_seed(int(config["random_state"]), task.task_id, bag, 203))
+            target_names = (target_name,) if target_name is not None else ("original_a", "original_b")
+            labels = {"original_a": selection_a_y, "original_b": selection_b_y}
+            query_x = {"original_a": selection_a_x, "original_b": selection_b_x}
+            # The inherited line checkpoint is a real candidate. This makes the
+            # continuation non-degrading on its own selection half.
+            if target_name is not None:
+                prediction = _normal_prediction(
+                    bundle=bundle, query_x=query_x[target_name],
+                    context_indices=bundle.support_indices, adapters=adapters, device=device,
+                )
+                error = _candidate_deployment_error(
+                    task.problem_type, labels[target_name], prediction, n_classes=task.n_classes
+                )
+                best[target_name] = {
+                    "step": 0, "error": float(error), "valid": True,
+                    "state": _cpu_state_dict(adapters),
+                }
+                checkpoint_records.append({
+                    "trajectory": target_name, "step": 0,
+                    f"{target_name}_error": float(error),
+                    "learning_rates": [float(group["lr"]) for group in optimizer.param_groups],
+                })
+            local_first = local_final = float("nan")
+            local_executed = 0
+            for step in range(1, int(config["adapter_steps"]) + 1):
+                configured_context_rows = config.get("train_context_rows")
+                context_row_limit = (
+                    max(
+                        1,
+                        bundle.fit_labels.size
+                        - (
+                            1
+                            if config.get("query_fraction_min") is not None
+                            else int(config["query_batch_rows"])
+                        ),
                     )
-                ),
-            )
-            train_context_sizes.append(int(context_rows.size))
-            train_query_sizes.append(int(query_rows.size))
-            queried_rows[query_rows] = True
-            optimizer.zero_grad(set_to_none=True)
-            output = _training_logits(
-                bundle=bundle, adapters=adapters, context_indices=context_rows, query_indices=query_rows, device=device
-            )
-            target = torch.as_tensor(bundle.fit_labels[query_rows], device=device)
-            if task.problem_type == "regression":
-                objective = F.mse_loss(output.flatten(), target.float().flatten())
-            else:
-                objective = _classification_training_objective_from_logits(
+                    if configured_context_rows is None
+                    else int(configured_context_rows)
+                )
+                context_rows, query_rows = sample_episode_indices(
+                    bundle.fit_labels,
+                    problem_type=task.problem_type,
+                    context_rows=context_row_limit,
+                    query_rows=int(config["query_batch_rows"]),
+                    rng=local_rng,
+                    query_fraction_range=(
+                        None
+                        if config.get("query_fraction_min") is None
+                        else (
+                            float(config["query_fraction_min"]),
+                            float(config["query_fraction_max"]),
+                        )
+                    ),
+                )
+                train_context_sizes.append(int(context_rows.size))
+                train_query_sizes.append(int(query_rows.size))
+                queried_rows[query_rows] = True
+                optimizer.zero_grad(set_to_none=True)
+                output = _training_logits(
+                    bundle=bundle,
+                    adapters=adapters,
+                    context_indices=context_rows,
+                    query_indices=query_rows,
+                    device=device,
+                )
+                target = torch.as_tensor(bundle.fit_labels[query_rows], device=device)
+                if task.problem_type == "regression":
+                    objective = F.mse_loss(output.flatten(), target.float().flatten())
+                else:
+                    objective = _classification_training_objective_from_logits(
                     logits=output,
                     target=target,
                     problem_type=task.problem_type,
@@ -500,41 +599,57 @@ def _fit_context_expansion_bag(
                     softmax_temperature=float(bundle.estimator.softmax_temperature),
                     config=config,
                 )
-            if not torch.isfinite(objective):
+                if not torch.isfinite(objective):
+                    del output, target, objective
+                    break
+                if step == 1:
+                    local_first = float(objective.detach())
+                objective.backward()
+                torch.nn.utils.clip_grad_norm_(adapters.parameters(), float(config["grad_clip"]))
+                optimizer.step()
+                if scheduler is not None:
+                    scheduler.step()
+                local_final = float(objective.detach())
+                local_executed = step
                 del output, target, objective
-                break
-            if step == 1:
-                first_objective = float(objective.detach())
-            objective.backward()
-            torch.nn.utils.clip_grad_norm_(adapters.parameters(), float(config["grad_clip"]))
-            optimizer.step()
-            if scheduler is not None:
-                scheduler.step()
-            final_objective = float(objective.detach())
-            executed_steps = step
-            del output, target, objective
-            if step % int(config["validation_interval"]) != 0 and step != int(config["adapter_steps"]):
-                continue
-            candidates = {
-                "original_a": _normal_prediction(bundle=bundle, query_x=selection_a_x, context_indices=bundle.support_indices, adapters=adapters, device=device),
-                "original_b": _normal_prediction(bundle=bundle, query_x=selection_b_x, context_indices=bundle.support_indices, adapters=adapters, device=device),
-            }
-            labels = {"original_a": selection_a_y, "original_b": selection_b_y}
-            errors = {
-                name: _candidate_deployment_error(task.problem_type, labels[name], prediction, n_classes=task.n_classes)
-                for name, prediction in candidates.items()
-            }
-            for name, error in errors.items():
-                if error < float(best[name]["error"]):
-                    best[name] = {"step": int(step), "error": float(error), "valid": True, "state": _cpu_state_dict(adapters)}
-            checkpoint_records.append({
-                "step": int(step),
-                "original_selection_a_error": float(errors["original_a"]),
-                "original_selection_b_error": float(errors["original_b"]),
-                "learning_rates": [float(group["lr"]) for group in optimizer.param_groups],
-            })
-            del candidates
-        del scheduler, optimizer
+                if step % int(config["validation_interval"]) != 0 and step != int(config["adapter_steps"]):
+                    continue
+                errors: dict[str, float] = {}
+                for name in target_names:
+                    prediction = _normal_prediction(
+                        bundle=bundle, query_x=query_x[name],
+                        context_indices=bundle.support_indices, adapters=adapters, device=device,
+                    )
+                    errors[name] = _candidate_deployment_error(
+                        task.problem_type, labels[name], prediction, n_classes=task.n_classes
+                    )
+                    if errors[name] < float(best[name]["error"]):
+                        best[name] = {"step": int(step), "error": float(errors[name]), "valid": True, "state": _cpu_state_dict(adapters)}
+                error_fields = (
+                    {
+                        "original_selection_a_error": float(errors["original_a"]),
+                        "original_selection_b_error": float(errors["original_b"]),
+                    }
+                    if target_name is None
+                    else {f"{target_name}_error": float(errors[target_name])}
+                )
+                checkpoint_records.append({
+                    "trajectory": "shared" if target_name is None else target_name,
+                    "step": int(step), **error_fields,
+                    "learning_rates": [float(group["lr"]) for group in optimizer.param_groups],
+                })
+            scheduler = optimizer = None
+            return local_first, local_final, local_executed
+
+        if initial_checkpoint is None:
+            first_objective, final_objective, executed_steps = train_trajectory()
+            total_trajectory_steps = executed_steps
+        else:
+            trajectory_stats = [train_trajectory(target_name=name) for name in ("original_a", "original_b")]
+            first_objective = float(np.nanmean([item[0] for item in trajectory_stats]))
+            final_objective = float(np.nanmean([item[1] for item in trajectory_stats]))
+            executed_steps = int(max(item[2] for item in trajectory_stats))
+            total_trajectory_steps = int(sum(item[2] for item in trajectory_stats))
         gc.collect()
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -572,10 +687,12 @@ def _fit_context_expansion_bag(
         "requested_bags": int(requested_bags),
         "effective_bags": int(effective_bags),
         "pipeline": "crossfit_frozen_context_expansion",
+        "staged_initial_checkpoint": None if initial_adapter_checkpoint_path is None else str(initial_adapter_checkpoint_path),
         "adapter_training_rows": "T only",
         "expanded_context_policy": "The original T-context-selected states are frozen; A uses T+B, B uses T+A, and test uses T+A+B",
         "adapter_steps_requested": int(config["adapter_steps"]),
         "adapter_steps_executed": int(executed_steps),
+        "adapter_total_trajectory_steps_executed": int(total_trajectory_steps),
         "adapter_first_objective": first_objective,
         "adapter_final_objective": final_objective,
         "checkpoints": {name: {key: value for key, value in record.items() if key != "state"} for name, record in best.items()},
@@ -711,6 +828,12 @@ def _manifest(
         "reference_crossfit_dir": None if reference_dir is None else str(reference_dir.resolve()),
         "reference_crossfit_manifest_sha256": None if reference_dir is None else _sha256(reference_dir / "experiment_manifest.json"),
         "reference_crossfit_fingerprint": None if reference_manifest is None else reference_manifest.get("run_fingerprint_sha256"),
+        "initial_adapter_dir": None if getattr(args, "initial_adapter_dir", None) is None else str(args.initial_adapter_dir.resolve()),
+        "initial_adapter_manifest_sha256": (
+            None
+            if getattr(args, "initial_adapter_dir", None) is None
+            else _sha256(args.initial_adapter_dir / "experiment_manifest.json")
+        ),
         "config_label": str(args.config_label),
         "task_ids": sorted(case.task_id for case in cases),
         "protocol_seed": int(args.protocol_seed),
@@ -722,6 +845,7 @@ def _manifest(
             if args.query_fraction_min is None
             else [float(args.query_fraction_min), float(args.query_fraction_max)]
         ),
+        "adapter_steps_override": getattr(args, "adapter_steps", None),
         "column_control_points": (
             None
             if args.column_control_points is None
@@ -729,7 +853,12 @@ def _manifest(
         ),
         "reference_atol": float(args.reference_atol),
         "fixed_arm_requirement": {"adapter_architecture": "fixed_cubic", "n_control_points": 20},
-        "training": "One fixed T-only adapter trajectory per bag; checkpoints are selected under the original T-only context, then no adapter, input-preprocessor, target-scaler, or ensemble refit occurs after A/B rows are appended.",
+        "training": (
+            "Two matched T-only continuation trajectories per bag, initialized from the "
+            "corresponding A/B-selected line states; each is selected on its own half"
+            if getattr(args, "initial_adapter_dir", None) is not None
+            else "One fixed T-only adapter trajectory per bag; checkpoints are selected under the original T-only context"
+        ) + "; no adapter, input-preprocessor, target-scaler, or ensemble refit occurs after A/B rows are appended.",
         "crossfit_contexts": {
             "original": "A/B/test use T",
             "expanded": "A uses T+B, B uses T+A, test uses T+A+B",
@@ -804,6 +933,10 @@ def _run_task(
     task_dir = _task_dir(output_dir, task)
     task_dir.mkdir(parents=True, exist_ok=True)
     config = dict(case.config)
+    if getattr(args, "adapter_steps", None) is not None:
+        config["adapter_steps"] = int(args.adapter_steps)
+        if config.get("cosine_schedule_steps") is not None:
+            config["cosine_schedule_steps"] = int(args.adapter_steps)
     source_patience = config.get("adapter_patience")
     config["adapter_patience"] = None
     test_shape = _prediction_shape(len(task.y_test), task.problem_type, task.n_classes)
@@ -850,6 +983,11 @@ def _run_task(
                 requested_bags=requested_bags,
                 effective_bags=effective_bags,
                 adapter_checkpoint_path=task_dir / f"bag_{bag}.adapters.pt",
+                initial_adapter_checkpoint_path=(
+                    None
+                    if getattr(args, "initial_adapter_dir", None) is None
+                    else _task_dir(args.initial_adapter_dir, task) / f"bag_{bag}.adapters.pt"
+                ),
             )
             if args.reference_crossfit_dir is not None:
                 reference_path = _task_dir(args.reference_crossfit_dir, task) / f"bag_{bag}.npz"
@@ -972,6 +1110,7 @@ def main() -> None:
         or args.coordinate_mapping != "linear"
         or args.query_fraction_min is not None
         or args.column_control_points is not None
+        or getattr(args, "adapter_steps", None) is not None
     ):
         configured_cases = []
         for case in cases:
