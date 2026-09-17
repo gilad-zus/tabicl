@@ -1103,14 +1103,6 @@ class DirectSplineTransform(nn.Module):
             base = expanded_range * u
         knots = self.knots_for_transform()
         identity_controls = greville_abscissae(knots, self.degree, params.control_points.shape[-1])
-        if self.direct_spline_output:
-            spline_value = evaluate_bspline(u, params.control_points, knots, self.degree)
-            center = expanded_range * torch.tanh(self.direct_center).unsqueeze(1)
-            half_span = expanded_range * torch.exp(
-                torch.log(torch.as_tensor(self.scale_adjustment_bound, device=u.device))
-                * torch.tanh(self.direct_log_span).unsqueeze(1)
-            )
-            return center + half_span * spline_value
         # B-spline evaluation is linear in its controls.  Evaluating only the
         # control-point residual is algebraically the same as
         # ``spline(u) - u``, while producing a bit-exact zero for a freshly
@@ -1122,6 +1114,17 @@ class DirectSplineTransform(nn.Module):
             knots,
             self.degree,
         )
+        if self.direct_spline_output:
+            # ``u + residual`` is algebraically the direct spline S(u), while
+            # making the initialized straight line bit-exact instead of
+            # relying on a rounded evaluation of the identity B-spline.
+            spline_value = u + spline_residual
+            center = expanded_range * torch.tanh(self.direct_center).unsqueeze(1)
+            half_span = expanded_range * torch.exp(
+                torch.log(torch.as_tensor(self.scale_adjustment_bound, device=u.device))
+                * torch.tanh(self.direct_log_span).unsqueeze(1)
+            )
+            return center + half_span * spline_value
         return base + params.gate.unsqueeze(1) * expanded_range * spline_residual
 
     def transform(self, x: torch.Tensor) -> torch.Tensor:

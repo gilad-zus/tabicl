@@ -680,8 +680,14 @@ def test_direct_arctan_line_and_spline_share_initial_function_and_learn_endpoint
         direct_spline_output=True,
     )
     probe = torch.tensor([[[-100.0, -4.0], [0.0, 0.0], [4.0, 100.0]]])
+    expected = 4.0 * (2.0 / torch.pi) * torch.atan(torch.pi * probe / 8.0)
+    with torch.no_grad():
+        for adapter in (line, spline):
+            adapter.location.zero_()
+            adapter.scale.fill_(1.0)
 
     assert torch.equal(line.transform(probe), spline.transform(probe))
+    assert torch.equal(line.transform(probe), expected)
     assert not line.gate_logits.requires_grad
     assert not spline.gate_logits.requires_grad
     with torch.no_grad():
