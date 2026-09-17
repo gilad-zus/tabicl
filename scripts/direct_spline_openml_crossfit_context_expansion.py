@@ -131,7 +131,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--bags", type=int, default=None)
     parser.add_argument(
         "--adapter-arm",
-        choices=("source", "full_spline", "affine_mixing"),
+        choices=("source", "full_spline", "affine_mixing", "direct_line", "direct_spline"),
         default="source",
         help="Optionally compare full nonlinear shape against shape frozen at identity.",
     )
@@ -977,7 +977,10 @@ def main() -> None:
         for case in cases:
             config = dict(case.config)
             if args.adapter_arm != "source":
-                config["trainable_shape"] = args.adapter_arm == "full_spline"
+                config["trainable_shape"] = args.adapter_arm in {"full_spline", "direct_spline"}
+                config["direct_spline_output"] = args.adapter_arm in {"direct_line", "direct_spline"}
+                if config["direct_spline_output"]:
+                    config["trainable_location_scale"] = False
             config["coordinate_mapping"] = str(args.coordinate_mapping)
             if args.query_fraction_min is not None:
                 config["query_fraction_min"] = float(args.query_fraction_min)

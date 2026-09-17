@@ -661,6 +661,48 @@ def test_direct_spline_arctan_mapping_is_matched_with_and_without_trainable_shap
     assert not torch.allclose(spline.transform(probe), control.transform(probe))
 
 
+def test_direct_arctan_line_and_spline_share_initial_function_and_learn_endpoints():
+    context = torch.zeros(1, 1, 2)
+    line = DirectSplineTransform(
+        context,
+        n_control_points=8,
+        trainable_shape=False,
+        trainable_location_scale=False,
+        coordinate_mapping="arctan",
+        direct_spline_output=True,
+    )
+    spline = DirectSplineTransform(
+        context,
+        n_control_points=8,
+        trainable_shape=True,
+        trainable_location_scale=False,
+        coordinate_mapping="arctan",
+        direct_spline_output=True,
+    )
+    probe = torch.tensor([[[-100.0, -4.0], [0.0, 0.0], [4.0, 100.0]]])
+
+    assert torch.equal(line.transform(probe), spline.transform(probe))
+    assert not line.gate_logits.requires_grad
+    assert not spline.gate_logits.requires_grad
+    with torch.no_grad():
+        spline.direct_center.fill_(0.25)
+        spline.direct_log_span.fill_(-0.5)
+        spline.gap_logits[..., 2].fill_(0.5)
+    changed = spline.transform(probe)
+    assert torch.isfinite(changed).all()
+    assert not torch.allclose(changed, line.transform(probe))
+
+
+def test_direct_spline_output_rejects_learned_pre_arctan_location_scale():
+    with pytest.raises(ValueError, match="pre-arctan location/scale"):
+        DirectSplineTransform(
+            torch.zeros(1, 1, 1),
+            coordinate_mapping="arctan",
+            direct_spline_output=True,
+            trainable_location_scale=True,
+        )
+
+
 def test_direct_spline_rejects_unknown_coordinate_mapping():
     with pytest.raises(ValueError, match="coordinate_mapping"):
         DirectSplineTransform(torch.zeros(1, 1, 1), coordinate_mapping="cauchy")

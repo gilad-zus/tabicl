@@ -422,6 +422,7 @@ def _make_adapters(bundle: _StandardBag, config: dict[str, Any], device: torch.d
                 trainable_shape=bool(config.get("trainable_shape", True)),
                 trainable_location_scale=bool(config["trainable_location_scale"]),
                 coordinate_mapping=str(config.get("coordinate_mapping", "linear")),
+                direct_spline_output=bool(config.get("direct_spline_output", False)),
                 knot_placement="uniform",
                 control_mode="monotone",
                 cross_column_mixing_rank=int(config["cross_column_mixing_rank"]),

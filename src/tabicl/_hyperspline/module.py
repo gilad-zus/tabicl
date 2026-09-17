@@ -782,6 +782,7 @@ class DirectSplineTransform(nn.Module):
         trainable_range: bool = False,
         trainable_location_scale: bool = False,
         coordinate_mapping: str = "linear",
+        direct_spline_output: bool = False,
         knot_placement: str = "uniform",
         control_mode: str = "monotone",
         free_control_bound: float = 1.0,
@@ -804,6 +805,10 @@ class DirectSplineTransform(nn.Module):
             raise ValueError("knot_placement must be one of: uniform, quantile, learned")
         if coordinate_mapping not in {"linear", "arctan"}:
             raise ValueError("coordinate_mapping must be one of: linear, arctan")
+        if direct_spline_output and coordinate_mapping != "arctan":
+            raise ValueError("direct spline output requires arctan coordinates")
+        if direct_spline_output and trainable_location_scale:
+            raise ValueError("direct spline output does not use learned pre-arctan location/scale")
         if control_mode not in {"monotone", "free"}:
             raise ValueError("control_mode must be one of: monotone, free")
         if free_control_bound <= 0:
@@ -819,6 +824,7 @@ class DirectSplineTransform(nn.Module):
         self.trainable_range = trainable_range
         self.trainable_location_scale = trainable_location_scale
         self.coordinate_mapping = coordinate_mapping
+        self.direct_spline_output = direct_spline_output
         self.knot_placement = knot_placement
         self.control_mode = control_mode
         self.free_control_bound = free_control_bound
@@ -845,7 +851,13 @@ class DirectSplineTransform(nn.Module):
         )
         self.gate_logits = nn.Parameter(
             torch.full((x_context.shape[0], x_context.shape[2]), torch.logit(torch.tensor(0.01))),
-            requires_grad=trainable_shape,
+            requires_grad=trainable_shape and not direct_spline_output,
+        )
+        self.direct_center = nn.Parameter(
+            torch.zeros_like(statistics.location), requires_grad=direct_spline_output
+        )
+        self.direct_log_span = nn.Parameter(
+            torch.zeros_like(statistics.scale), requires_grad=direct_spline_output
         )
         # Free controls are an experimental DirectSpline-only freedom.  Their
         # endpoints remain fixed, so values outside the context-derived spline
@@ -1091,6 +1103,14 @@ class DirectSplineTransform(nn.Module):
             base = expanded_range * u
         knots = self.knots_for_transform()
         identity_controls = greville_abscissae(knots, self.degree, params.control_points.shape[-1])
+        if self.direct_spline_output:
+            spline_value = evaluate_bspline(u, params.control_points, knots, self.degree)
+            center = expanded_range * torch.tanh(self.direct_center).unsqueeze(1)
+            half_span = expanded_range * torch.exp(
+                torch.log(torch.as_tensor(self.scale_adjustment_bound, device=u.device))
+                * torch.tanh(self.direct_log_span).unsqueeze(1)
+            )
+            return center + half_span * spline_value
         # B-spline evaluation is linear in its controls.  Evaluating only the
         # control-point residual is algebraically the same as
         # ``spline(u) - u``, while producing a bit-exact zero for a freshly
