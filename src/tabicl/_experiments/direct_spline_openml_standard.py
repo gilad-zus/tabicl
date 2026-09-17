@@ -1377,8 +1377,9 @@ def _identity_view_parity(
     task_id: int,
     bag: int,
     split: str,
+    fresh_adapter_must_be_identity: bool = True,
 ) -> tuple[float, str, bool]:
-    """Require bit-exact public/no-spline/fresh-spline inputs on every row.
+    """Audit public baseline reconstruction and fresh-adapter input validity.
 
     Evaluation itself uses the estimator's own ``_batch_forward`` method, so
     comparing two separate GPU predictions is both redundant and vulnerable
@@ -1448,11 +1449,13 @@ def _identity_view_parity(
             del spline_views, spline_labels
         diagnostics[str(method)] = branch
 
-        for comparison in branch.values():
+        for name, comparison in branch.items():
             if comparison.get("shape_match") is not True or comparison.get("nonfinite_differences") != 0:
                 maximum = float("inf")
                 break
-            maximum = max(maximum, float(comparison.get("max_abs", 0.0)))
+            enforce_exact = fresh_adapter_must_be_identity or name != "fresh_spline_views_vs_no_spline"
+            if enforce_exact:
+                maximum = max(maximum, float(comparison.get("max_abs", 0.0)))
 
     if maximum != 0.0:
         _emit(
@@ -1466,8 +1469,10 @@ def _identity_view_parity(
             diagnostics=diagnostics,
         )
         raise RuntimeError(
-            "standard-pipeline identity parity failed: public, no-spline, and fresh-spline input views "
-            f"must be bit exact on all {len(query_x)} {split} rows. "
+            "standard-pipeline input parity failed: public/no-spline views, labels, shuffles, and "
+            + ("fresh-adapter views " if fresh_adapter_must_be_identity else "fresh-adapter labels ")
+            + f"must be bit exact on all {len(query_x)} {split} rows; all fresh-adapter arrays must "
+            "also have matching shapes and finite differences. "
             f"parity_diagnostics={json.dumps(diagnostics, sort_keys=True)}"
         )
     reference = (

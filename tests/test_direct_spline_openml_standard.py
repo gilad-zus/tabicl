@@ -1559,6 +1559,73 @@ def test_all_nan_query_mask_is_a_full_exact_input_check_without_mutation():
     pd.testing.assert_frame_equal(masked_query, before)
 
 
+def test_arctan_adapter_parity_keeps_public_baseline_check_without_requiring_identity():
+    rows = 24
+    features = pd.DataFrame(
+        {
+            "x0": np.linspace(-3.0, 3.0, rows),
+            "x1": np.linspace(1.0, 5.0, rows),
+        }
+    )
+    targets = np.linspace(10.0, 30.0, rows)
+    task = OpenMLTaskData(
+        task_id=8,
+        dataset_id=9,
+        dataset_name="regression_arctan_parity",
+        problem_type="regression",
+        n_classes=None,
+        x_train=features.iloc[:16].reset_index(drop=True),
+        y_train=targets[:16],
+        x_test=features.iloc[16:].reset_index(drop=True),
+        y_test=targets[16:],
+        outer_split_hash="test",
+    )
+    config = {
+        **standard_direct_spline_config(train_context_rows=4),
+        "coordinate_mapping": "arctan",
+        "trainable_shape": False,
+        "cross_column_mixing_rank": 0,
+    }
+    bundle = _fit_standard_bag(
+        task=task,
+        fit_indices=np.arange(12),
+        config=config,
+        protocol_seed=0,
+        bag=0,
+        backbone=_OffsetPublicRegressionBackbone(),
+        device=torch.device("cpu"),
+    )
+    adapters = _make_adapters(bundle, config, torch.device("cpu"))
+
+    maximum, reference, public_checked = _identity_view_parity(
+        bundle=bundle,
+        adapters=adapters,
+        query_x=task.x_test,
+        device=torch.device("cpu"),
+        progress=None,
+        task_id=task.task_id,
+        bag=0,
+        split="test",
+        fresh_adapter_must_be_identity=False,
+    )
+
+    assert maximum == 0.0
+    assert reference == "public_exact_input_views_full_query"
+    assert public_checked
+
+    with pytest.raises(RuntimeError, match="fresh-adapter views"):
+        _identity_view_parity(
+            bundle=bundle,
+            adapters=adapters,
+            query_x=task.x_test,
+            device=torch.device("cpu"),
+            progress=None,
+            task_id=task.task_id,
+            bag=0,
+            split="test",
+        )
+
+
 def test_many_class_training_route_has_all_public_classes_and_input_gradients():
     backbone = TabICL(
         max_classes=3,

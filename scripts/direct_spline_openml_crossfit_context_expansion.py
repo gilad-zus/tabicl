@@ -401,17 +401,21 @@ def _fit_context_expansion_bag(
     if device.type == "cuda":
         torch.cuda.manual_seed_all(adapter_seed)
     adapters = _make_adapters(bundle, config, device)
+    fresh_adapter_must_be_identity = str(config.get("coordinate_mapping", "linear")) == "linear"
     parity_a, parity_a_reference, public_parity_a = _identity_view_parity(
         bundle=bundle, adapters=adapters, query_x=selection_a_x, device=device, progress=None,
         task_id=task.task_id, bag=bag, split="context_expansion_selection_a",
+        fresh_adapter_must_be_identity=fresh_adapter_must_be_identity,
     )
     parity_b, parity_b_reference, public_parity_b = _identity_view_parity(
         bundle=bundle, adapters=adapters, query_x=selection_b_x, device=device, progress=None,
         task_id=task.task_id, bag=bag, split="context_expansion_selection_b",
+        fresh_adapter_must_be_identity=fresh_adapter_must_be_identity,
     )
     parity_test, parity_test_reference, public_parity_test = _identity_view_parity(
         bundle=bundle, adapters=adapters, query_x=task.x_test, device=device, progress=None,
         task_id=task.task_id, bag=bag, split="context_expansion_test",
+        fresh_adapter_must_be_identity=fresh_adapter_must_be_identity,
     )
     train_context_sizes: list[int] = []
     train_query_sizes: list[int] = []
