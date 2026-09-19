@@ -666,6 +666,9 @@ def _apply_adapter(
     indices = torch.as_tensor(numerical_indices, dtype=torch.long, device=canonical.device)
     transformed = canonical.clone()
     values = canonical.index_select(-1, indices).unsqueeze(0)
+    if getattr(adapter, "expands_features", False):
+        extra = adapter.transform(values).squeeze(0)
+        return torch.cat((canonical, extra), dim=-1)
     effective_mixing = adapter.effective_mixing_matrix()  # type: ignore[attr-defined]
     if filtered_feature_mask is None:
         adapted_values = adapter.transform(values)  # type: ignore[attr-defined]
@@ -762,6 +765,37 @@ def _masked_feature_shuffles(
     return [[remap[index] for index in shuffle if index in remap] for shuffle in shuffles]
 
 
+def _adapter_feature_layout(
+    shuffles: list[list[int]],
+    *,
+    numerical_indices: np.ndarray,
+    adapter: nn.Module | None,
+    filtered_feature_mask: np.ndarray | None,
+) -> tuple[list[list[int]], np.ndarray | None]:
+    """Extend each ordinary permutation with the corresponding added features.
+
+    Added features travel beside their source columns. This deterministic
+    policy is identical for line and spline arms and for train/public paths.
+    A query-masked original column also removes its derived feature.
+    """
+    if adapter is None or not getattr(adapter, "expands_features", False):
+        return shuffles, filtered_feature_mask
+    width = len(shuffles[0])
+    extra = {int(index): width + position for position, index in enumerate(numerical_indices)}
+    extended = []
+    for shuffle in shuffles:
+        members = []
+        for index in shuffle:
+            members.append(index)
+            if index in extra:
+                members.append(extra[index])
+        extended.append(members)
+    mask = None if filtered_feature_mask is None else np.concatenate(
+        (filtered_feature_mask, np.asarray(filtered_feature_mask)[numerical_indices])
+    )
+    return extended, mask
+
+
 def _build_method_batch(
     *,
     bundle: _StandardBag,
@@ -787,12 +821,15 @@ def _build_method_batch(
         adapter=adapter,
         filtered_feature_mask=filtered_feature_mask,
     )
-    feature_shuffles = _masked_feature_shuffles(
-        [feature_shuffle for feature_shuffle, _ in configs], filtered_feature_mask
+    unmasked_shuffles, expanded_mask = _adapter_feature_layout(
+        [feature_shuffle for feature_shuffle, _ in configs],
+        numerical_indices=bundle.numerical_indices, adapter=adapter,
+        filtered_feature_mask=filtered_feature_mask,
     )
-    if filtered_feature_mask is not None:
+    feature_shuffles = _masked_feature_shuffles(unmasked_shuffles, expanded_mask)
+    if expanded_mask is not None:
         kept = torch.as_tensor(
-            np.flatnonzero(~filtered_feature_mask), dtype=torch.long, device=canonical.device
+            np.flatnonzero(~expanded_mask), dtype=torch.long, device=canonical.device
         )
         canonical = canonical.index_select(-1, kept)
     views = torch.stack([canonical[:, feature_shuffle] for feature_shuffle in feature_shuffles], dim=0)
@@ -835,6 +872,11 @@ def _build_public_method_arrays(
         dtype=np.float32,
     )
     adapter = None if adapters is None else adapters.for_method(method)
+    unmasked_shuffles, expanded_mask = _adapter_feature_layout(
+        [feature_shuffle for feature_shuffle, _ in configs],
+        numerical_indices=bundle.numerical_indices, adapter=adapter,
+        filtered_feature_mask=filtered_feature_mask,
+    )
     if adapter is not None:
         with torch.no_grad():
             canonical_tensor = torch.as_tensor(canonical, dtype=torch.float32, device=device)
@@ -844,9 +886,9 @@ def _build_public_method_arrays(
                 adapter=adapter,
                 filtered_feature_mask=filtered_feature_mask,
             )
-            if filtered_feature_mask is not None:
+            if expanded_mask is not None:
                 kept = torch.as_tensor(
-                    np.flatnonzero(~filtered_feature_mask),
+                    np.flatnonzero(~expanded_mask),
                     dtype=torch.long,
                     device=canonical_tensor.device,
                 )
@@ -857,7 +899,7 @@ def _build_public_method_arrays(
         canonical = canonical[:, ~np.asarray(filtered_feature_mask, dtype=bool)]
 
     feature_shuffles = _masked_feature_shuffles(
-        [feature_shuffle for feature_shuffle, _ in configs], filtered_feature_mask
+        unmasked_shuffles, expanded_mask
     )
     views = np.stack(
         [canonical[:, feature_shuffle] for feature_shuffle in feature_shuffles],

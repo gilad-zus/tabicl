@@ -147,6 +147,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--query-fraction-min", type=float, default=None)
     parser.add_argument("--query-fraction-max", type=float, default=None)
     parser.add_argument("--adapter-steps", type=int, default=None)
+    parser.add_argument("--n-control-points", type=int, default=None,
+                        help="Override uniform cubic capacity; staged line starts are transferred exactly.")
+    parser.add_argument("--training-audit-episodes", type=int, default=0,
+                        help="Fixed train-only episodes for final and selected checkpoint diagnostics.")
     parser.add_argument(
         "--column-control-points",
         default=None,
@@ -183,6 +187,12 @@ def _parse_args() -> argparse.Namespace:
         raise ValueError("--bootstrap-rounds must be positive")
     if args.adapter_steps is not None and args.adapter_steps < 1:
         raise ValueError("--adapter-steps must be positive")
+    if args.n_control_points is not None and args.n_control_points < 4:
+        raise ValueError("cubic splines require at least four control points")
+    if args.training_audit_episodes < 0:
+        raise ValueError("training-audit-episodes must be nonnegative")
+    if args.n_control_points is not None and args.column_control_points is not None:
+        raise ValueError("choose uniform or per-column capacity, not both")
     if args.reference_atol < 0.0:
         raise ValueError("--reference-atol must be non-negative")
     if (args.query_fraction_min is None) != (args.query_fraction_max is None):
@@ -368,6 +378,37 @@ def _verify_reference_bag(
     }
 
 
+def _load_staged_line_state(adapters, state):
+    """Transfer a shape-frozen direct line across cubic capacities exactly.
+
+    Capacity-dependent buffers remain those of the destination. All learned
+    center/span and mixer parameters are preserved. A learned curved spline
+    cannot enter this path: its nonzero shape coefficients are rejected.
+    """
+    target = adapters.state_dict()
+    if set(target) != set(state):
+        raise ValueError("initial line state has incompatible parameter names")
+    if all(target[key].shape == state[key].shape for key in target):
+        adapters.load_state_dict(state, strict=True)
+        return
+    capacity_fields = {"knots", "identity_gaps", "gap_logits", "free_reference_control_points",
+                       "free_control_residual", "fixed_knot_widths", "knot_width_logits"}
+    for key, value in state.items():
+        field = key.rsplit(".", 1)[-1]
+        if field in {"gap_logits", "free_control_residual", "knot_width_logits"} and torch.count_nonzero(value):
+            raise ValueError("cross-capacity initialization requires an exact shape-frozen uniform line")
+        if field in capacity_fields:
+            if field in {"gap_logits", "free_control_residual", "knot_width_logits"}:
+                # The same destination module is reused for A and B. Clear
+                # A's learned curvature before starting B from its saved line.
+                target[key] = torch.zeros_like(target[key])
+            continue
+        if value.shape != target[key].shape:
+            raise ValueError(f"non-capacity parameter changed: {key}")
+        target[key] = value
+    adapters.load_state_dict(target, strict=True)
+
+
 def _fit_context_expansion_bag(
     *,
     task: OpenMLTaskData,
@@ -433,6 +474,29 @@ def _fit_context_expansion_bag(
     train_context_sizes: list[int] = []
     train_query_sizes: list[int] = []
     queried_rows = np.zeros(bundle.fit_labels.size, dtype=bool)
+    training_audit = {}
+    final_states = {}
+    audit_rng = np.random.default_rng(_seed(20260919, task.task_id, bag, 901))
+    audit_episodes = [sample_episode_indices(
+        bundle.fit_labels, problem_type=task.problem_type,
+        context_rows=max(1, len(bundle.fit_labels) - 1),
+        query_rows=int(config["query_batch_rows"]), rng=audit_rng,
+        query_fraction_range=(float(config["query_fraction_min"]), float(config["query_fraction_max"])),
+    ) for _ in range(int(config.get("training_audit_episodes", 0)))]
+
+    def measure_training():
+        values = []
+        with torch.no_grad():
+            for context, query in audit_episodes:
+                output = _training_logits(bundle=bundle, adapters=adapters, context_indices=context,
+                                          query_indices=query, device=device)
+                target = torch.as_tensor(bundle.fit_labels[query], device=device)
+                loss = F.mse_loss(output.flatten(), target.float().flatten()) if task.problem_type == "regression" else _classification_training_objective_from_logits(
+                    logits=output, target=target, problem_type=task.problem_type, n_classes=task.n_classes,
+                    softmax_temperature=float(bundle.estimator.softmax_temperature), config=config)
+                values.append(float(loss))
+        return {"mean": float(np.mean(values)), "episode_losses": values}
+
     checkpoint_records: list[dict[str, Any]] = []
     first_objective = final_objective = float("nan")
     executed_steps = 0
@@ -482,7 +546,6 @@ def _fit_context_expansion_bag(
                 raise ValueError("staged continuation requires checkpoints from a direct-line arm")
             matched_config_fields = (
                 "adapter_architecture",
-                "n_control_points",
                 "coordinate_mapping",
                 "query_fraction_min",
                 "query_fraction_max",
@@ -513,7 +576,7 @@ def _fit_context_expansion_bag(
             nonlocal adapters, optimizer, scheduler, best, checkpoint_records
             if target_name is not None:
                 source_record = initial_checkpoint["checkpoints"][target_name]
-                adapters.load_state_dict(source_record["state_dict"], strict=True)
+                _load_staged_line_state(adapters, source_record["state_dict"])
                 optimizer = _optimizer(adapters, config)
                 scheduler = None if config.get("cosine_schedule_steps") is None else _cosine_scheduler(
                     optimizer,
@@ -638,6 +701,10 @@ def _fit_context_expansion_bag(
                     "step": int(step), **error_fields,
                     "learning_rates": [float(group["lr"]) for group in optimizer.param_groups],
                 })
+            if audit_episodes:
+                key = "final_" + (target_name or "shared")
+                final_states[key] = _cpu_state_dict(adapters)
+                training_audit[key] = measure_training()
             scheduler = optimizer = None
             return local_first, local_final, local_executed
 
@@ -650,6 +717,10 @@ def _fit_context_expansion_bag(
             final_objective = float(np.nanmean([item[1] for item in trajectory_stats]))
             executed_steps = int(max(item[2] for item in trajectory_stats))
             total_trajectory_steps = int(sum(item[2] for item in trajectory_stats))
+        if audit_episodes:
+            for name, record in best.items():
+                adapters.load_state_dict(record["state"], strict=True)
+                training_audit[name] = measure_training()
         gc.collect()
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -695,6 +766,7 @@ def _fit_context_expansion_bag(
         "adapter_total_trajectory_steps_executed": int(total_trajectory_steps),
         "adapter_first_objective": first_objective,
         "adapter_final_objective": final_objective,
+        "fixed_training_audit": training_audit,
         "checkpoints": {name: {key: value for key, value in record.items() if key != "state"} for name, record in best.items()},
         "adapter_checkpoint_records": checkpoint_records,
         "identity_parity_max_abs_selection_a": float(parity_a),
@@ -739,6 +811,11 @@ def _fit_context_expansion_bag(
         )
         metadata["adapter_checkpoint_file"] = adapter_checkpoint_path.name
         metadata["adapter_checkpoint_bytes"] = adapter_checkpoint_path.stat().st_size
+        if final_states:
+            torch.save({"states": final_states, "task_id": task.task_id, "bag": bag,
+                        "outer_split_hash": task.outer_split_hash, "config": config,
+                        "training_audit": training_audit},
+                       adapter_checkpoint_path.with_name(adapter_checkpoint_path.stem + ".final.pt"))
     del adapters, bundle
     if device.type == "cuda":
         torch.cuda.empty_cache()
@@ -846,6 +923,8 @@ def _manifest(
             else [float(args.query_fraction_min), float(args.query_fraction_max)]
         ),
         "adapter_steps_override": getattr(args, "adapter_steps", None),
+        "n_control_points_override": getattr(args, "n_control_points", None),
+        "training_audit_episodes": getattr(args, "training_audit_episodes", 0),
         "column_control_points": (
             None
             if args.column_control_points is None
@@ -933,6 +1012,7 @@ def _run_task(
     task_dir = _task_dir(output_dir, task)
     task_dir.mkdir(parents=True, exist_ok=True)
     config = dict(case.config)
+    config["training_audit_episodes"] = int(getattr(args, "training_audit_episodes", 0))
     if getattr(args, "adapter_steps", None) is not None:
         config["adapter_steps"] = int(args.adapter_steps)
         if config.get("cosine_schedule_steps") is not None:
@@ -1111,6 +1191,7 @@ def main() -> None:
         or args.query_fraction_min is not None
         or args.column_control_points is not None
         or getattr(args, "adapter_steps", None) is not None
+        or getattr(args, "n_control_points", None) is not None
     ):
         configured_cases = []
         for case in cases:
@@ -1121,6 +1202,8 @@ def main() -> None:
                 if config["direct_spline_output"]:
                     config["trainable_location_scale"] = False
             config["coordinate_mapping"] = str(args.coordinate_mapping)
+            if args.n_control_points is not None:
+                config["n_control_points"] = int(args.n_control_points)
             if args.query_fraction_min is not None:
                 config["query_fraction_min"] = float(args.query_fraction_min)
                 config["query_fraction_max"] = float(args.query_fraction_max)
