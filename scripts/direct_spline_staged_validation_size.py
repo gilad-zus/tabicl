@@ -336,7 +336,7 @@ def main() -> None:
                 problem_type=task.problem_type, device=device,
                 classifier_checkpoint=args.classifier_checkpoint, regressor_checkpoint=None,
             )
-        for bag, fit, heldout in enumerate(splits):
+        for bag, (fit, heldout) in enumerate(splits):
             destination = args.output_dir / "raw" / f"task_{task.task_id}" / f"bag_{bag}.npz"
             record_path = destination.with_suffix(".json")
             if any(item[0] == bag for item in missing):
