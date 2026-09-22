@@ -26,6 +26,7 @@ from tabicl._experiments.direct_spline_openml_standard import (
     _normal_prediction,
     _normal_prediction_with_appended_context,
     _single_validation_split,
+    fixed_fit_validation_size_splits,
     _StandardBag,
     run_task_full_context_refit_checkpoint_audit_standard,
     run_task_unconditional_full_context_refit_standard,
@@ -239,6 +240,37 @@ def test_validation_selected_split_is_deterministic_disjoint_and_stratified():
     assert np.array_equal(np.unique(labels[first_fit]), np.asarray([0, 1]))
     assert np.array_equal(np.unique(labels[first_validation]), np.asarray([0, 1]))
     assert np.bincount(labels[first_fit]).min() >= 2
+
+
+def test_fixed_fit_selection_size_split_keeps_training_fixed_and_selection_nested():
+    labels = np.tile([0, 1, 2], 30)
+    task = OpenMLTaskData(
+        task_id=780,
+        dataset_id=790,
+        dataset_name="nested_selection_size",
+        problem_type="multiclass",
+        n_classes=3,
+        x_train=pd.DataFrame({"x": np.arange(labels.size)}),
+        y_train=labels,
+        x_test=pd.DataFrame({"x": [91.0, 92.0, 93.0]}),
+        y_test=np.asarray([0, 1, 2]),
+        outer_split_hash="nested-split",
+    )
+    first = fixed_fit_validation_size_splits(
+        task, small_validation_fraction=0.20, large_validation_fraction=0.40, seed=55
+    )
+    second = fixed_fit_validation_size_splits(
+        task, small_validation_fraction=0.20, large_validation_fraction=0.40, seed=55
+    )
+    fit, small, large = first
+
+    assert all(np.array_equal(left, right) for left, right in zip(first, second, strict=True))
+    assert fit.size == 54 and small.size == 18 and large.size == 36
+    assert not np.intersect1d(fit, large).size
+    assert np.all(np.isin(small, large))
+    assert np.array_equal(np.sort(np.concatenate((fit, large))), np.arange(labels.size))
+    assert np.array_equal(np.unique(labels[fit]), np.asarray([0, 1, 2]))
+    assert np.array_equal(np.unique(labels[small]), np.asarray([0, 1, 2]))
 
 
 def test_identity_regularizer_is_zero_at_identity_and_differentiable_after_movement():

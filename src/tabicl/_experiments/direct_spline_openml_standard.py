@@ -643,6 +643,68 @@ def _single_validation_split(
     return np.asarray(fit_indices, dtype=int), np.asarray(validation_indices, dtype=int)
 
 
+def fixed_fit_validation_size_splits(
+    task: OpenMLTaskData,
+    *,
+    large_validation_fraction: float,
+    small_validation_fraction: float,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return one fixed fit set and nested small/large selection sets.
+
+    This is deliberately unlike a usual train/validation split.  Both selector
+    sizes evaluate checkpoints from *the same* adapter trajectory trained on
+    ``fit_indices``.  The small set is nested in the large set, so the only
+    intended difference between the two checkpoint decisions is additional
+    labelled selection evidence, not fitted rows, initialization, or episode
+    sampling.  It is a diagnostic for checkpoint-selection sample size, not a
+    replacement for the normal 80/20 deployment protocol.
+    """
+
+    if not 0.0 < small_validation_fraction < large_validation_fraction < 0.5:
+        raise ValueError(
+            "selection fractions must satisfy 0 < small < large < 0.5"
+        )
+    fit_indices, large_indices = _single_validation_split(
+        task,
+        validation_fraction=large_validation_fraction,
+        seed=seed,
+    )
+    small_relative_fraction = small_validation_fraction / large_validation_fraction
+    positions = np.arange(large_indices.size, dtype=int)
+    if task.problem_type == "regression":
+        splitter = ShuffleSplit(
+            n_splits=1,
+            test_size=small_relative_fraction,
+            random_state=_seed(seed, 911),
+        )
+        _unused, small_positions = next(splitter.split(positions))
+    else:
+        labels = np.asarray(task.y_train[large_indices], dtype=int)
+        splitter = StratifiedShuffleSplit(
+            n_splits=1,
+            test_size=small_relative_fraction,
+            random_state=_seed(seed, 911),
+        )
+        try:
+            _unused, small_positions = next(splitter.split(positions, labels))
+        except ValueError as error:
+            raise ValidationSplitInfeasibleError(
+                f"task {task.task_id} cannot form a nested selection subset at "
+                f"fraction {small_validation_fraction}"
+            ) from error
+    small_indices = np.asarray(large_indices[small_positions], dtype=int)
+    if np.intersect1d(fit_indices, large_indices).size:
+        raise RuntimeError("fixed-fit selection split overlaps fitting rows")
+    if not np.all(np.isin(small_indices, large_indices)):
+        raise RuntimeError("small selection set is not nested in large selection set")
+    return (
+        np.asarray(fit_indices, dtype=int),
+        small_indices,
+        np.asarray(large_indices, dtype=int),
+    )
+
+
 def _split_sha256(fit_indices: np.ndarray, validation_indices: np.ndarray) -> str:
     """Fingerprint a persisted inner split without embedding every index in JSON."""
 
@@ -2794,6 +2856,16 @@ def _validation_selected_refit_dir(
     return _config_dir(output_dir, task, label) / "validation_selected_refit"
 
 
+def _fixed_fit_validation_size_dir(
+    output_dir: Path,
+    task: OpenMLTaskData,
+    label: str,
+) -> Path:
+    """Return the durable directory for one nested-selection-size arm."""
+
+    return _config_dir(output_dir, task, label) / "fixed_fit_validation_size"
+
+
 def _artifact_sha256(path: Path) -> str:
     """Hash a durable validation/refit artifact without holding it in memory."""
 
@@ -3320,6 +3392,308 @@ def _fit_validation_selected_checkpoint_standard(
     }, metadata, selected_state_cpu
 
 
+def _fit_fixed_fit_selection_size_standard(
+    *,
+    task: OpenMLTaskData,
+    fit_indices: np.ndarray,
+    small_selection_indices: np.ndarray,
+    large_selection_indices: np.ndarray,
+    config: dict[str, Any],
+    protocol_seed: int,
+    backbone: TabICL,
+    device: torch.device,
+    progress: Any,
+) -> tuple[dict[str, np.ndarray], dict[str, Any], dict[str, dict[str, Any]]]:
+    """Train once and select that trajectory with nested validation sizes.
+
+    This intentionally has no full-context refit.  Reusing the exact fitted
+    trajectory is the control which makes a small-versus-large selection
+    comparison interpretable: any different selected state cannot be caused by
+    another initialization, optimizer path, fitted preprocessor, or context.
+    """
+
+    max_steps = int(config["adapter_steps"])
+    checkpoint_interval = int(config["selection_checkpoint_interval"])
+    scheduler_horizon = int(config["cosine_schedule_steps"])
+    if max_steps <= 0 or checkpoint_interval <= 0 or scheduler_horizon < max_steps:
+        raise ValueError("invalid fixed-fit selection-size schedule")
+    if not np.all(np.isin(small_selection_indices, large_selection_indices)):
+        raise ValueError("small selection rows must be nested in large selection rows")
+    started = time.perf_counter()
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    bundle = _fit_standard_bag(
+        task=task,
+        fit_indices=fit_indices,
+        config=config,
+        protocol_seed=protocol_seed,
+        bag=-3,
+        backbone=backbone,
+        device=device,
+    )
+    small_x = task.x_train.iloc[small_selection_indices].reset_index(drop=True)
+    large_x = task.x_train.iloc[large_selection_indices].reset_index(drop=True)
+    small_y = np.asarray(task.y_train[small_selection_indices])
+    large_y = np.asarray(task.y_train[large_selection_indices])
+    adapter_seed = _seed(int(config["random_state"]), task.task_id, -3, 202)
+    torch.manual_seed(adapter_seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(adapter_seed)
+    adapters = _make_adapters(bundle, config, device)
+    parity_large, parity_large_reference, public_parity_large = _identity_view_parity(
+        bundle=bundle,
+        adapters=adapters,
+        query_x=large_x,
+        device=device,
+        progress=progress,
+        task_id=task.task_id,
+        bag=-3,
+        split="fixed_fit_large_selection",
+    )
+    parity_test, parity_test_reference, public_parity_test = _identity_view_parity(
+        bundle=bundle,
+        adapters=adapters,
+        query_x=task.x_test,
+        device=device,
+        progress=progress,
+        task_id=task.task_id,
+        bag=-3,
+        split="fixed_fit_selection_size_test",
+    )
+    identity_small = _normal_prediction(
+        bundle=bundle, query_x=small_x, context_indices=bundle.support_indices,
+        adapters=None, device=device,
+    )
+    identity_large = _normal_prediction(
+        bundle=bundle, query_x=large_x, context_indices=bundle.support_indices,
+        adapters=None, device=device,
+    )
+    identities = {
+        "small": _candidate_deployment_error(
+            task.problem_type, small_y, identity_small, n_classes=task.n_classes
+        ),
+        "large": _candidate_deployment_error(
+            task.problem_type, large_y, identity_large, n_classes=task.n_classes
+        ),
+    }
+    selection_labels = {"small": small_y, "large": large_y}
+    selection_queries = {"small": small_x, "large": large_x}
+    selected: dict[str, dict[str, Any]] = {
+        name: {"best_error": float("inf"), "best_step": None, "best_state": None}
+        for name in ("small", "large")
+    }
+    identity_state = {} if adapters is None else _cpu_state_dict(adapters)
+    checkpoint_records: list[dict[str, Any]] = [
+        {
+            "step": 0,
+            "kind": "identity",
+            "selection_errors": {name: float(error) for name, error in identities.items()},
+        }
+    ]
+    training_context_sizes: list[int] = []
+    executed_steps = 0
+    encountered_nonfinite_objective = False
+    first_task_objective = final_task_objective = float("nan")
+    first_identity_penalty = final_identity_penalty = float("nan")
+    first_total_objective = final_total_objective = float("nan")
+    no_trainable_numerical_features = adapters is None
+    if adapters is not None:
+        optimizer = _optimizer(adapters, config)
+        scheduler = _cosine_scheduler(
+            optimizer, total_steps=scheduler_horizon,
+            min_lr_ratio=float(config["cosine_min_lr_ratio"]),
+        )
+        episode_rng = np.random.default_rng(_seed(int(config["random_state"]), task.task_id, -3, 203))
+        for step in range(1, max_steps + 1):
+            configured_context_rows = config.get("train_context_rows")
+            context_limit = (
+                max(1, bundle.fit_labels.size - int(config["query_batch_rows"]))
+                if configured_context_rows is None else int(configured_context_rows)
+            )
+            context_rows, query_rows = sample_episode_indices(
+                bundle.fit_labels, problem_type=task.problem_type,
+                context_rows=context_limit,
+                query_rows=int(config["query_batch_rows"]), rng=episode_rng,
+            )
+            training_context_sizes.append(int(context_rows.size))
+            optimizer.zero_grad(set_to_none=True)
+            task_objective, identity_penalty, total_objective = _adapter_training_objective(
+                bundle=bundle, adapters=adapters, context_indices=context_rows,
+                query_indices=query_rows, config=config, device=device,
+            )
+            if not torch.isfinite(total_objective):
+                encountered_nonfinite_objective = True
+                _emit(progress, event="fixed_fit_selection_size_nonfinite_objective", task_id=task.task_id, step=step)
+                del task_objective, identity_penalty, total_objective
+                break
+            if step == 1:
+                first_task_objective = float(task_objective.detach())
+                first_identity_penalty = float(identity_penalty.detach())
+                first_total_objective = float(total_objective.detach())
+            total_objective.backward()
+            torch.nn.utils.clip_grad_norm_(adapters.parameters(), float(config["grad_clip"]))
+            optimizer.step(); scheduler.step()
+            final_task_objective = float(task_objective.detach())
+            final_identity_penalty = float(identity_penalty.detach())
+            final_total_objective = float(total_objective.detach())
+            executed_steps = step
+            if step % checkpoint_interval == 0 or step == max_steps:
+                candidate_errors: dict[str, float] = {}
+                improved = False
+                for name in ("small", "large"):
+                    candidate = _normal_prediction(
+                        bundle=bundle, query_x=selection_queries[name],
+                        context_indices=bundle.support_indices, adapters=adapters, device=device,
+                    )
+                    error = _candidate_deployment_error(
+                        task.problem_type, selection_labels[name], candidate, n_classes=task.n_classes
+                    )
+                    candidate_errors[name] = float(error)
+                    improved = improved or error < float(selected[name]["best_error"])
+                    del candidate
+                state = _cpu_state_dict(adapters) if improved else None
+                for name, error in candidate_errors.items():
+                    if error < float(selected[name]["best_error"]):
+                        selected[name].update(best_error=float(error), best_step=int(step), best_state=state)
+                diagnostics = _adapter_checkpoint_diagnostics(adapters)
+                checkpoint_records.append(
+                    {
+                        "step": int(step), "kind": "spline",
+                        "selection_errors": candidate_errors,
+                        "task_objective": final_task_objective,
+                        "identity_penalty": final_identity_penalty,
+                        "total_objective": final_total_objective,
+                        "learning_rates": [float(group["lr"]) for group in optimizer.param_groups],
+                        "elapsed_seconds": float(time.perf_counter() - started),
+                        "adapter_diagnostics": diagnostics,
+                    }
+                )
+                _emit(
+                    progress, event="fixed_fit_selection_size_checkpoint", task_id=task.task_id,
+                    step=int(step), small_selection_error=float(candidate_errors["small"]),
+                    large_selection_error=float(candidate_errors["large"]),
+                    mean_grid_deformation=diagnostics["mean_grid_deformation"],
+                )
+            del task_objective, identity_penalty, total_objective
+        del scheduler, optimizer
+
+    selected_metadata: dict[str, dict[str, Any]] = {}
+    selected_states: dict[str, dict[str, Any]] = {}
+    selected_selection_predictions: dict[str, np.ndarray] = {}
+    for name in ("small", "large"):
+        best_state = selected[name]["best_state"]
+        best_error = float(selected[name]["best_error"])
+        if best_state is None:
+            use_adapted = False
+            selected_step = 0
+        else:
+            decision = choose_identity_guard(
+                identity_error=float(identities[name]), adapted_error=best_error,
+                required_relative_improvement=float(config["selection_relative_improvement"]),
+            )
+            use_adapted = bool(decision.use_adapted)
+            selected_step = int(selected[name]["best_step"]) if use_adapted else 0
+        state = best_state if use_adapted else identity_state
+        if adapters is not None:
+            adapters.load_state_dict(state, strict=True)
+        selected_selection_predictions[name] = (
+            (identity_small if name == "small" else identity_large).copy()
+            if not use_adapted or adapters is None
+            else _normal_prediction(
+                bundle=bundle, query_x=selection_queries[name],
+                context_indices=bundle.support_indices, adapters=adapters, device=device,
+            )
+        )
+        selected_metadata[name] = {
+            "selection_rows": int(selection_labels[name].size),
+            "identity_selection_error": float(identities[name]),
+            "best_spline_checkpoint_step": selected[name]["best_step"],
+            "best_spline_selection_error": None if not np.isfinite(best_error) else best_error,
+            "selected_step": int(selected_step),
+            "selected_use_adapted": bool(use_adapted),
+            "selected_selection_error": float(
+                _candidate_deployment_error(
+                    task.problem_type, selection_labels[name], selected_selection_predictions[name],
+                    n_classes=task.n_classes,
+                )
+            ),
+        }
+        selected_states[name] = state
+
+    # These outer-test predictions are generated only after both selectors have
+    # fixed their state.  This function deliberately never receives y_test.
+    identity_test = _normal_prediction(
+        bundle=bundle, query_x=task.x_test, context_indices=bundle.support_indices,
+        adapters=None, device=device,
+    )
+    selected_test: dict[str, np.ndarray] = {}
+    for name, state in selected_states.items():
+        if adapters is not None:
+            adapters.load_state_dict(state, strict=True)
+        selected_test[name] = (
+            identity_test.copy()
+            if not selected_metadata[name]["selected_use_adapted"] or adapters is None
+            else _normal_prediction(
+                bundle=bundle, query_x=task.x_test, context_indices=bundle.support_indices,
+                adapters=adapters, device=device,
+            )
+        )
+    peak_gib = 0.0 if device.type != "cuda" else torch.cuda.max_memory_allocated(device) / 2**30
+    metadata = {
+        "fit_rows": int(fit_indices.size),
+        "small_selection_rows": int(small_selection_indices.size),
+        "large_selection_rows": int(large_selection_indices.size),
+        "support_rows": int(bundle.support_indices.size),
+        "n_features": int(task.x_train.shape[1]),
+        "n_numerical_features": int(bundle.numerical_indices.size),
+        "no_trainable_numerical_features": bool(no_trainable_numerical_features),
+        "adapter_seed": int(adapter_seed),
+        "adapter_training_objective": _training_objective_name(problem_type=task.problem_type, config=config),
+        "adapter_steps_requested": max_steps,
+        "adapter_steps_executed": int(executed_steps),
+        "fixed_horizon_completed": bool(adapters is None or executed_steps == max_steps),
+        "encountered_nonfinite_objective": bool(encountered_nonfinite_objective),
+        "scheduler": {"kind": "cosine", "horizon_steps": scheduler_horizon, "min_lr_ratio": float(config["cosine_min_lr_ratio"])},
+        "selection_relative_improvement": float(config["selection_relative_improvement"]),
+        "checkpoint_interval": checkpoint_interval,
+        "checkpoint_records": checkpoint_records,
+        "selection": selected_metadata,
+        "identity_parity_max_abs_large_selection": float(parity_large),
+        "identity_parity_max_abs_test": float(parity_test),
+        "identity_parity_reference_large_selection": parity_large_reference,
+        "identity_parity_reference_test": parity_test_reference,
+        "public_path_input_parity_checked_large_selection": bool(public_parity_large),
+        "public_path_input_parity_checked_test": bool(public_parity_test),
+        "fresh_spline_view_identity_passed": bool(adapters is None or (parity_large == 0.0 and parity_test == 0.0)),
+        "adapter_first_task_objective": first_task_objective,
+        "adapter_final_task_objective": final_task_objective,
+        "adapter_first_identity_penalty": first_identity_penalty,
+        "adapter_final_identity_penalty": final_identity_penalty,
+        "adapter_first_total_objective": first_total_objective,
+        "adapter_final_total_objective": final_total_objective,
+        "adapter_train_context_policy": "all_non_query_fixed_fit_rows" if config.get("train_context_rows") is None else "sampled_context_cap",
+        "adapter_observed_train_context_rows_min": None if not training_context_sizes else int(min(training_context_sizes)),
+        "adapter_observed_train_context_rows_max": None if not training_context_sizes else int(max(training_context_sizes)),
+        "adapter_observed_train_context_rows_mean": None if not training_context_sizes else float(np.mean(training_context_sizes)),
+        "train_seconds": float(time.perf_counter() - started),
+        "peak_allocated_gib": float(peak_gib),
+    }
+    prediction_result = {
+        "small_identity_selection": identity_small,
+        "small_selected_selection": selected_selection_predictions["small"],
+        "large_identity_selection": identity_large,
+        "large_selected_selection": selected_selection_predictions["large"],
+        "identity_test": identity_test,
+        "small_selected_test": selected_test["small"],
+        "large_selected_test": selected_test["large"],
+    }
+    del adapters, bundle
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    return prediction_result, metadata, selected_states
+
+
 def _fit_selected_full_context_refit_standard(
     *,
     task: OpenMLTaskData,
@@ -3736,6 +4110,314 @@ def run_task_validation_selected_full_refit_standard(
         },
         "variants": variants,
     }
+
+
+def run_task_fixed_fit_validation_size_standard(
+    *,
+    task: OpenMLTaskData,
+    config_labels: list[str],
+    configs: list[dict[str, Any]],
+    small_validation_fraction: float,
+    large_validation_fraction: float,
+    validation_seed: int,
+    output_dir: Path,
+    protocol_seed: int,
+    device: torch.device,
+    classifier_checkpoint: str | Path | None,
+    regressor_checkpoint: str | Path | None,
+    resume: bool,
+    run_fingerprint_hash: str,
+    progress: Any = None,
+) -> dict[str, Any]:
+    """Compare nested selection sizes on a fixed fitted adapter trajectory.
+
+    Test labels are intentionally absent here.  This function only freezes
+    arrays after selection; the separate summary function may score them.
+    """
+
+    if len(config_labels) != len(configs) or not config_labels:
+        raise ValueError("fixed-fit selection-size run requires matching non-empty labels and configs")
+    if len(set(config_labels)) != len(config_labels):
+        raise ValueError("fixed-fit selection-size config labels must be unique")
+    task_split_seed = _seed(int(validation_seed), task.task_id, -3, 301)
+    fit_indices, small_indices, large_indices = fixed_fit_validation_size_splits(
+        task,
+        small_validation_fraction=small_validation_fraction,
+        large_validation_fraction=large_validation_fraction,
+        seed=task_split_seed,
+    )
+    split_digest = hashlib.sha256()
+    for values in (fit_indices, small_indices, large_indices):
+        split_digest.update(np.asarray(values, dtype=np.int64).tobytes())
+    split_hash = split_digest.hexdigest()
+    variants: dict[str, dict[str, Any]] = {}
+    for label, config in zip(config_labels, configs, strict=True):
+        artifact_dir = _fixed_fit_validation_size_dir(output_dir, task, label)
+        summary_path = artifact_dir / "summary.json"
+        prediction_path = artifact_dir / "predictions.npz"
+        split_path = artifact_dir / "selection_split.npz"
+        state_path = artifact_dir / "selected_adapter_states.pt"
+        if resume and all(path.is_file() for path in (summary_path, prediction_path, split_path, state_path)):
+            try:
+                result = _json_load(summary_path)
+                with np.load(split_path, allow_pickle=False) as split:
+                    stored_fit = np.asarray(split["fit_indices"], dtype=int)
+                    stored_small = np.asarray(split["small_selection_indices"], dtype=int)
+                    stored_large = np.asarray(split["large_selection_indices"], dtype=int)
+                with np.load(prediction_path, allow_pickle=False) as predictions:
+                    expected = {
+                        "small_identity_selection", "small_selected_selection",
+                        "large_identity_selection", "large_selected_selection",
+                        "identity_test", "small_selected_test", "large_selected_test",
+                    }
+                    complete_predictions = set(predictions.files) == expected
+                reusable = (
+                    result.get("experiment_type") == "fixed_fit_nested_validation_size_checkpoint_selection"
+                    and result.get("run_fingerprint_hash") == run_fingerprint_hash
+                    and result.get("task_id") == task.task_id
+                    and result.get("outer_split_hash") == task.outer_split_hash
+                    and result.get("config") == config
+                    and result.get("config_label") == label
+                    and result.get("split", {}).get("sha256") == split_hash
+                    and np.array_equal(stored_fit, fit_indices)
+                    and np.array_equal(stored_small, small_indices)
+                    and np.array_equal(stored_large, large_indices)
+                    and complete_predictions
+                    and result.get("prediction_artifact_sha256") == _artifact_sha256(prediction_path)
+                    and result.get("selected_adapter_states_sha256") == _artifact_sha256(state_path)
+                )
+            except (OSError, ValueError, KeyError, UnicodeDecodeError, json.JSONDecodeError):
+                reusable = False
+                result = None
+            if reusable and result is not None:
+                _emit(progress, event="fixed_fit_selection_size_reused", task_id=task.task_id, config_label=label)
+                variants[label] = result
+                continue
+            _emit(progress, event="fixed_fit_selection_size_rebuilding_incomplete", task_id=task.task_id, config_label=label)
+
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            split_path,
+            fit_indices=fit_indices,
+            small_selection_indices=small_indices,
+            large_selection_indices=large_indices,
+        )
+        _emit(
+            progress, event="fixed_fit_selection_size_started", task_id=task.task_id,
+            config_label=label, fit_rows=int(fit_indices.size),
+            small_selection_rows=int(small_indices.size), large_selection_rows=int(large_indices.size),
+        )
+        backbone, checkpoint_path, _checkpoint_metadata = load_frozen_backbone(
+            problem_type=task.problem_type, device=device,
+            classifier_checkpoint=classifier_checkpoint, regressor_checkpoint=regressor_checkpoint,
+        )
+        predictions, metadata, states = _fit_fixed_fit_selection_size_standard(
+            task=task, fit_indices=fit_indices, small_selection_indices=small_indices,
+            large_selection_indices=large_indices, config=config, protocol_seed=protocol_seed,
+            backbone=backbone, device=device, progress=progress,
+        )
+        del backbone, checkpoint_path
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        np.savez_compressed(prediction_path, **predictions)
+        torch.save({"states": states, "selection": metadata["selection"]}, state_path)
+        result = {
+            "experiment_type": "fixed_fit_nested_validation_size_checkpoint_selection",
+            "task_id": task.task_id,
+            "dataset_id": task.dataset_id,
+            "dataset_name": task.dataset_name,
+            "problem_type": task.problem_type,
+            "n_classes": task.n_classes,
+            "outer_split_hash": task.outer_split_hash,
+            "run_fingerprint_hash": run_fingerprint_hash,
+            "config_label": label,
+            "config": config,
+            "split": {
+                "small_validation_fraction": float(small_validation_fraction),
+                "large_validation_fraction": float(large_validation_fraction),
+                "root_seed": int(validation_seed),
+                "task_seed": int(task_split_seed),
+                "fit_rows": int(fit_indices.size),
+                "small_selection_rows": int(small_indices.size),
+                "large_selection_rows": int(large_indices.size),
+                "sha256": split_hash,
+                "artifact": split_path.name,
+            },
+            "selection": metadata,
+            "selected_adapter_states": state_path.name,
+            "selected_adapter_states_sha256": _artifact_sha256(state_path),
+            "prediction_artifact_sha256": _artifact_sha256(prediction_path),
+            "test_metrics_deferred_to_task_summary": True,
+            "outer_test_policy": (
+                "One fixed adapter trajectory is trained on the persisted fit rows. Nested small and large "
+                "selection sets independently choose identity or a checkpoint before outer-test predictions "
+                "are frozen. Outer-test labels are read only by the separate summary stage."
+            ),
+        }
+        _json_dump(summary_path, result)
+        _emit(
+            progress, event="fixed_fit_selection_size_completed", task_id=task.task_id,
+            config_label=label,
+            small_selected_step=int(metadata["selection"]["small"]["selected_step"]),
+            large_selected_step=int(metadata["selection"]["large"]["selected_step"]),
+            seconds=float(metadata["train_seconds"]),
+        )
+        variants[label] = result
+    return {
+        "experiment_type": "fixed_fit_nested_validation_size_checkpoint_selection",
+        "task_id": task.task_id, "dataset_id": task.dataset_id,
+        "dataset_name": task.dataset_name, "problem_type": task.problem_type,
+        "n_classes": task.n_classes, "outer_split_hash": task.outer_split_hash,
+        "run_fingerprint_hash": run_fingerprint_hash,
+        "split": {
+            "small_validation_fraction": float(small_validation_fraction),
+            "large_validation_fraction": float(large_validation_fraction),
+            "root_seed": int(validation_seed), "task_seed": int(task_split_seed),
+            "fit_rows": int(fit_indices.size), "small_selection_rows": int(small_indices.size),
+            "large_selection_rows": int(large_indices.size), "sha256": split_hash,
+        },
+        "variants": variants,
+    }
+
+
+def summarize_fixed_fit_validation_size_task(
+    *, task: OpenMLTaskData, output_dir: Path, task_result: dict[str, Any]
+) -> dict[str, Any]:
+    """Score a completed fixed-fit selection-size task after predictions freeze."""
+
+    if task_result.get("experiment_type") != "fixed_fit_nested_validation_size_checkpoint_selection":
+        raise RuntimeError("refusing to score a non fixed-fit selection-size task")
+    variants: dict[str, Any] = {}
+    for label, result in task_result["variants"].items():
+        prediction_path = _fixed_fit_validation_size_dir(output_dir, task, label) / "predictions.npz"
+        identity = _load_prediction(prediction_path, "identity_test")
+        variants[label] = {
+            "selection": result["selection"]["selection"],
+            "small_selection": _selected_pair_summary(
+                task=task, identity_prediction=identity,
+                selected_prediction=_load_prediction(prediction_path, "small_selected_test"),
+            ),
+            "large_selection": _selected_pair_summary(
+                task=task, identity_prediction=identity,
+                selected_prediction=_load_prediction(prediction_path, "large_selected_test"),
+            ),
+        }
+    summary = {
+        "experiment_type": "fixed_fit_nested_validation_size_checkpoint_selection",
+        "outer_test_scored_after_both_selection_rules_froze_predictions": True,
+        "outer_test_used_for_selection": False,
+        "task_id": task.task_id, "dataset_id": task.dataset_id,
+        "dataset_name": task.dataset_name, "problem_type": task.problem_type,
+        "n_classes": task.n_classes, "outer_split_hash": task.outer_split_hash,
+        "split": task_result["split"], "variants": variants,
+        "comparison_note": (
+            "Small and large decisions use the same fitted adapter trajectory and test context. "
+            "They differ only in nested labelled checkpoint-selection evidence."
+        ),
+    }
+    path = output_dir / "fixed_fit_validation_size_task_summaries" / (
+        f"task_{task.task_id}_{_safe_name(task.dataset_name)}.json"
+    )
+    _json_dump(path, summary)
+    return summary
+
+
+def summarize_fixed_fit_validation_size_experiment(
+    *,
+    task_summaries: list[dict[str, Any]],
+    output_dir: Path,
+    bootstrap_rounds: int,
+    bootstrap_seed: int,
+    skipped_tasks: list[dict[str, Any]] | None = None,
+    task_eligibility: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Aggregate fixed-fit small/large checkpoint-selection outcomes."""
+
+    if not task_summaries:
+        raise ValueError("cannot summarise an empty fixed-fit selection-size experiment")
+    skipped_tasks = [] if skipped_tasks is None else skipped_tasks
+    labels = list(task_summaries[0]["variants"])
+    if not labels or any(list(item["variants"]) != labels for item in task_summaries):
+        raise ValueError("all fixed-fit selection-size summaries need the same ordered variants")
+    paired_results: dict[str, dict[str, Any]] = {}
+    rows: list[dict[str, Any]] = []
+    for label_offset, label in enumerate(labels):
+        paired_results[label] = {}
+        for size_offset, size in enumerate(("small_selection", "large_selection")):
+            reference = np.asarray(
+                [float(item["variants"][label][size]["identity"]["benchmark_error"]) for item in task_summaries],
+                dtype=float,
+            )
+            candidate = np.asarray(
+                [float(item["variants"][label][size]["selected"]["benchmark_error"]) for item in task_summaries],
+                dtype=float,
+            )
+            problem_types = np.asarray([str(item["problem_type"]) for item in task_summaries], dtype=object)
+            paired_results[label][size] = _paired_comparison_summary(
+                reference=reference, candidate=candidate, problem_types=problem_types,
+                bootstrap_rounds=bootstrap_rounds,
+                bootstrap_seed=bootstrap_seed + 10 * label_offset + size_offset,
+                reference_label="fixed_fit_standard_tabicl_identity",
+                candidate_label=f"{label}_{size}",
+            )
+        for item in task_summaries:
+            selection = item["variants"][label]["selection"]
+            small = item["variants"][label]["small_selection"]
+            large = item["variants"][label]["large_selection"]
+            rows.append(
+                {
+                    "task_id": item["task_id"], "dataset_id": item["dataset_id"],
+                    "dataset_name": item["dataset_name"], "problem_type": item["problem_type"],
+                    "outer_split_hash": item["outer_split_hash"], "variant": label,
+                    "fit_rows": item["split"]["fit_rows"],
+                    "small_selection_rows": selection["small"]["selection_rows"],
+                    "large_selection_rows": selection["large"]["selection_rows"],
+                    "small_selected_step": selection["small"]["selected_step"],
+                    "large_selected_step": selection["large"]["selected_step"],
+                    "small_selected_use_adapted": selection["small"]["selected_use_adapted"],
+                    "large_selected_use_adapted": selection["large"]["selected_use_adapted"],
+                    "small_selection_error": selection["small"]["selected_selection_error"],
+                    "large_selection_error": selection["large"]["selected_selection_error"],
+                    "identity_benchmark_error": small["identity"]["benchmark_error"],
+                    "small_selected_benchmark_error": small["selected"]["benchmark_error"],
+                    "large_selected_benchmark_error": large["selected"]["benchmark_error"],
+                    "small_selected_deployment_error": small["selected"]["deployment_error"],
+                    "large_selected_deployment_error": large["selected"]["deployment_error"],
+                    "small_test_relative_improvement_vs_identity": small["selected_deployment_relative_improvement_vs_identity"],
+                    "large_test_relative_improvement_vs_identity": large["selected_deployment_relative_improvement_vs_identity"],
+                    "large_minus_small_test_deployment_error": (
+                        float(small["selected"]["deployment_error"])
+                        - float(large["selected"]["deployment_error"])
+                    ),
+                }
+            )
+    csv_path = output_dir / "fixed_fit_validation_size_results.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        fieldnames = list(dict.fromkeys(key for row in rows for key in row))
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader(); writer.writerows(rows)
+    changed = [
+        row for row in rows
+        if row["small_selected_step"] != row["large_selected_step"]
+        or row["small_selected_use_adapted"] != row["large_selected_use_adapted"]
+    ]
+    summary = {
+        "experiment_type": "fixed_fit_nested_validation_size_checkpoint_selection",
+        "n_tasks": len(task_summaries), "n_skipped_tasks": len(skipped_tasks),
+        "task_eligibility": task_eligibility,
+        "paired_results": paired_results,
+        "selection_decision_changed_on": [row["dataset_name"] for row in changed],
+        "n_selection_decisions_changed": len(changed),
+        "rows": rows,
+        "interpretation": (
+            "The small and large rules score checkpoints from the same training trajectory and test with the "
+            "same fitted context. A difference isolates the consequence of additional nested selection labels "
+            "for this split/trajectory; it does not estimate a standard 80/20 protocol or a full-context refit."
+        ),
+    }
+    _json_dump(output_dir / "summary.json", summary)
+    return summary
 
 
 def _selected_pair_summary(
