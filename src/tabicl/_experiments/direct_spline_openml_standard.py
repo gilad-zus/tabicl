@@ -423,6 +423,7 @@ def _make_adapters(bundle: _StandardBag, config: dict[str, Any], device: torch.d
                 trainable_location_scale=bool(config["trainable_location_scale"]),
                 coordinate_mapping=str(config.get("coordinate_mapping", "linear")),
                 direct_spline_output=bool(config.get("direct_spline_output", False)),
+                preserve_input_base=bool(config.get("preserve_input_base", False)),
                 knot_placement="uniform",
                 control_mode="monotone",
                 cross_column_mixing_rank=int(config["cross_column_mixing_rank"]),
@@ -475,7 +476,7 @@ def _make_adapters(bundle: _StandardBag, config: dict[str, Any], device: torch.d
                 adapter.scale.fill_(1.0)
             transformed_probe = adapter.transform(identity_probe)  # type: ignore[attr-defined]
             coordinate_mapping = str(config.get("coordinate_mapping", "linear"))
-            if coordinate_mapping == "linear":
+            if coordinate_mapping == "linear" or bool(config.get("preserve_input_base", False)):
                 expected_probe = identity_probe
             elif coordinate_mapping == "arctan":
                 standardized_range = float(config.get("standardized_range", 4.0))

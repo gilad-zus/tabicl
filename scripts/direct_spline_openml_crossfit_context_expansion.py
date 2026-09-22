@@ -144,6 +144,15 @@ def _parse_args() -> argparse.Namespace:
             "Arctan is smooth, bounded, and has unit derivative at zero."
         ),
     )
+    parser.add_argument(
+        "--preserve-input-base",
+        action="store_true",
+        help=(
+            "For direct arctan output only, add the learned direct function as a residual "
+            "around the original TabICL-standardized feature. The fresh adapter is exactly "
+            "the ordinary TabICL input rather than the arctan-compressed coordinate."
+        ),
+    )
     parser.add_argument("--query-fraction-min", type=float, default=None)
     parser.add_argument("--query-fraction-max", type=float, default=None)
     parser.add_argument("--adapter-steps", type=int, default=None)
@@ -207,6 +216,13 @@ def _parse_args() -> argparse.Namespace:
         )
         if not args.column_control_points or any(value <= 3 for value in args.column_control_points):
             raise ValueError("column control-point counts must all exceed cubic degree 3")
+    if args.preserve_input_base and (
+        args.coordinate_mapping != "arctan"
+        or args.adapter_arm not in {"direct_line", "direct_spline"}
+    ):
+        raise ValueError(
+            "--preserve-input-base requires --coordinate-mapping arctan and a direct adapter arm"
+        )
     return args
 
 
@@ -455,7 +471,10 @@ def _fit_context_expansion_bag(
     if device.type == "cuda":
         torch.cuda.manual_seed_all(adapter_seed)
     adapters = _make_adapters(bundle, config, device)
-    fresh_adapter_must_be_identity = str(config.get("coordinate_mapping", "linear")) == "linear"
+    fresh_adapter_must_be_identity = (
+        str(config.get("coordinate_mapping", "linear")) == "linear"
+        or bool(config.get("preserve_input_base", False))
+    )
     parity_a, parity_a_reference, public_parity_a = _identity_view_parity(
         bundle=bundle, adapters=adapters, query_x=selection_a_x, device=device, progress=None,
         task_id=task.task_id, bag=bag, split="context_expansion_selection_a",
@@ -917,6 +936,7 @@ def _manifest(
         "requested_bags": args.bags,
         "adapter_arm": str(args.adapter_arm),
         "coordinate_mapping": str(getattr(args, "coordinate_mapping", "linear")),
+        "preserve_input_base": bool(getattr(args, "preserve_input_base", False)),
         "query_fraction_range": (
             None
             if args.query_fraction_min is None
@@ -1188,6 +1208,7 @@ def main() -> None:
     if (
         args.adapter_arm != "source"
         or args.coordinate_mapping != "linear"
+        or bool(args.preserve_input_base)
         or args.query_fraction_min is not None
         or args.column_control_points is not None
         or getattr(args, "adapter_steps", None) is not None
@@ -1202,6 +1223,7 @@ def main() -> None:
                 if config["direct_spline_output"]:
                     config["trainable_location_scale"] = False
             config["coordinate_mapping"] = str(args.coordinate_mapping)
+            config["preserve_input_base"] = bool(args.preserve_input_base)
             if args.n_control_points is not None:
                 config["n_control_points"] = int(args.n_control_points)
             if args.query_fraction_min is not None:

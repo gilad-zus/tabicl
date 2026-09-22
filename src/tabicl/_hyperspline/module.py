@@ -783,6 +783,7 @@ class DirectSplineTransform(nn.Module):
         trainable_location_scale: bool = False,
         coordinate_mapping: str = "linear",
         direct_spline_output: bool = False,
+        preserve_input_base: bool = False,
         knot_placement: str = "uniform",
         control_mode: str = "monotone",
         free_control_bound: float = 1.0,
@@ -809,6 +810,10 @@ class DirectSplineTransform(nn.Module):
             raise ValueError("direct spline output requires arctan coordinates")
         if direct_spline_output and trainable_location_scale:
             raise ValueError("direct spline output does not use learned pre-arctan location/scale")
+        if preserve_input_base and not (direct_spline_output and coordinate_mapping == "arctan"):
+            raise ValueError(
+                "preserve_input_base requires direct spline output in arctan coordinates"
+            )
         if control_mode not in {"monotone", "free"}:
             raise ValueError("control_mode must be one of: monotone, free")
         if free_control_bound <= 0:
@@ -825,6 +830,7 @@ class DirectSplineTransform(nn.Module):
         self.trainable_location_scale = trainable_location_scale
         self.coordinate_mapping = coordinate_mapping
         self.direct_spline_output = direct_spline_output
+        self.preserve_input_base = preserve_input_base
         self.knot_placement = knot_placement
         self.control_mode = control_mode
         self.free_control_bound = free_control_bound
@@ -1124,7 +1130,16 @@ class DirectSplineTransform(nn.Module):
                 torch.log(torch.as_tensor(self.scale_adjustment_bound, device=u.device))
                 * torch.tanh(self.direct_log_span).unsqueeze(1)
             )
-            return center + half_span * spline_value
+            direct_output = center + half_span * spline_value
+            if self.preserve_input_base:
+                # Keep the frozen model's ordinary standardized input as the
+                # initial representation.  The arctan coordinate only tells
+                # the spline where its residual is evaluated.  With zero
+                # centre, unit span, and identity controls this is bit-exact
+                # z, while the shape-frozen arm can still learn an affine
+                # adjustment in u.
+                return z + direct_output - expanded_range * u
+            return direct_output
         return base + params.gate.unsqueeze(1) * expanded_range * spline_residual
 
     def transform(self, x: torch.Tensor) -> torch.Tensor:
