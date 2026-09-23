@@ -6,9 +6,11 @@ from pathlib import Path
 import sys
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
+from tabicl._experiments.direct_spline_openml_standard import _make_adapters
 from tabicl._hyperspline import DirectSplineTransform
 
 
@@ -67,6 +69,47 @@ def test_native_input_residual_starts_exactly_at_tabicl_coordinates():
     changed.square().mean().backward()
     assert spline.gap_logits.grad is not None
     assert spline.direct_center.grad is not None
+
+
+def test_native_input_residual_is_exact_for_standard_probe_and_random_values():
+    n_columns = 7
+    probe = torch.linspace(-5.0, 5.0, 17).view(1, 17, 1).expand(-1, -1, n_columns)
+    values = torch.cat((probe, torch.randn(1, 4096, n_columns) * 7.0), dim=1)
+    for trainable_shape in (False, True):
+        adapter = DirectSplineTransform(
+            torch.zeros(1, 1, n_columns),
+            n_control_points=20,
+            trainable_shape=trainable_shape,
+            trainable_location_scale=False,
+            coordinate_mapping="arctan",
+            direct_spline_output=True,
+            preserve_input_base=True,
+            cross_column_mixing_rank=4,
+        )
+        with torch.no_grad():
+            adapter.location.zero_()
+            adapter.scale.fill_(1.0)
+            assert torch.equal(adapter.transform(values), values)
+
+
+def test_standard_adapter_accepts_input_preserving_initialization():
+    bundle = SimpleNamespace(
+        numerical_indices=np.arange(7),
+        estimator=SimpleNamespace(
+            ensemble_generator_=SimpleNamespace(preprocessors_=["normal"])
+        ),
+    )
+    config = {
+        "n_control_points": 20,
+        "trainable_shape": True,
+        "trainable_location_scale": False,
+        "coordinate_mapping": "arctan",
+        "direct_spline_output": True,
+        "preserve_input_base": True,
+        "cross_column_mixing_rank": 4,
+        "cross_column_mixing_bound": 0.1,
+    }
+    assert _make_adapters(bundle, config, torch.device("cpu")) is not None
 
 
 def test_native_input_residual_rejects_non_arctan_direct_output():

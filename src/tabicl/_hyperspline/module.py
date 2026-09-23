@@ -1130,16 +1130,19 @@ class DirectSplineTransform(nn.Module):
                 torch.log(torch.as_tensor(self.scale_adjustment_bound, device=u.device))
                 * torch.tanh(self.direct_log_span).unsqueeze(1)
             )
-            direct_output = center + half_span * spline_value
             if self.preserve_input_base:
                 # Keep the frozen model's ordinary standardized input as the
-                # initial representation.  The arctan coordinate only tells
-                # the spline where its residual is evaluated.  With zero
-                # centre, unit span, and identity controls this is bit-exact
-                # z, while the shape-frozen arm can still learn an affine
-                # adjustment in u.
-                return z + direct_output - expanded_range * u
-            return direct_output
+                # initial representation.  Form the correction from terms
+                # that are individually zero at initialization; computing
+                # z + direct_output - R*u loses exact identity to GPU
+                # rounding because the subtraction happens after adding z.
+                residual = (
+                    center
+                    + (half_span - expanded_range) * u
+                    + half_span * spline_residual
+                )
+                return z + residual
+            return center + half_span * spline_value
         return base + params.gate.unsqueeze(1) * expanded_range * spline_residual
 
     def transform(self, x: torch.Tensor) -> torch.Tensor:
