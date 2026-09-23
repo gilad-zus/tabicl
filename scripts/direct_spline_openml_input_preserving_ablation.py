@@ -25,13 +25,12 @@ import argparse
 import csv
 import hashlib
 import json
+import math
+import statistics
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Mapping
-
-from tabicl._experiments.paired_metrics import relative_error_reduction, summarize_error_pairs
-
 
 REFERENCE_ARMS = {
     "compressed_line": "direct_arctan_line",
@@ -41,6 +40,27 @@ PRESERVING_ARMS = {
     "preserved_line": "direct_line",
     "preserved_spline": "direct_spline",
 }
+
+
+def relative_error_reduction(reference: float, candidate: float) -> float | None:
+    if not all(math.isfinite(value) and value >= 0 for value in (reference, candidate)):
+        raise ValueError("paired errors must be finite non-negative values")
+    return (reference - candidate) / reference if reference > 0 else None
+
+
+def summarize_error_pairs(pairs: list[tuple[float, float]]) -> dict[str, int | float | None]:
+    gains = [relative_error_reduction(reference, candidate) for reference, candidate in pairs]
+    relative = [gain for gain in gains if gain is not None]
+    wins = sum(reference > candidate for reference, candidate in pairs)
+    losses = sum(candidate > reference for reference, candidate in pairs)
+    return {
+        "wins": wins,
+        "losses": losses,
+        "ties": len(pairs) - wins - losses,
+        "n_relative_gain_tasks": len(relative),
+        "mean_relative_gain": statistics.mean(relative) if relative else None,
+        "median_relative_gain": statistics.median(relative) if relative else None,
+    }
 
 
 def _canonical_json(value: Any) -> str:
@@ -167,9 +187,6 @@ def _prepare_manifest(args: argparse.Namespace) -> None:
         ),
         "standard_adapter_sha256": _sha256(
             script.resolve().parents[1] / "src/tabicl/_experiments/direct_spline_openml_standard.py"
-        ),
-        "reporting_sha256": _sha256(
-            script.resolve().parents[1] / "src/tabicl/_experiments/paired_metrics.py"
         ),
     }
     path = args.output_dir / "experiment_manifest.json"
