@@ -92,7 +92,10 @@ def test_native_input_residual_is_exact_for_standard_probe_and_random_values():
             assert torch.equal(adapter.transform(values), values)
 
 
-def test_standard_adapter_accepts_input_preserving_initialization():
+@pytest.mark.parametrize("device_name", ("cpu", "cuda"))
+def test_standard_adapter_accepts_input_preserving_initialization(device_name):
+    if device_name == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
     bundle = SimpleNamespace(
         numerical_indices=np.arange(7),
         estimator=SimpleNamespace(
@@ -109,7 +112,7 @@ def test_standard_adapter_accepts_input_preserving_initialization():
         "cross_column_mixing_rank": 4,
         "cross_column_mixing_bound": 0.1,
     }
-    assert _make_adapters(bundle, config, torch.device("cpu")) is not None
+    assert _make_adapters(bundle, config, torch.device(device_name)) is not None
 
 
 def test_native_input_residual_rejects_non_arctan_direct_output():
