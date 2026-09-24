@@ -70,3 +70,29 @@ def test_confirmation_rejects_changed_identity_baseline(tmp_path):
 
     with pytest.raises(ValueError, match="identity error differs"):
         experiment._aggregate(SimpleNamespace(output_dir=tmp_path, task_id=[1]))
+
+
+def test_confirmation_compares_cosine_and_saved_constant_lr_on_same_tasks(tmp_path):
+    _write_arm(tmp_path, "preserved_line", [_record(1, 0.30, 0.30, 1.0)])
+    _write_arm(tmp_path, "preserved_spline", [_record(1, 0.25, 0.25, 1.0)])
+    reference = tmp_path / "constant"
+    reference.mkdir()
+    (reference / "confirmation_summary.json").write_text(json.dumps({
+        "task_results": [{
+            "task_id": 1,
+            "dataset_name": "task-1",
+            "outer_test_full_tabiclv2": 0.45,
+            "outer_test_raw_spline_line": 0.35,
+            "outer_test_raw_spline_spline": 0.40,
+            "outer_test_selected_blend_line": 0.35,
+            "outer_test_selected_blend_spline": 0.40,
+        }],
+    }), encoding="utf-8")
+
+    summary = experiment._aggregate(SimpleNamespace(
+        output_dir=tmp_path, reference_dir=reference, task_id=[1]
+    ))
+
+    assert summary["comparisons"]["cosine_vs_constant_line"]["wins"] == 1
+    assert summary["comparisons"]["cosine_vs_constant_spline"]["wins"] == 1
+    assert summary["task_results"][0]["outer_test_raw_spline_spline_cosine_gain"] == pytest.approx(0.375)

@@ -31,6 +31,39 @@ experiment = _load_module(
 )
 
 
+def test_cosine_override_changes_only_learning_rate_schedule_in_training_config():
+    source = {
+        "learning_rate": 0.005,
+        "validation_interval": 10,
+        "random_state": 0,
+        "adapter_steps": 500,
+        "trainable_location_scale": True,
+    }
+    args = SimpleNamespace(
+        adapter_arm="direct_spline",
+        coordinate_mapping="arctan",
+        preserve_input_base=True,
+        n_control_points=20,
+        cosine_min_lr_ratio=0.01,
+        adapter_steps=500,
+        query_fraction_min=0.05,
+        query_fraction_max=0.20,
+        column_control_points=None,
+    )
+
+    configured = experiment._updated_adapter_config(source, args)
+
+    assert configured["cosine_schedule_steps"] == 500
+    assert configured["cosine_min_lr_ratio"] == 0.01
+    assert configured["learning_rate"] == 0.005
+    assert configured["validation_interval"] == 10
+    assert configured["random_state"] == 0
+    assert configured["trainable_shape"] is True
+    assert configured["direct_spline_output"] is True
+    assert configured["trainable_location_scale"] is False
+    assert "cosine_schedule_steps" not in source
+
+
 def _bag() -> object:
     return experiment.ContextExpansionBagPredictions(
         validation_indices=np.asarray([0, 1]),

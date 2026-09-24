@@ -156,6 +156,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--query-fraction-min", type=float, default=None)
     parser.add_argument("--query-fraction-max", type=float, default=None)
     parser.add_argument("--adapter-steps", type=int, default=None)
+    parser.add_argument(
+        "--cosine-min-lr-ratio", type=float, default=None,
+        help="Use cosine decay over the adapter trajectory, ending at this fraction of the initial LR.",
+    )
     parser.add_argument("--n-control-points", type=int, default=None,
                         help="Override uniform cubic capacity; staged line starts are transferred exactly.")
     parser.add_argument("--training-audit-episodes", type=int, default=0,
@@ -196,6 +200,8 @@ def _parse_args() -> argparse.Namespace:
         raise ValueError("--bootstrap-rounds must be positive")
     if args.adapter_steps is not None and args.adapter_steps < 1:
         raise ValueError("--adapter-steps must be positive")
+    if args.cosine_min_lr_ratio is not None and not 0.0 < args.cosine_min_lr_ratio <= 1.0:
+        raise ValueError("--cosine-min-lr-ratio must lie in (0, 1]")
     if args.n_control_points is not None and args.n_control_points < 4:
         raise ValueError("cubic splines require at least four control points")
     if args.training_audit_episodes < 0:
@@ -943,6 +949,7 @@ def _manifest(
             else [float(args.query_fraction_min), float(args.query_fraction_max)]
         ),
         "adapter_steps_override": getattr(args, "adapter_steps", None),
+        "cosine_min_lr_ratio_override": getattr(args, "cosine_min_lr_ratio", None),
         "n_control_points_override": getattr(args, "n_control_points", None),
         "training_audit_episodes": getattr(args, "training_audit_episodes", 0),
         "column_control_points": (
@@ -1174,6 +1181,31 @@ def _comparison(
     )
 
 
+def _updated_adapter_config(config: Mapping[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    updated = dict(config)
+    if args.adapter_arm != "source":
+        updated["trainable_shape"] = args.adapter_arm in {"full_spline", "direct_spline"}
+        updated["direct_spline_output"] = args.adapter_arm in {"direct_line", "direct_spline"}
+        if updated["direct_spline_output"]:
+            updated["trainable_location_scale"] = False
+    updated["coordinate_mapping"] = str(args.coordinate_mapping)
+    updated["preserve_input_base"] = bool(args.preserve_input_base)
+    if args.n_control_points is not None:
+        updated["n_control_points"] = int(args.n_control_points)
+    if args.cosine_min_lr_ratio is not None:
+        updated["cosine_schedule_steps"] = int(
+            args.adapter_steps if args.adapter_steps is not None else updated["adapter_steps"]
+        )
+        updated["cosine_min_lr_ratio"] = float(args.cosine_min_lr_ratio)
+    if args.query_fraction_min is not None:
+        updated["query_fraction_min"] = float(args.query_fraction_min)
+        updated["query_fraction_max"] = float(args.query_fraction_max)
+    if args.column_control_points is not None:
+        updated["adapter_architecture"] = "heterogeneous_fixed_cubic"
+        updated["column_control_points"] = list(args.column_control_points)
+    return updated
+
+
 def main() -> None:
     args = _parse_args()
     source_dir = args.source_dir.resolve()
@@ -1212,27 +1244,12 @@ def main() -> None:
         or args.query_fraction_min is not None
         or args.column_control_points is not None
         or getattr(args, "adapter_steps", None) is not None
+        or getattr(args, "cosine_min_lr_ratio", None) is not None
         or getattr(args, "n_control_points", None) is not None
     ):
         configured_cases = []
         for case in cases:
-            config = dict(case.config)
-            if args.adapter_arm != "source":
-                config["trainable_shape"] = args.adapter_arm in {"full_spline", "direct_spline"}
-                config["direct_spline_output"] = args.adapter_arm in {"direct_line", "direct_spline"}
-                if config["direct_spline_output"]:
-                    config["trainable_location_scale"] = False
-            config["coordinate_mapping"] = str(args.coordinate_mapping)
-            config["preserve_input_base"] = bool(args.preserve_input_base)
-            if args.n_control_points is not None:
-                config["n_control_points"] = int(args.n_control_points)
-            if args.query_fraction_min is not None:
-                config["query_fraction_min"] = float(args.query_fraction_min)
-                config["query_fraction_max"] = float(args.query_fraction_max)
-            if args.column_control_points is not None:
-                config["adapter_architecture"] = "heterogeneous_fixed_cubic"
-                config["column_control_points"] = list(args.column_control_points)
-            configured_cases.append(replace(case, config=config))
+            configured_cases.append(replace(case, config=_updated_adapter_config(case.config, args)))
         cases = configured_cases
     manifest = _manifest(source_dir=source_dir, source_manifest=source_manifest, reference_dir=args.reference_crossfit_dir, reference_manifest=reference_manifest, cases=cases, args=args)
     fingerprint = _prepare_output(output_dir=args.output_dir, manifest=manifest, resume=bool(args.resume))
