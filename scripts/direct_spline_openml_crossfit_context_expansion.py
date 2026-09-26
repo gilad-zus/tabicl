@@ -87,6 +87,7 @@ from tabicl._experiments.direct_spline_openml_standard import (
     _training_logits,
 )
 from tabicl._experiments.direct_spline_protocol import deployment_error, sample_episode_indices
+from tabicl._experiments.direct_spline_preprocessing import install_minimal_numerical_preprocessing
 
 
 CONTEXT_EXPANSION_SCHEMA_VERSION = 2
@@ -164,6 +165,11 @@ def _parse_args() -> argparse.Namespace:
                         help="Override uniform cubic capacity; staged line starts are transferred exactly.")
     parser.add_argument("--training-audit-episodes", type=int, default=0,
                         help="Fixed train-only episodes for final and selected checkpoint diagnostics.")
+    parser.add_argument("--numerical-preparation", choices=("standard", "minimal"), default="standard")
+    parser.add_argument("--constant-lr", action="store_true", help="Explicitly remove an inherited cosine schedule.")
+    parser.add_argument("--training-random-state", type=int, default=None)
+    parser.add_argument("--validation-interval", type=int, default=None)
+    parser.add_argument("--branch-diagnostics", action="store_true")
     parser.add_argument(
         "--column-control-points",
         default=None,
@@ -206,6 +212,10 @@ def _parse_args() -> argparse.Namespace:
         raise ValueError("cubic splines require at least four control points")
     if args.training_audit_episodes < 0:
         raise ValueError("training-audit-episodes must be nonnegative")
+    if args.constant_lr and args.cosine_min_lr_ratio is not None:
+        raise ValueError("choose constant or cosine LR")
+    if args.validation_interval is not None and args.validation_interval < 1:
+        raise ValueError("validation-interval must be positive")
     if args.n_control_points is not None and args.column_control_points is not None:
         raise ValueError("choose uniform or per-column capacity, not both")
     if args.reference_atol < 0.0:
@@ -244,6 +254,7 @@ def _append_prediction(
     appended_indices: np.ndarray,
     adapters: Any,
     device: torch.device,
+    normalization_methods: tuple[str, ...] | None = None,
 ) -> np.ndarray:
     appended_indices = np.asarray(appended_indices, dtype=int)
     return _normal_prediction_with_appended_context(
@@ -254,6 +265,7 @@ def _append_prediction(
         appended_context_y=np.asarray(task.y_train[appended_indices]),
         adapters=adapters,
         device=device,
+        normalization_methods=normalization_methods,
     )
 
 
@@ -472,6 +484,8 @@ def _fit_context_expansion_bag(
         backbone=backbone,
         device=device,
     )
+    if config.get("numerical_preparation", "standard") == "minimal":
+        install_minimal_numerical_preprocessing(bundle)
     adapter_seed = _seed(int(config["random_state"]), task.task_id, bag, 202)
     torch.manual_seed(adapter_seed)
     if device.type == "cuda":
@@ -595,6 +609,8 @@ def _fit_context_expansion_bag(
             min_lr_ratio=float(config["cosine_min_lr_ratio"]),
         )
         identity_state = _cpu_state_dict(adapters)
+        if audit_episodes:
+            training_audit["initial"] = measure_training()
         best = {key: {"step": 0, "error": float("inf"), "valid": False, "state": identity_state} for key in ("original_a", "original_b")}
 
         def train_trajectory(*, target_name: str | None = None) -> tuple[float, float, int]:
@@ -725,6 +741,7 @@ def _fit_context_expansion_bag(
                     "trajectory": "shared" if target_name is None else target_name,
                     "step": int(step), **error_fields,
                     "learning_rates": [float(group["lr"]) for group in optimizer.param_groups],
+                    **({"fixed_training_loss": measure_training()} if audit_episodes else {}),
                 })
             if audit_episodes:
                 key = "final_" + (target_name or "shared")
@@ -771,6 +788,30 @@ def _fit_context_expansion_bag(
         expanded_spline_b_on_a = _append_prediction(bundle=bundle, task=task, query_x=selection_a_x, appended_indices=selection_b_indices, adapters=adapters, device=device)
         expanded_spline_b_test = _append_prediction(bundle=bundle, task=task, query_x=task.x_test, appended_indices=validation_indices, adapters=adapters, device=device)
 
+    branch_predictions = {}
+    if config.get("branch_diagnostics", False):
+        for method in bundle.estimator.ensemble_generator_.preprocessors_:
+            values = {}
+            specifications = (
+                ("expanded_identity_selection_a", selection_a_x, selection_b_indices, None),
+                ("expanded_identity_selection_b", selection_b_x, selection_a_indices, None),
+                ("expanded_identity_test", task.x_test, validation_indices, None),
+                ("expanded_spline_selected_on_b_selection_a", selection_a_x, selection_b_indices, "original_b"),
+                ("expanded_spline_selected_on_a_selection_b", selection_b_x, selection_a_indices, "original_a"),
+                ("expanded_spline_selected_on_a_test", task.x_test, validation_indices, "original_a"),
+                ("expanded_spline_selected_on_b_test", task.x_test, validation_indices, "original_b"),
+            )
+            for name, query, appended, state_name in specifications:
+                active = None
+                if adapters is not None and state_name is not None:
+                    adapters.load_state_dict(best[state_name]["state"], strict=True)
+                    active = adapters
+                values[name] = _append_prediction(
+                    bundle=bundle, task=task, query_x=query, appended_indices=appended,
+                    adapters=active, device=device, normalization_methods=(method,),
+                ).tolist()
+            branch_predictions[method] = values
+
     peak_gib = 0.0 if device.type != "cuda" else torch.cuda.max_memory_allocated(device) / 2**30
     metadata = {
         "bag": int(bag),
@@ -792,6 +833,8 @@ def _fit_context_expansion_bag(
         "adapter_first_objective": first_objective,
         "adapter_final_objective": final_objective,
         "fixed_training_audit": training_audit,
+        "numerical_preparation": config.get("numerical_preparation", "standard"),
+        "branch_predictions": branch_predictions,
         "checkpoints": {name: {key: value for key, value in record.items() if key != "state"} for name, record in best.items()},
         "adapter_checkpoint_records": checkpoint_records,
         "identity_parity_max_abs_selection_a": float(parity_a),
@@ -952,6 +995,11 @@ def _manifest(
         "cosine_min_lr_ratio_override": getattr(args, "cosine_min_lr_ratio", None),
         "n_control_points_override": getattr(args, "n_control_points", None),
         "training_audit_episodes": getattr(args, "training_audit_episodes", 0),
+        "numerical_preparation": getattr(args, "numerical_preparation", "standard"),
+        "constant_lr_override": getattr(args, "constant_lr", False),
+        "training_random_state_override": getattr(args, "training_random_state", None),
+        "validation_interval_override": getattr(args, "validation_interval", None),
+        "branch_diagnostics": getattr(args, "branch_diagnostics", False),
         "column_control_points": (
             None
             if args.column_control_points is None
@@ -983,6 +1031,9 @@ def _manifest(
             ),
             "adapter_module": _sha256(
                 Path(__file__).resolve().parents[1] / "src/tabicl/_hyperspline/module.py"
+            ),
+            "numerical_preparation": _sha256(
+                Path(__file__).resolve().parents[1] / "src/tabicl/_experiments/direct_spline_preprocessing.py"
             ),
         },
         "script_sha256": _sha256(Path(__file__)),
@@ -1125,6 +1176,33 @@ def _run_task(
         identity_test=expanded_test_identity,
         spline_test=expanded_test_spline,
     )
+    branch_records = {}
+    branch_arrays = {}
+    for method in bags[0].metadata.get("branch_predictions", {}):
+        branch_bags = [replace(item, **{
+            name: np.asarray(values, dtype=float)
+            for name, values in item.metadata["branch_predictions"][method].items()
+        }) for item in bags]
+        identity_oof, spline_oof, identity_test, spline_test = _assemble(
+            task=task, bags=branch_bags, condition="expanded"
+        )
+        branch_records[method] = {
+            split: {
+                label: _metric_bundle(task.problem_type, labels, prediction, task.n_classes)
+                for label, prediction in predictions.items()
+            }
+            for split, labels, predictions in (
+                ("oof", task.y_train, {"identity": identity_oof, "raw_spline": spline_oof}),
+                ("outer_test", task.y_test, {"identity": identity_test, "raw_spline": spline_test}),
+            )
+        }
+        for label, prediction in (
+            ("identity_oof", identity_oof), ("spline_oof", spline_oof),
+            ("identity_test", identity_test), ("spline_test", spline_test),
+        ):
+            branch_arrays[f"{method}_{label}"] = prediction
+    if branch_arrays:
+        np.savez_compressed(task_dir / "branch_predictions.npz", **branch_arrays)
     prediction_path = task_dir / "task_predictions.npz"
     np.savez_compressed(prediction_path, **{f"original_{name}": value for name, value in original["predictions"].items()}, **{f"expanded_{name}": value for name, value in expanded["predictions"].items()})
     source_prediction = _source_standard_prediction(source_dir=case.source_dir, task=task)
@@ -1145,6 +1223,7 @@ def _run_task(
         "effective_adapter_patience": None,
         "original_context": {key: value for key, value in original.items() if key != "predictions"},
         "expanded_context": {key: value for key, value in expanded.items() if key != "predictions"},
+        "branch_diagnostics": branch_records,
         "source_full_outer_training_tabiclv2": None if source_prediction is None else _metric_bundle(task.problem_type, task.y_test, source_prediction, task.n_classes),
         "original_context_replay_max_abs": replay_max,
         "outer_test_scored_after_both_context_predictions_and_alphas_fixed": True,
@@ -1183,6 +1262,15 @@ def _comparison(
 
 def _updated_adapter_config(config: Mapping[str, Any], args: argparse.Namespace) -> dict[str, Any]:
     updated = dict(config)
+    if getattr(args, "constant_lr", False):
+        updated.pop("cosine_schedule_steps", None)
+        updated.pop("cosine_min_lr_ratio", None)
+    for arg_name, config_name in (("training_random_state", "random_state"), ("validation_interval", "validation_interval")):
+        value = getattr(args, arg_name, None)
+        if value is not None:
+            updated[config_name] = int(value)
+    updated["numerical_preparation"] = getattr(args, "numerical_preparation", "standard")
+    updated["branch_diagnostics"] = bool(getattr(args, "branch_diagnostics", False))
     if args.adapter_arm != "source":
         updated["trainable_shape"] = args.adapter_arm in {"full_spline", "direct_spline"}
         updated["direct_spline_output"] = args.adapter_arm in {"direct_line", "direct_spline"}
@@ -1246,6 +1334,11 @@ def main() -> None:
         or getattr(args, "adapter_steps", None) is not None
         or getattr(args, "cosine_min_lr_ratio", None) is not None
         or getattr(args, "n_control_points", None) is not None
+        or getattr(args, "numerical_preparation", "standard") != "standard"
+        or getattr(args, "constant_lr", False)
+        or getattr(args, "training_random_state", None) is not None
+        or getattr(args, "validation_interval", None) is not None
+        or getattr(args, "branch_diagnostics", False)
     ):
         configured_cases = []
         for case in cases:

@@ -1216,6 +1216,7 @@ def _normal_prediction(
     context_indices: np.ndarray,
     adapters: _AdapterSet | None,
     device: torch.device,
+    normalization_methods: tuple[str, ...] | None = None,
 ) -> np.ndarray:
     """Predict with normal ensemble views and an optional DirectSpline set."""
 
@@ -1229,6 +1230,8 @@ def _normal_prediction(
     class_patterns: list[np.ndarray | None] = []
     regression_members: list[np.ndarray] = []
     for method, preprocessor in generator.preprocessors_.items():
+        if normalization_methods is not None and method not in normalization_methods:
+            continue
         context = preprocessor.X_transformed_[context_indices]
         query = preprocessor.transform(prepared.filtered)
         public_views, public_labels, feature_shuffles, method_patterns = (
@@ -1319,6 +1322,7 @@ def _normal_prediction_with_appended_context(
     appended_context_y: np.ndarray,
     adapters: _AdapterSet | None,
     device: torch.device,
+    normalization_methods: tuple[str, ...] | None = None,
 ) -> np.ndarray:
     """Predict after appending labelled rows without refitting any component.
 
@@ -1342,6 +1346,7 @@ def _normal_prediction_with_appended_context(
             context_indices=context_indices,
             adapters=adapters,
             device=device,
+            normalization_methods=normalization_methods,
         )
 
     bundle.backbone.eval()
@@ -1357,6 +1362,8 @@ def _normal_prediction_with_appended_context(
     class_patterns: list[np.ndarray | None] = []
     regression_members: list[np.ndarray] = []
     for method, preprocessor in generator.preprocessors_.items():
+        if normalization_methods is not None and method not in normalization_methods:
+            continue
         original_context = preprocessor.X_transformed_[context_indices]
         appended_context = preprocessor.transform(prepared_append.filtered)
         context = np.concatenate((original_context, appended_context), axis=0)

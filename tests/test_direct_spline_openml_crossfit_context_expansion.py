@@ -172,6 +172,7 @@ def test_ablation_manifest_records_arm_sampler_and_implementation_hashes(monkeyp
         "standard_adapter",
         "episode_protocol",
         "adapter_module",
+        "numerical_preparation",
     }
 
 

@@ -2,6 +2,10 @@
 
 Codex always runs on the local Windows PC. Use this local repository for code inspection and editing, Git operations, unit tests, pytest, linting, type checking, debugging, CPU-only sanity checks, and analysis of downloaded results. Do not use the university server for ordinary development. If validation specifically requires CUDA/GPU resources, treat it as a remote experiment and use the built-in command approval mechanism before any remote operation.
 
+## Git branch continuity
+
+- Work on the user's current branch for routine development and experiments. Do not create or switch branches just to isolate ordinary changes. Change branches only when a concrete issue requires it or the user explicitly requests it; avoid back-and-forth branch changes.
+
 ## University SLURM environment
 
 - SSH host: `slurm-login1.lnx.biu.ac.il`
