@@ -1,0 +1,30 @@
+{
+  "format_version": 1,
+  "purpose": "Frozen real-transfer evaluation after synthetic-only checkpoint selection",
+  "split_seeds": [0, 1],
+  "max_rows": 1024,
+  "test_fraction": 0.3,
+  "eligibility": "2-10 classes, 5-100 encoded features, at least one numerical feature, at least 256 usable rows",
+  "families": [
+    {"source": "sklearn", "name": "breast_cancer"},
+    {"source": "sklearn", "name": "digits"},
+    {"source": "openml", "name": "adult", "version": 2},
+    {"source": "openml", "name": "credit-g", "version": 1},
+    {"source": "openml", "name": "bank-marketing", "version": 1},
+    {"source": "pmlb", "name": "allbp"},
+    {"source": "pmlb", "name": "bupa"},
+    {"source": "pmlb", "name": "coil2000"},
+    {"source": "pmlb", "name": "dermatology"},
+    {"source": "pmlb", "name": "ecoli"},
+    {"source": "pmlb", "name": "ionosphere"},
+    {"source": "pmlb", "name": "magic"},
+    {"source": "pmlb", "name": "page_blocks"},
+    {"source": "pmlb", "name": "phoneme"},
+    {"source": "pmlb", "name": "satimage"},
+    {"source": "pmlb", "name": "spambase"},
+    {"source": "pmlb", "name": "spectf"},
+    {"source": "pmlb", "name": "vehicle"},
+    {"source": "pmlb", "name": "waveform_21"},
+    {"source": "pmlb", "name": "yeast"}
+  ]
+}

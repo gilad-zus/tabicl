@@ -1,8 +1,17 @@
 # Joint preprocessing hypernetwork: proposed pilot, 2026-09-28
 
 Status, 2026-09-28: user requested execution. The synthetic-first model and
-runner have been implemented locally, and targeted CPU tests passed. No GPU
-training has started; real test family IDs and eligibility still need locking.
+runner have been implemented locally, and targeted CPU tests passed. Commit
+`4162107` is synchronized to the university checkout. After VPN reconnection,
+the 512-task validation and 1,024-task test banks were generated and frozen.
+GPU smoke job `31333979` was submitted on uriofir and was pending for resources
+at the last 2026-09-28 check; no training result is available yet. Twenty real
+family source IDs are reserved in `joint_preprocessing_real_transfer_manifest_20260928.json`;
+eligibility and source hashes are not yet verified, and no real data have been scored.
+The CPU bank log is `/home/dsi/zusmang/TabICL/tabicl/joint-preprocessing-bank-260928.log`.
+Smoke stdout/stderr are `slurm_logs/slurm-jp-smoke-j0-260928-31333979.out`
+and `.err` in the remote repository. Its requested resources are one uriofir
+GPU, 32G RAM, four CPUs and one hour, with default SLURM email enabled.
 
 Current recommendation following the synthetic-first question, 2026-09-28:
 train and select checkpoints using synthetic tasks only, then evaluate frozen
@@ -350,6 +359,15 @@ frozen inference path. Local checks: 30 targeted tests passed, including a tiny
 real TabICL forward/backward/inference smoke test and end-to-end one-step runner
 test; compilation passed. `ruff` is unavailable in the selected local venv.
 The local interpreter is `C:/Users/Gilad/Documents/Cursor/.venv/Scripts/python.exe`.
+
+The later real panel is fixed in
+`joint_preprocessing_real_transfer_manifest_20260928.json`. Its preparation and
+evaluation implementation is `scripts/joint_preprocessing_real_transfer.py`.
+PMLB sources are already numerical encodings and may not preserve original
+categorical types; the three OpenML families exercise typed categorical
+encoding. Prior research has inspected some of these families, so the panel is
+reserved against selection in this pilot but is not an untouched historical
+benchmark. Only synthetic validation determines checkpoints.
 
 Methodological references: [HyperFast](https://ojs.aaai.org/index.php/AAAI/article/view/28988)
 establishes dataset-to-model-weight generation; [TabICL](https://proceedings.mlr.press/v267/qu25d.html)
