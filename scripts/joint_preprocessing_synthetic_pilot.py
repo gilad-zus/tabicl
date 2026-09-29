@@ -452,12 +452,13 @@ def train(args: argparse.Namespace) -> None:
 
 def report(args: argparse.Namespace) -> None:
     manifest = read_manifest(args.output_dir)
+    bank_name = args.bank
     seeds = tuple(args.model_seeds)
     if not seeds or len(set(seeds)) != len(seeds) or any(seed not in (0, 1) for seed in seeds):
         raise ValueError("model seeds must be distinct and selected from 0, 1")
     runs = [(arm, seed, args.output_dir / "runs" / f"{arm}_seed{seed}") for arm in ARMS for seed in seeds]
     if any(not (path / "complete.json").is_file() for _, _, path in runs):
-        raise FileNotFoundError("all requested arm/seed runs must complete before opening the test bank")
+        raise FileNotFoundError("all requested arm/seed runs must complete before opening a report bank")
     device = torch.device(args.device)
     backbone, _, backbone_hash = load_frozen(args, device)
     selected = {}
@@ -469,9 +470,9 @@ def report(args: argparse.Namespace) -> None:
         model.load_state_dict(payload["model"])
         model.eval()
         selected[(arm, seed)] = model
-    test = load_bank(args.output_dir, manifest, "test")
+    episodes = load_bank(args.output_dir, manifest, bank_name)
     rows = []
-    for i, source in enumerate(test):
+    for i, source in enumerate(episodes):
         e = on_device(source, device)
         if device.type == "cuda":
             torch.cuda.synchronize(device)
@@ -501,9 +502,9 @@ def report(args: argparse.Namespace) -> None:
                              n_context=e.x_context.shape[1], n_query=e.x_query.shape[1],
                              n_features=e.x_context.shape[2], n_classes=e.n_classes))
         if (i + 1) % 32 == 0:
-            print(f"reported {i + 1}/{len(test)} synthetic tasks", flush=True)
-    output = args.output_dir / ("report" if seeds == (0, 1) else
-                                "report_seed" + "_".join(map(str, seeds)))
+            print(f"reported {i + 1}/{len(episodes)} {bank_name} tasks", flush=True)
+    report_name = "report" if seeds == (0, 1) else "report_seed" + "_".join(map(str, seeds))
+    output = args.output_dir / (report_name if bank_name == "test" else f"validation_{report_name}")
     output.mkdir(parents=True, exist_ok=True)
     with (output / "synthetic_tasks.csv").open("w", newline="", encoding="utf8") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
@@ -532,7 +533,8 @@ def report(args: argparse.Namespace) -> None:
                 for left, right in (("joint", "restricted"), ("no_spline", "restricted"), ("joint", "no_spline"))}
     json_write(output / "synthetic_summary.json", dict(arms=summaries, pairwise=pairwise,
                                                         model_seed_ids=list(seeds),
-                                                        bank_sha256=manifest["banks"]["test"]["sha256"],
+                                                        bank_name=bank_name,
+                                                        bank_sha256=manifest["banks"][bank_name]["sha256"],
                                                         limitation="same-generator synthetic transfer only"))
     print(json.dumps(summaries, indent=2), flush=True)
 
@@ -563,6 +565,7 @@ def main() -> None:
     evaluation.add_argument("--device", default="cuda")
     evaluation.add_argument("--checkpoint", type=Path, default=None)
     evaluation.add_argument("--model-seeds", type=int, nargs="+", choices=(0, 1), default=[0, 1])
+    evaluation.add_argument("--bank", choices=("validation", "test"), default="test")
     args = parser.parse_args()
     {"prepare": prepare, "train": train, "report": report}[args.command](args)
 

@@ -35,6 +35,19 @@ verification snapshot. Seed-0 results can support an interim comparison, but
 the originally specified two-seed evidence and report are deferred.
 The reporter now accepts `--model-seeds 0` and writes this interim synthetic
 panel to `report_seed0/`, leaving the original two-seed `report/` path separate.
+All three seed-0 training jobs completed on 2026-09-29 (exit 0, 10,000 steps).
+Selected validation scores/steps were `joint` -0.003521 at 1,000,
+`restricted` -0.004493 at 3,000, and `no_spline` -0.003084 at 8,000.
+These are fixed-bank selection results against matched identity, not test
+results. The seed-0 synthetic test report was submitted as uriofir job
+`31506739` from commit `fe389fb` (one GPU, 32G RAM, four CPUs, one-hour limit).
+It targets `results/hyperspline_joint_preprocessing_pilot/v1_seed20260928/report_seed0/`;
+logs are `slurm_logs/slurm-jp-test-s0-260929-31506739.out` and `.err`.
+For a descriptive win/loss diagnostic requested after selection, `report
+--bank validation --model-seeds 0` uses the frozen seed-0 checkpoints on the
+512 validation tasks and writes `validation_report_seed0/`. This does not
+change checkpoint selection. The output includes paired task wins/losses versus
+identity and ordinary TabICL, and remains separate from the final test report.
 
 Current recommendation following the synthetic-first question, 2026-09-28:
 train and select checkpoints using synthetic tasks only, then evaluate frozen

@@ -148,9 +148,11 @@ def test_report_accepts_only_completed_seed_zero_runs(tmp_path, monkeypatch):
     backbone = FakeBackbone()
     backbone.dummy.requires_grad_(False)
     monkeypatch.setattr(pilot, "load_frozen", lambda args, device: (backbone, tmp_path / "backbone", "hash"))
-    monkeypatch.setattr(pilot, "load_bank", lambda root, manifest, name: [episode])
+    loaded_banks = []
+    monkeypatch.setattr(pilot, "load_bank", lambda root, manifest, name: (loaded_banks.append(name), [episode])[1])
     pilot.json_write(pilot.manifest_path(tmp_path),
-                     {"format_version": 1, "banks": {"test": {"sha256": "bank-hash"}}})
+                     {"format_version": 1, "banks": {"test": {"sha256": "test-hash"},
+                                                      "validation": {"sha256": "validation-hash"}}})
     manifest_hash = pilot.hash_file(pilot.manifest_path(tmp_path))
     for arm in pilot.ARMS:
         run = tmp_path / "runs" / f"{arm}_seed0"
@@ -159,15 +161,25 @@ def test_report_accepts_only_completed_seed_zero_runs(tmp_path, monkeypatch):
                                                      backbone_hash="hash", manifest_sha256=manifest_hash))
         if arm != "no_spline":
             pilot.json_write(run / "complete.json", {"steps_completed": 1})
-    args = argparse.Namespace(output_dir=tmp_path, model_seeds=[0], device="cpu", checkpoint=None)
+    args = argparse.Namespace(output_dir=tmp_path, model_seeds=[0], device="cpu",
+                              checkpoint=None, bank="test")
     with pytest.raises(FileNotFoundError):
         pilot.report(args)
+    assert loaded_banks == []
     pilot.json_write(tmp_path / "runs" / "no_spline_seed0" / "complete.json", {"steps_completed": 1})
     pilot.report(args)
     result = json.loads((tmp_path / "report_seed0" / "synthetic_summary.json").read_text())
     assert result["model_seed_ids"] == [0]
+    assert result["bank_name"] == "test"
+    assert result["bank_sha256"] == "test-hash"
     assert all(result["arms"][arm]["model_seeds"] == 1 for arm in pilot.ARMS)
     assert not (tmp_path / "report" / "synthetic_summary.json").exists()
+    args.bank = "validation"
+    pilot.report(args)
+    result = json.loads((tmp_path / "validation_report_seed0" / "synthetic_summary.json").read_text())
+    assert result["bank_name"] == "validation"
+    assert result["bank_sha256"] == "validation-hash"
+    assert loaded_banks == ["test", "validation"]
 
 
 def test_actual_tiny_tabicl_training_and_inference_paths():
