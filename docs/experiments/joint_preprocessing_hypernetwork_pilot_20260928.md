@@ -19,6 +19,23 @@ prints a 50-step training heartbeat to stdout, and records and prints the fixed
 validation scores against matched identity, rather than falling training loss
 on newly generated tasks alone, are the learning signal.
 
+Full synthetic training was submitted on 2026-09-29 from commit `467c5c9`:
+`joint` seeds 0/1: `31422457` (resumes smoke state) / `31423075`;
+`restricted` seeds 0/1: `31423133` / `31423134`;
+`no_spline` seeds 0/1: `31423147` / `31423261`. Each job requests uriofir,
+one GPU, 32G host RAM, four CPUs, and up to eight hours, with email enabled.
+Each writes to `results/hyperspline_joint_preprocessing_pilot/v1_seed20260928/runs/<arm>_seed<seed>/`.
+Stdout/stderr are `slurm_logs/slurm-<job-name>-<job-id>.out` and `.err`.
+All six were pending in one `squeue` snapshot after submission. Their training
+outcomes are pending; hitting the wall-time limit may require resuming.
+On 2026-09-29 the user narrowed the current run to seed 0. Seed-1 jobs
+`31423075`, `31423134`, and `31423261` were cancelled before starting;
+seed-0 jobs `31422457`, `31423133`, and `31423147` remained pending at the
+verification snapshot. Seed-0 results can support an interim comparison, but
+the originally specified two-seed evidence and report are deferred.
+The reporter now accepts `--model-seeds 0` and writes this interim synthetic
+panel to `report_seed0/`, leaving the original two-seed `report/` path separate.
+
 Current recommendation following the synthetic-first question, 2026-09-28:
 train and select checkpoints using synthetic tasks only, then evaluate frozen
 models on synthetic tests and subsequently on real dataset families. The earlier

@@ -1,4 +1,5 @@
 import argparse
+import json
 import numpy as np
 import pytest
 import torch
@@ -136,6 +137,37 @@ def test_one_step_runner_writes_selected_checkpoint(tmp_path, monkeypatch, capsy
     checkpoint = torch.load(tmp_path / "runs" / "joint_seed0" / "selected.pt", weights_only=True)
     assert checkpoint["selected_step"] in (0, 1)
     assert (tmp_path / "runs" / "joint_seed0" / "complete.json").exists()
+
+
+def test_report_accepts_only_completed_seed_zero_runs(tmp_path, monkeypatch):
+    from scripts import joint_preprocessing_synthetic_pilot as pilot
+
+    x, y, query = example()
+    episode = SyntheticEpisode(3_000_000_000, 172001, x, query, y,
+                               torch.tensor([0, 1]), 2)
+    backbone = FakeBackbone()
+    backbone.dummy.requires_grad_(False)
+    monkeypatch.setattr(pilot, "load_frozen", lambda args, device: (backbone, tmp_path / "backbone", "hash"))
+    monkeypatch.setattr(pilot, "load_bank", lambda root, manifest, name: [episode])
+    pilot.json_write(pilot.manifest_path(tmp_path),
+                     {"format_version": 1, "banks": {"test": {"sha256": "bank-hash"}}})
+    manifest_hash = pilot.hash_file(pilot.manifest_path(tmp_path))
+    for arm in pilot.ARMS:
+        run = tmp_path / "runs" / f"{arm}_seed0"
+        run.mkdir(parents=True)
+        pilot.atomic_save(run / "selected.pt", dict(model=pilot.state_cpu(JointPreprocessor(arm)),
+                                                     backbone_hash="hash", manifest_sha256=manifest_hash))
+        if arm != "no_spline":
+            pilot.json_write(run / "complete.json", {"steps_completed": 1})
+    args = argparse.Namespace(output_dir=tmp_path, model_seeds=[0], device="cpu", checkpoint=None)
+    with pytest.raises(FileNotFoundError):
+        pilot.report(args)
+    pilot.json_write(tmp_path / "runs" / "no_spline_seed0" / "complete.json", {"steps_completed": 1})
+    pilot.report(args)
+    result = json.loads((tmp_path / "report_seed0" / "synthetic_summary.json").read_text())
+    assert result["model_seed_ids"] == [0]
+    assert all(result["arms"][arm]["model_seeds"] == 1 for arm in pilot.ARMS)
+    assert not (tmp_path / "report" / "synthetic_summary.json").exists()
 
 
 def test_actual_tiny_tabicl_training_and_inference_paths():
