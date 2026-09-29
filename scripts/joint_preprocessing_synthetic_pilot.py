@@ -374,6 +374,8 @@ def train(args: argparse.Namespace) -> None:
             best_score = initial_score
         csv_append(run_dir / "validation.csv", dict(step=0, tasks_seen=0, score=initial_score,
                                                      mean_nll=initial_nll, selected=True))
+        print(f"{args.arm} seed={args.model_seed} step=0 val_nll={initial_nll:.5f} "
+              f"val_score={initial_score:.6f} best={best_score:.6f}@0", flush=True)
     json_write(run_dir / "config.json", dict(arm=args.arm, model_seed=args.model_seed,
                                               fingerprint=fingerprint, backbone_hash=backbone_hash,
                                               steps=args.steps, learning_rate=args.lr))
@@ -387,6 +389,9 @@ def train(args: argparse.Namespace) -> None:
     if not args.resume:
         save_state(0)
     stop = args.steps if args.max_steps is None else min(args.steps, args.max_steps)
+    recent_losses: list[float] = []
+    recent_norms: list[float] = []
+    last_progress_time = time.perf_counter()
     for current_step in range(step + 1, stop + 1):
         model.train()
         episodes = train_episodes(args, current_step, device)
@@ -406,8 +411,14 @@ def train(args: argparse.Namespace) -> None:
         if not math.isfinite(norm):
             raise FloatingPointError(f"nonfinite gradient at step {current_step}")
         optimizer.step()
+        mean_loss = float(np.mean(losses))
+        recent_losses.append(mean_loss)
+        recent_norms.append(norm)
+        if len(recent_losses) > args.save_every:
+            recent_losses.pop(0)
+            recent_norms.pop(0)
         csv_append(run_dir / "training.csv", dict(step=current_step, tasks_seen=4 * current_step,
-                                                   mean_nll=float(np.mean(losses)), preclip_gradient_norm=norm))
+                                                   mean_nll=mean_loss, preclip_gradient_norm=norm))
         validated = current_step % args.validate_every == 0 or current_step == args.steps
         if validated:
             score, mean_nll = validation_score(backbone, model, validation, identity_nll, device)
@@ -416,8 +427,16 @@ def train(args: argparse.Namespace) -> None:
                 best_score, best_step, best_model = score, current_step, state_cpu(model)
             csv_append(run_dir / "validation.csv", dict(step=current_step, tasks_seen=4 * current_step,
                                                          score=score, mean_nll=mean_nll, selected=selected))
-            print(f"{args.arm} seed={args.model_seed} step={current_step} train_nll={np.mean(losses):.5f} "
-                  f"val_score={score:.6f} best={best_score:.6f}@{best_step}", flush=True)
+            print(f"{args.arm} seed={args.model_seed} step={current_step} train_nll={mean_loss:.5f} "
+                  f"val_nll={mean_nll:.5f} val_score={score:.6f} "
+                  f"best={best_score:.6f}@{best_step}", flush=True)
+        if current_step % args.save_every == 0 or current_step == stop:
+            now = time.perf_counter()
+            print(f"{args.arm} seed={args.model_seed} step={current_step}/{args.steps} "
+                  f"train_nll_recent={np.mean(recent_losses):.5f} "
+                  f"grad_norm_recent={np.mean(recent_norms):.5f} "
+                  f"elapsed_since_progress_s={now - last_progress_time:.1f}", flush=True)
+            last_progress_time = now
         if validated or current_step % args.save_every == 0 or current_step == stop:
             save_state(current_step)
     if stop == args.steps:

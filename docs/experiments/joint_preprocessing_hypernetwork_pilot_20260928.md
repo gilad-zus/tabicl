@@ -4,21 +4,27 @@ Status, 2026-09-28: user requested execution. The synthetic-first model and
 runner have been implemented locally, and targeted CPU tests passed. Commit
 `4162107` is synchronized to the university checkout. After VPN reconnection,
 the 512-task validation and 1,024-task test banks were generated and frozen.
-GPU smoke job `31333979` was submitted on uriofir and was pending for resources
-at the last 2026-09-28 check; no training result is available yet. Twenty real
+GPU smoke job `31333979` completed on 2026-09-29 (exit 0). Its step-0
+validation NLL was 0.9188; its one training update had NLL 0.7883 and finite
+preclip gradient norm 1.1602. This checks execution, not learning. Twenty real
 family source IDs are reserved in `joint_preprocessing_real_transfer_manifest_20260928.json`;
 eligibility and source hashes are not yet verified, and no real data have been scored.
 The CPU bank log is `/home/dsi/zusmang/TabICL/tabicl/joint-preprocessing-bank-260928.log`.
 Smoke stdout/stderr are `slurm_logs/slurm-jp-smoke-j0-260928-31333979.out`
 and `.err` in the remote repository. Its requested resources are one uriofir
 GPU, 32G RAM, four CPUs and one hour, with default SLURM email enabled.
+The full trainer writes per-step training NLL and gradient norm to `training.csv`,
+prints a 50-step training heartbeat to stdout, and records and prints the fixed
+512-task validation score and NLL every 1,000 steps. Sustained negative
+validation scores against matched identity, rather than falling training loss
+on newly generated tasks alone, are the learning signal.
 
 Current recommendation following the synthetic-first question, 2026-09-28:
 train and select checkpoints using synthetic tasks only, then evaluate frozen
 models on synthetic tests and subsequently on real dataset families. The earlier
 50/50 real/synthetic training and validation proposal is superseded. Real-data
-meta-training is a possible follow-up, not a prerequisite. No run is authorized
-or launched by this recommendation.
+meta-training is a possible follow-up, not a prerequisite. The user authorized
+the synthetic-first experiment; the smoke job above has completed.
 
 ## Question and relation to previous work
 

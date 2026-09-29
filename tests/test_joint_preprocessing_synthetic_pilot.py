@@ -110,7 +110,7 @@ def test_standard_preprocessing_reference_is_finite():
     assert 0 <= metrics["accuracy"] <= 1
 
 
-def test_one_step_runner_writes_selected_checkpoint(tmp_path, monkeypatch):
+def test_one_step_runner_writes_selected_checkpoint(tmp_path, monkeypatch, capsys):
     from scripts import joint_preprocessing_synthetic_pilot as pilot
 
     x, y, query = example()
@@ -129,6 +129,10 @@ def test_one_step_runner_writes_selected_checkpoint(tmp_path, monkeypatch):
                               checkpoint=None, lr=1e-3, steps=1, validate_every=1,
                               save_every=1, max_steps=None, resume=False)
     pilot.train(args)
+    progress = capsys.readouterr().out
+    assert "step=0 val_nll=" in progress
+    assert "step=1 train_nll=" in progress
+    assert "step=1/1 train_nll_recent=" in progress
     checkpoint = torch.load(tmp_path / "runs" / "joint_seed0" / "selected.pt", weights_only=True)
     assert checkpoint["selected_step"] in (0, 1)
     assert (tmp_path / "runs" / "joint_seed0" / "complete.json").exists()
