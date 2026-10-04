@@ -82,6 +82,8 @@ def _episode(frame, labels: np.ndarray, *, family: str, seed: int, max_rows: int
     if not np.isfinite(x_context).all() or not np.isfinite(x_query).all():
         raise ValueError(f"{family}: encoded features are nonfinite")
     return dict(family=family, split_seed=seed, n_classes=len(classes),
+                context_indices=torch.from_numpy(indices[context].copy()),
+                query_indices=torch.from_numpy(indices[query].copy()),
                 x_context=torch.from_numpy(x_context).unsqueeze(0),
                 x_query=torch.from_numpy(x_query).unsqueeze(0),
                 y_context=torch.from_numpy(y_context.astype(np.float32)).unsqueeze(0),
@@ -128,11 +130,11 @@ def prepare(args: argparse.Namespace) -> None:
     print(f"Prepared frozen real-transfer bank: {bank_path}", flush=True)
 
 
-def _prepared_views(episode: dict[str, Any]):
+def _prepared_views(episode: dict[str, Any], estimators: int = 8):
     x_context = episode["x_context"].squeeze(0).numpy()
     x_query = episode["x_query"].squeeze(0).numpy()
     y_context = episode["y_context"].squeeze(0).numpy().astype(int)
-    generator = EnsembleGenerator(classification=True, n_estimators=8,
+    generator = EnsembleGenerator(classification=True, n_estimators=estimators,
                                   norm_methods=["none", "power"], feat_shuffle_method="latin",
                                   class_shuffle_method="shift", random_state=0).fit(x_context, y_context)
     members = generator.transform(x_query, mode="both")
@@ -145,8 +147,10 @@ def _prepared_views(episode: dict[str, Any]):
     return generator, members, canonical_numerical, numerical_keep, keep
 
 
-def evaluate_episode(backbone, model: JointPreprocessor | str, episode: dict[str, Any]) -> dict[str, float]:
-    generator, members, numerical_positions, numerical_keep, keep = _prepared_views(episode)
+def episode_logits(backbone, model: JointPreprocessor | str, episode: dict[str, Any],
+                   estimators: int = 8) -> tuple[torch.Tensor, int]:
+    """Predict from context labels and query features; query labels are never read."""
+    generator, members, numerical_positions, numerical_keep, keep = _prepared_views(episode, estimators)
     device = next(backbone.parameters()).device
     context = episode["x_context"][..., keep].to(device)
     query = episode["x_query"][..., keep].to(device)
@@ -189,6 +193,12 @@ def evaluate_episode(backbone, model: JointPreprocessor | str, episode: dict[str
                 class_index = torch.as_tensor(class_shuffle, device=device, dtype=torch.long)
                 logits.append(raw[..., :episode["n_classes"]][..., class_index])
     average = torch.stack(logits).mean(dim=0)
+    return average, len(logits)
+
+
+def evaluate_episode(backbone, model: JointPreprocessor | str, episode: dict[str, Any]) -> dict[str, float]:
+    average, _ = episode_logits(backbone, model, episode)
+    device = average.device
     labels = episode["y_query"].to(device)
     log_prob = F.log_softmax(average.float() / 0.9, dim=-1).flatten(0, 1)
     nll = float(F.nll_loss(log_prob, labels))
