@@ -1,8 +1,15 @@
 # Research memory: what we have already tried
 
-Last reviewed: **2026-09-26**. Read before proposing the next experiment.
+Last reviewed: **2026-10-05**. Read before proposing the next experiment.
 Purpose: avoid rediscovering old ideas, not enumerate every result or permanently rule
 out approaches. Details and source paths: [research history](research_history_20260920.md).
+
+Current agreed run, 2026-10-05: **seed 0 only**, current single-view CE versus
+ordinary8+learned8 ensemble CE, 1,024 updates each, four paired real episodes/update,
+same original pretrained start and 40-source/10-validation family bank. This is
+the previously deferred objective ablation, with no teacher, new gate or target
+fitting. Implementation complete; 51 distinct local checks passed. Submission
+pending; no new result. See [one-seed protocol](joint_preprocessing_ensemble_objective_20261005.md).
 
 Meeting reference, 2026-09-26: `thesis_meeting_brief_20260927.md` consolidates recent
 results, matched-control qualifications, training protocols and formula changes.
