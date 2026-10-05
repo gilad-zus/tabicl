@@ -1,0 +1,47 @@
+{
+  "date": "2026-10-05",
+  "original_job_id": "32073418",
+  "original_revision": "b248c3d272ccd57be227fb33e2f3b6dc85a90b90",
+  "original_job_states": {
+    "32073418_0": "FAILED 1:0 after 04:41:51",
+    "32073418_1": "FAILED 1:0 after 00:01:14"
+  },
+  "failure": {
+    "type": "IndexError",
+    "message": "index 12 is out of bounds for axis 1 with size 12",
+    "arm": "real",
+    "continuation_seed": 0,
+    "step": 1478,
+    "family": "Titanic",
+    "rows": 128,
+    "context_fraction": 0.5,
+    "episode_seed": 3813224753,
+    "locally_reproduced_before_fix": true
+  },
+  "fix": "Align typed numerical input/output positions and missing masks with retained mean-imputer columns; ordinary transform unchanged.",
+  "completed_runs_preserved": [
+    "synthetic_seed0",
+    "synthetic_seed1"
+  ],
+  "resume_step_inferred_from_last_checkpoint_log": 1450,
+  "experiment_manifest_fingerprint": "b62d26b770666607c9b0d4a2fd370b10e25d95034ccd2e7a4cd425f1cde6abdf",
+  "banks_and_manifest_regenerated": false,
+  "preprocessing_original_sha256": "02720be46c54a0702fa1d3de434ace76322e5847dc87cb7c5772610983860e74",
+  "preprocessing_repaired_sha256": "606ef13f6f01994d77f5a3a586956011335c9df2a03e72697b1ca86b4903b5e2",
+  "verification": {
+    "distinct_tests_passed": 69,
+    "new_regression_tests": 13,
+    "exact_failing_batch_repaired": true,
+    "cpu_backward_actual_tiny_tabicl": true,
+    "cpu_backward_nll": 0.666696310043335,
+    "sparse_numerical_families": [
+      "Titanic",
+      "horse_colic_outcome"
+    ],
+    "planned_sparse_real_episodes_audited": 1638,
+    "planned_audit_scope": "Both real-seed streams, all4096 steps, all positions from families with numerical columns observed on fewer than half of source rows; mixed draws are subsets of these.",
+    "local_cpu_verification_seconds": 36.64464289999887
+  },
+  "status": "LOCAL FIX VERIFIED; awaiting revision synchronization and GPU resume submission",
+  "failure_verified_at": "2026-10-05T07:55:29+03:00"
+}

@@ -1,7 +1,22 @@
 # Joint preprocessing: synthetic / real / mixed continuation
 
-Authorized **2026-10-04**. Implementation is complete; local combined checks and
-launch preparation are underway. No GPU outcome exists at this snapshot.
+Authorized **2026-10-04**. Implementation and 56 relevant local checks passed.
+Revision `b248c3d` is committed, pushed and synchronized to the university checkout.
+Recovery update **2026-10-05**: array 32073418 failed on a context-empty numerical
+column during real seed-zero update 1,478. Both synthetic runs completed.
+The shared encoder fix passes local regression and exact-episode checks;
+replacement resume submission is being prepared. See
+[the repair note](joint_preprocessing_real_meta_continuation_repair_20261005.md).
+
+Original launch snapshot:
+CPU preparation completed on dsiofir01 with `runnohup jp-rm-bank-261004`,
+PID 604568; log `/home/dsi/zusmang/TabICL/tabicl/jp-rm-bank-261004.log`.
+All 40/10/30 real families and synthetic banks are frozen. Downloaded metadata,
+fingerprints, manifest links and all nine committed code hashes passed local
+verification. GPU array **32073418**, job **jp-rm-261004**, was submitted at
+2026-10-04 23:51:35 IDT; both tasks were **PENDING (Resources)** at 23:52:12 IDT.
+The scheduler estimated 2026-10-05 03:24:14 IDT on dsiuriofir01; this may change.
+No new training or evaluation outcome exists at this snapshot.
 
 Question: does exposure to real source families improve frozen zero-shot
 preprocessing beyond the same additional synthetic training? Closest predecessors
@@ -147,7 +162,29 @@ resumable pipeline. Slots skip finished arms, resume the current one, lock all
 six models, then resume final reporting. This uses one GPU at a time and respects
 the eight-hour maximum per allocation. About 6–8.3 training hours plus diagnostic
 evaluation/setup and up to roughly three reporting hours justify more than one
-slot. Later slots exit promptly if the pipeline is already complete. Exact
-approved commands, job IDs and logs will be appended after submission.
+slot. Later slots exit promptly if the pipeline is already complete.
 
 Result root: `results/hyperspline_joint_real_meta_continuation/v1_seed20261004`.
+
+Submitted array `0-1%1` runs two resumable allocations serially, with email
+BEGIN/END/FAIL enabled. Requested per allocation: uriofir / p_uriofir /
+ug_uri_ofir, one GPU, 32G host RAM, four CPUs, eight hours. Batch file:
+`/home/dsi/zusmang/TabICL/tabicl/.slurm_submissions/jp-rm-261004_20261004_235134.slurm`.
+
+Exact stdout/stderr paths:
+
+- `/home/dsi/zusmang/TabICL/tabicl/slurm_logs/slurm-jp-rm-261004-32073418_0.out`
+- `/home/dsi/zusmang/TabICL/tabicl/slurm_logs/slurm-jp-rm-261004-32073418_0.err`
+- `/home/dsi/zusmang/TabICL/tabicl/slurm_logs/slurm-jp-rm-261004-32073418_1.out`
+- `/home/dsi/zusmang/TabICL/tabicl/slurm_logs/slurm-jp-rm-261004-32073418_1.err`
+
+Remote result directory:
+`/home/dsi/zusmang/TabICL/tabicl/results/hyperspline_joint_real_meta_continuation/v1_seed20261004`.
+Downloaded metadata directory:
+`C:\Users\Gilad\Documents\Cursor\TabICL\results\hyperspline_joint_real_meta_continuation\v1_seed20261004`.
+Two test candidates failed source loading (`vehicle_sensIT`, `jEdit_4.2_4.3`);
+the predeclared availability-only fallback order filled all 30 test families.
+Tensor banks and checkpoints were not downloaded for local verification.
+Exact approved CPU/submission commands, selected families, availability reasons,
+hash verification and scheduler snapshot are recorded in
+[the execution record](joint_preprocessing_real_meta_continuation_submission_20261004.json).

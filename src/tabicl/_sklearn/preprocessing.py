@@ -178,6 +178,19 @@ class TransformToNumerical(TransformerMixin, BaseEstimator):
 
         self.tfm_.fit(X)
 
+        if len(self.numeric_input_positions_):
+            imputer = (self.tfm_.named_transformers_["continuous"]
+                       if hasattr(X, "columns") else self.tfm_)
+            # Default mean imputation drops columns with no context observations.
+            # Track only its retained columns so typed values and missing masks
+            # match the unchanged ordinary transform, including for query rows.
+            retained = ~np.isnan(imputer.statistics_)
+            self.numeric_input_positions_ = self.numeric_input_positions_[retained]
+            n_categorical = len(self.categorical_output_positions_)
+            self.numeric_output_positions_ = np.arange(
+                n_categorical, n_categorical + int(retained.sum()), dtype=int
+            )
+
         if self.verbose and hasattr(self.tfm_, "transformers_"):
             selected_cols = []
             for name, tfm, pos in self.tfm_.transformers_:

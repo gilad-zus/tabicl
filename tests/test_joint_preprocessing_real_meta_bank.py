@@ -79,6 +79,25 @@ def test_content_hash_ignores_row_column_order_and_detects_target_changes():
         bank._reject_duplicate(relabeled, "new", [dict(family="old", fingerprints=original)])
 
 
+def test_episode_handles_numerical_feature_missing_only_in_sampled_context():
+    raw = family(rare=False)
+    original = bank.sample_real_episode(raw, 128, .5, 9)
+    changed = copy.deepcopy(raw)
+    context_rows = set(original["context_indices"].tolist())
+    changed["columns"][1]["values"] = [None if i in context_rows else value
+                                         for i, value in enumerate(changed["columns"][1]["values"])]
+    repaired = bank.sample_real_episode(changed, 128, .5, 9)
+    # Merged order is category, x0, x1, x2, x3, x4; remove context-empty x1.
+    keep = [0, 1, 3, 4, 5]
+    for key in ("x_context", "x_query"):
+        torch.testing.assert_close(repaired[key], original[key][..., keep], rtol=0, atol=0)
+    for key in ("context_missing", "query_missing"):
+        torch.testing.assert_close(repaired[key], original[key][..., [0, 2, 3, 4]], rtol=0, atol=0)
+    for key in ("context_indices", "query_indices", "y_context", "y_query"):
+        torch.testing.assert_close(repaired[key], original[key], rtol=0, atol=0)
+    assert int(repaired["numerical_mask"].sum()) == 4
+
+
 def manifest_fixture():
     entry = lambda name: dict(source="pmlb", name=name, source_group=f"group_{name}")
     return dict(format_version=1, target_counts=dict(train=2, validation=1, test=1),
