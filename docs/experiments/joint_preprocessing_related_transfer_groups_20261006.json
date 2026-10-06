@@ -1,0 +1,29 @@
+{
+  "format_version": 1,
+  "purpose": "Exploratory domain-related versus cross-domain zero-shot transfer; group membership declared from task descriptions, not model gains",
+  "historical_status": "Reuses previously inspected development datasets. Independent of the synthetic starting weights, but not a fresh confirmatory benchmark.",
+  "groups": {
+    "clinical": {
+      "definition": "Clinical measurement based disease/risk classification from independently sourced cohorts; broad domain hypothesis, not a similarity metric",
+      "train": ["breast_cancer", "bupa", "diabetes", "heart_disease_cleveland"],
+      "validation": ["maternal_health_risk"],
+      "test": ["mammography", "ilpd"]
+    },
+    "financial": {
+      "definition": "Creditworthiness/default/solvency prediction; individual credit and company bankruptcy differ, so this is a broad domain hypothesis",
+      "train": ["credit-g", "credit_card_clients_default", "heloc", "GiveMeSomeCredit"],
+      "validation": ["credit_approval_australia"],
+      "test": ["polish_companies_bankruptcy", "taiwanese_bankruptcy_prediction"]
+    }
+  },
+  "selection_policy": "Exact membership and counts; no score-based substitutions or omissions. Distinct original source groups and input hashes required across all fourteen datasets.",
+  "validation_policy": "Both models select checkpoints on the same two validation datasets, averaged equally by dataset. Final equal-budget checkpoints are the primary transfer comparison.",
+  "sources": [
+    "https://archive.ics.uci.edu/dataset/45/heart+disease",
+    "https://archive.ics.uci.edu/dataset/225/ilpd+indian+liver+patient+dataset",
+    "https://archive.ics.uci.edu/dataset/365/polish+companies+bankruptcy+data",
+    "https://archive.ics.uci.edu/dataset/572/taiwanese+bankruptcy+prediction",
+    "https://www.openml.org/search?id=31&type=data",
+    "docs/experiments/joint_preprocessing_real_meta_candidates_20261004.json"
+  ]
+}

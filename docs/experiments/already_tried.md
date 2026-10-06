@@ -1,5 +1,15 @@
 # Research memory: what we have already tried
 
+Agreed next diagnostic **2026-10-06**: two domain continuations, clinical versus
+financial, four independent source datasets each, **seed 0 only**, 1,024 updates
+each with ensemble CE from the same synthetic checkpoint. Common two-dataset
+validation; primary comparison at equal final budgets on four entirely different
+target datasets. This tests declared domain relatedness, not more-data scaling or
+a learned similarity metric. Reuses previously inspected development datasets;
+not fresh confirmation. Implementation complete, 19 targeted checks passed;
+local metadata verified. Not yet submitted.
+Evidence/protocol: [related transfer](joint_preprocessing_related_transfer_20261006.md).
+
 Last reviewed: **2026-10-05**. Read before proposing the next experiment.
 Purpose: avoid rediscovering old ideas, not enumerate every result or permanently rule
 out approaches. Details and source paths: [research history](research_history_20260920.md).
