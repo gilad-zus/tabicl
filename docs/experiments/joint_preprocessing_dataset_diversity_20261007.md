@@ -49,6 +49,43 @@ Give Me Some Credit variants and a conservative CreditCardSubset/fraud grouping.
 Catalog inventories and class-count metadata support the financial copy grouping;
 not every shared-source inference is an established record-level identity.
 
+Final preparation dispatched from committed revision `52799ce` on dsiofir01,
+PID **3168727**, exact log
+`/home/dsi/zusmang/TabICL/tabicl/jp-dd-bank-final-261007.log`.
+The earlier v2 preparation was stopped before freezing any bank. Its intent is
+archived; identical raw data are reused under the corrected rules. Preparation
+completed. All 185 distinct declared groups, unique input hashes, nested panels,
+train/validation group separation and 42 committed dependency hashes were
+verified locally after downloading the four JSON metadata artifacts.
+Final manifest SHA256:
+`0e7295768e6392573650f21af5f75edd918b006617543d384853082d6d9d19ee`.
+
+Submitted SLURM array **33062914**, job name **jp-dd-s0-261007**, October 7 19:49.
+Tasks 0=small, 1=large; `ArrayTaskThrottle=1` verified. Pending **Resources** at the
+status check; no training results yet. Per task: profile uriofir, partition
+p_uriofir (sole node dsiuriofir01), account ug_uri_ofir, one GPU, four CPUs, 32G RAM,
+six-hour limit and email BEGIN/END/FAIL enabled. Result root is v2 as below.
+
+Exact logs under `/home/dsi/zusmang/TabICL/tabicl/slurm_logs/`:
+
+- `slurm-jp-dd-s0-261007-33062914_0.out`
+- `slurm-jp-dd-s0-261007-33062914_0.err`
+- `slurm-jp-dd-s0-261007-33062914_1.out`
+- `slurm-jp-dd-s0-261007-33062914_1.err`
+
+Coverage is now observable: median feature counts small/large/validation are
+18.5/16/16, and median absolute skew is 0.783/1.039/1.049. Two validation sources
+have class counts outside the small-bank range, zero outside the large-bank range;
+skew is outside range for three versus one. These descriptors support broader
+coverage, not equivalence of optimal transformations. Full coverage in the
+submission record and downloaded banks_manifest.json.
+
+October 7 failure update: both tasks failed before optimizer updates while
+building validation references. [Numerical repair](joint_preprocessing_dataset_diversity_numerical_repair_20261007.md)
+adds a fixed [-100,100] standardized-input guard to train/inference and reuses
+the exact frozen data panels in v3. Neither failed startup provides a learning
+result. Replacement submission and GPU preflight are tracked in the repair note.
+
 ## Question and closest predecessor
 
 Does broader real-data experience improve zero-shot preprocessing at a fixed
@@ -196,8 +233,8 @@ Remote repository: `/home/dsi/zusmang/TabICL/tabicl`.
 Python: `/home/eng/zusmang/try_micormamba/.venv_311_ticl/bin/python`.
 
 CPU preparation on dsiofir01, after reproducible Git synchronization:
-`runnohup jp-dd-bank-261007 env OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 <python> -u -m scripts.joint_preprocessing_dataset_diversity prepare --output-dir <root> --device cpu`.
-Exact log: `/home/dsi/zusmang/TabICL/tabicl/jp-dd-bank-261007.log`.
+`runnohup jp-dd-bank-final-261007 env OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 <python> -u -m scripts.joint_preprocessing_dataset_diversity prepare --output-dir <root> --reuse-source-cache <v1-root>/source_cache --repair-unfinished-preparation --device cpu --expected-revision 52799ceff19d2171cdc4ce03b8cd29b3f226735c`.
+Exact log: `/home/dsi/zusmang/TabICL/tabicl/jp-dd-bank-final-261007.log`.
 
 After bank completion/coverage verification, submit a two-task SLURM array limited
 to one running task (`0-1%1`): task zero trains small, task one trains large.

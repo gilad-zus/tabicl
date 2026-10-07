@@ -41,6 +41,7 @@ def settings(args):
         panels=list(PANELS), objective="ordinary8+learned8 CE", validation_selection="minimum arithmetic mean of dataset mean NLL; update zero eligible",
         primary="final equal-update comparison; selected checkpoints are secondary deployment candidates",
         paired_rows="same per-step minimum row cap across both scheduled four-source batches",
+        numerical_guard="context-standardized numerical inputs clipped to [-100, 100] before learned transformations in train and inference",
         candidate_sha256=objective.canonical_hash(args.candidate_manifest),
         expected_revision=getattr(args, "expected_revision", None),
         runtime=dict(python=sys.version, torch=torch.__version__, numpy=np.__version__, sklearn=sklearn.__version__),
@@ -89,6 +90,8 @@ def prepare(args):
             raise FileExistsError("use a new empty output root")
         pilot.json_write(path, intent)
     cache_options = {}
+    if getattr(args, "reuse_bank_dir", None) is not None:
+        bank.reuse_frozen_banks(args.output_dir, args.candidate_manifest, args.reuse_bank_dir)
     if getattr(args, "reuse_source_cache", None) is not None:
         cache_options["reuse_source_cache"] = args.reuse_source_cache
     banks = bank.prepare(args.output_dir, args.candidate_manifest, args.cache_dir, **cache_options)
@@ -142,6 +145,41 @@ def setup(args):
     initial = new_model().to(device)
     initial.load_state_dict(torch.load(args.output_dir / "initial.pt", map_location="cpu", weights_only=True)["model"])
     return backbone, initial, manifest, device
+
+
+def preflight(args):
+    """Check the known failing episode on real inference and gradient paths."""
+    backbone, model, manifest, device = setup(args)
+    episodes = bank.load_bank(args.output_dir, manifest, "real_validation")
+    episode = next((e for e in episodes if e["family"] == args.preflight_family
+                    and e["split_seed"] == args.preflight_split_seed), None)
+    if episode is None:
+        raise ValueError("requested preflight source/split is absent from validation")
+    folder = args.output_dir / "preflight"
+    # The fresh zero-head model starts at standardized identity. Reproduce its
+    # formerly unbounded input on the same frozen default-AMP inference path.
+    _, views = objective.prepared_episode(episode, device)
+    xc, xq, yc, mc, mq = core.numeric_context(episode, device)
+    with torch.no_grad(), pilot.frozen_inference(backbone):
+        parameters = model.generate(xc, yc, mc)
+        unbounded = torch.cat([((x - parameters.location[:, None]) / parameters.scale[:, None]).masked_fill(m, 0)
+                               for x, m in ((xc, mc), (xq, mq))], 1)
+        unsafe_logits = objective.ensemble_mean(backbone, views, episode["n_classes"], [unbounded] * 2)
+        unbounded_amp_finite = bool(torch.isfinite(unsafe_logits).all())
+        unbounded_max = float(unbounded.abs().max())
+    print(f"Unbounded standardized input max={unbounded_max:.6g}; default AMP finite={unbounded_amp_finite}", flush=True)
+    objective.execution_audit(backbone, model, episode, folder, device)
+    audit = previous.read(folder / "execution_audit.json")
+    numbers = [v for v in audit.values() if isinstance(v, (int, float))]
+    numbers += list(audit["gradient_norms"].values())
+    if not all(math.isfinite(v) for v in numbers):
+        raise FloatingPointError("preflight has nonfinite inference or gradient diagnostics")
+    pilot.json_write(folder / "complete.json", dict(fingerprint=manifest["fingerprint"],
+        family=episode["family"], split_seed=episode["split_seed"], device=str(device),
+        unclipped_standardized_max=unbounded_max, unclipped_amp_finite=unbounded_amp_finite,
+        audit_sha256=pilot.hash_file(folder / "execution_audit.json"),
+        no_optimizer_update=True, default_amp_finite=True))
+    print(f"Preflight passed: {episode['family']} split {episode['split_seed']}; default AMP, FP32 parity and learning gradients finite", flush=True)
 
 
 def scheduled_sources(families, step):
@@ -373,11 +411,14 @@ def report(args):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("command", choices=("prepare", "train", "report", "pipeline"))
+    p.add_argument("command", choices=("prepare", "preflight", "train", "report", "pipeline"))
     p.add_argument("--output-dir", type=Path, required=True)
     p.add_argument("--candidate-manifest", type=Path, default=DEFAULT_CANDIDATES)
     p.add_argument("--cache-dir", type=Path, default=Path("results/pmlb_cache"))
     p.add_argument("--reuse-source-cache", type=Path, help="Read raw source caches from an earlier unused preparation; never modify that cache or reuse its split allocation")
+    p.add_argument("--reuse-bank-dir", type=Path, help="Copy hash-verified frozen data panels into a new result root; never reuse references or learned state")
+    p.add_argument("--preflight-family", default="Credit_Risk_Modeling")
+    p.add_argument("--preflight-split-seed", type=int, default=0)
     p.add_argument("--device", default="cuda")
     p.add_argument("--checkpoint", type=Path)
     p.add_argument("--arm", choices=ARMS, default="small")

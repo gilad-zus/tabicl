@@ -143,6 +143,19 @@ def train_fixture(args):
     runner.train(args)
 
 
+def test_preflight_checks_inference_and_gradients_without_training(tmp_path, fixture):
+    initial = copy.deepcopy(fixture[0].state_dict())
+    episode = real_episode()
+    root = tmp_path / "preflight"
+    runner.preflight(args_for(root, preflight_family=episode['family'],
+                              preflight_split_seed=episode['split_seed']))
+    assert fixture[2] == ['real_validation']
+    assert_nested_equal(initial, fixture[0].state_dict())
+    result = runner.previous.read(root / 'preflight' / 'complete.json')
+    assert result['default_amp_finite'] and result['no_optimizer_update']
+    assert not (root / 'runs').exists()
+
+
 @pytest.mark.parametrize("arm", runner.ARMS)
 def test_resume_preserves_weights_optimizer_rng_and_logs(tmp_path, fixture, arm):
     full, partial = tmp_path / "full", tmp_path / "partial"
@@ -298,6 +311,41 @@ def test_cache_recuration_never_relaxes_data_loading_identity():
     assert bank.cached_entry_identity(original) == bank.cached_entry_identity(curated)
     for field, value in [("data_id", 1590), ("name", "adult"), ("target", "other"), ("source", "pmlb")]:
         assert bank.cached_entry_identity(original) != bank.cached_entry_identity(dict(curated, **{field: value}))
+
+
+def test_reuse_frozen_bank_preserves_data_and_excludes_old_model_state(tmp_path):
+    source = tmp_path / "previous"
+    target = tmp_path / "repaired"
+    candidate = tmp_path / "candidates.json"
+    candidate.write_text('{"fixed": true}')
+    panels = {}
+    for panel in ("small_train", "large_train", "real_probe", "large_only_probe", "real_validation"):
+        path = source / "banks" / f"{panel}.pt"
+        runner.pilot.atomic_save(path, dict(values=[real_episode()]))
+        panels[panel] = dict(path=f"banks/{panel}.pt", count=1, sha256=runner.pilot.hash_file(path))
+    manifest = dict(candidate_sha256=runner.pilot.hash_file(candidate), banks=panels)
+    runner.pilot.json_write(source / "banks_manifest.json", manifest)
+    runner.pilot.json_write(source / "availability.json", dict(accepted=["unchanged"]))
+    runner.pilot.atomic_save(source / "references" / "real_probe.pt", dict(old=True))
+    runner.pilot.atomic_save(source / "runs" / "small_seed0" / "state.pt", dict(old=True))
+    source_hashes = {p.relative_to(source).as_posix(): runner.pilot.hash_file(p)
+                     for p in source.rglob('*') if p.is_file()}
+    bank.reuse_frozen_banks(target, candidate, source)
+    bank.reuse_frozen_banks(target, candidate, source)
+    assert runner.previous.read(target / "banks_manifest.json") == manifest
+    assert not (target / "references").exists() and not (target / "runs").exists()
+    assert {p.relative_to(source).as_posix(): runner.pilot.hash_file(p)
+            for p in source.rglob('*') if p.is_file()} == source_hashes
+    for entry in panels.values():
+        assert runner.pilot.hash_file(target / entry['path']) == entry['sha256']
+    candidate.write_text('{"changed": true}')
+    with pytest.raises(ValueError, match="candidates changed"):
+        bank.reuse_frozen_banks(tmp_path / "changed", candidate, source)
+    candidate.write_text('{"fixed": true}')
+    (source / panels['large_train']['path']).write_bytes(b'corrupted')
+    with pytest.raises(ValueError, match="bank hash changed"):
+        bank.reuse_frozen_banks(tmp_path / "corrupted", candidate, source)
+    assert not (tmp_path / "corrupted" / "banks_manifest.json").exists()
 
 
 def test_reused_cache_cannot_bypass_new_synthetic_description_exclusion(tmp_path, monkeypatch):

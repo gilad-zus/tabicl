@@ -187,11 +187,18 @@ def episode_logits(backbone, model: JointPreprocessor | str, episode: dict[str, 
                     inverse = {int(original): position for position, original in enumerate(feature_shuffle)}
                     for column, original in enumerate(numerical_positions):
                         x_view[..., inverse[int(original)]] = merged[..., column]
+                model_name = model.arm if isinstance(model, JointPreprocessor) else model
+                view_name = f"{episode['family']} split {episode['split_seed']} {model_name} {method} view {index}"
+                if not torch.isfinite(x_view).all():
+                    raise FloatingPointError(f"{view_name}: nonfinite backbone input")
                 backbone.clear_cache()
                 raw = backbone(x_view, torch.from_numpy(ys[index:index + 1]).to(device=device, dtype=torch.float32),
                                feature_shuffles=[list(feature_shuffle)], return_logits=True)
                 class_index = torch.as_tensor(class_shuffle, device=device, dtype=torch.long)
-                logits.append(raw[..., :episode["n_classes"]][..., class_index])
+                aligned = raw[..., :episode["n_classes"]][..., class_index]
+                if not torch.isfinite(aligned).all():
+                    raise FloatingPointError(f"{view_name}: nonfinite backbone logits (max absolute input {float(x_view.abs().max()):.6g})")
+                logits.append(aligned)
     average = torch.stack(logits).mean(dim=0)
     return average, len(logits)
 

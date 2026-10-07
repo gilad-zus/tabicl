@@ -67,6 +67,28 @@ def test_joint_preprocessor_enabled_heads_receive_gradients(arm):
         assert model.mix_gate_head.weight.grad.abs().sum() > 0
 
 
+@pytest.mark.parametrize("arm", ("restricted", "joint", "no_spline"))
+def test_query_outlier_with_tiny_context_variance_remains_safe_for_float16(arm):
+    x, y, query = example()
+    x[..., 0] = 0.
+    x[:, 0, 0] = .001
+    query = query.clone().requires_grad_(True)
+    with torch.no_grad():
+        query[..., 0] = torch.tensor([1e6, -1e6])
+    model = JointPreprocessor(arm, hidden_dim=16)
+    params = model.generate(x, y)
+    raw = (query - params.location[:, None]) / params.scale[:, None]
+    assert not torch.isfinite(raw.detach().half()).all()
+    for slot in (0, 1):
+        output = model.apply(query, params, slot)
+        torch.testing.assert_close(output, raw.clamp(-100, 100), atol=2e-5, rtol=2e-5)
+        assert torch.isfinite(output.detach().half()).all()
+    model.apply(query, params, 0).square().sum().backward()
+    assert torch.isfinite(query.grad).all()
+    assert torch.count_nonzero(query.grad[..., 0]) == 0
+    assert all(p.grad is None or torch.isfinite(p.grad).all() for p in model.parameters())
+
+
 def test_view_schedule_matches_standard_tabicl_generator():
     x = np.arange(60, dtype=np.float64).reshape(20, 3)
     y = np.arange(20) % 2

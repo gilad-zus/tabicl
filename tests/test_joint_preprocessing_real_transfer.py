@@ -1,8 +1,9 @@
 import numpy as np
 import pandas as pd
+import pytest
 import torch
 
-from scripts.joint_preprocessing_real_transfer import _episode, evaluate_episode
+from scripts.joint_preprocessing_real_transfer import _episode, evaluate_episode, episode_logits
 from tabicl._hyperspline.joint_preprocessing import JointPreprocessor
 
 
@@ -48,3 +49,15 @@ def test_real_episode_rejects_ineligible_row_count():
         assert "256" in str(error)
     else:
         raise AssertionError("short real dataset was accepted")
+
+
+def test_nonfinite_prediction_identifies_source_split_and_view():
+    class NonfiniteBackbone(TinyBackbone):
+        def forward(self, *args, **kwargs):
+            return super().forward(*args, **kwargs) * float('nan')
+    rng = np.random.default_rng(12)
+    frame = pd.DataFrame({f'x{i}': rng.normal(size=300) for i in range(5)})
+    episode = _episode(frame, np.arange(300) % 2, family='unstable', seed=0,
+                       max_rows=256, test_fraction=.3)
+    with pytest.raises(FloatingPointError, match='unstable split 0 ordinary none view 0: nonfinite backbone logits'):
+        episode_logits(NonfiniteBackbone(), 'ordinary', episode)

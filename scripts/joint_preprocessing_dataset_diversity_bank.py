@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shutil
 from pathlib import Path
 from urllib.request import urlopen
 
@@ -117,6 +118,42 @@ def load_candidate(entry, cache_dir):
 def cached_entry_identity(entry):
     """Allow curation annotations to change, preserving every data-load field."""
     return {k: v for k, v in entry.items() if k not in {"source_group", "provenance"}}
+
+
+def reuse_frozen_banks(output_dir, candidate_path, source_dir):
+    """Copy verified data panels only; never reuse references or learned state."""
+    if output_dir.resolve() == source_dir.resolve():
+        raise ValueError("bank reuse requires a distinct result root")
+    result = json.loads((source_dir / "banks_manifest.json").read_text())
+    if result["candidate_sha256"] != pilot.hash_file(candidate_path):
+        raise ValueError("reused bank candidates changed")
+    allowed = {"small_train", "large_train", "real_probe", "large_only_probe", "real_validation"}
+    if set(result["banks"]) != allowed:
+        raise ValueError("reused bank contains unexpected or test panels")
+    # Verify all inputs before writing any bank/lock into the new result root.
+    paths = []
+    for entry in result["banks"].values():
+        relative = Path(entry["path"])
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError("reused bank path escapes the result root")
+        src, dst = source_dir / relative, output_dir / relative
+        if pilot.hash_file(src) != entry["sha256"]:
+            raise ValueError("reused bank hash changed")
+        if dst.exists() and pilot.hash_file(dst) != entry["sha256"]:
+            raise ValueError("destination bank hash changed")
+        paths.append((src, dst))
+    for src, dst in paths:
+        if not dst.exists():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(src, dst)
+    # Descriptive audit only; old references/checkpoints/configs are excluded.
+    availability = source_dir / "availability.json"
+    if availability.exists():
+        shutil.copyfile(availability, output_dir / "availability.json")
+    pilot.json_write(output_dir / "bank_reuse.json", dict(source_dir=str(source_dir.resolve()),
+        banks_manifest_sha256=pilot.hash_file(source_dir / "banks_manifest.json"),
+        policy="identical data panels; recompute every model-dependent reference and start fresh"))
+    pilot.json_write(output_dir / "banks_manifest.json", result)
 
 
 def prepare(output_dir, candidate_path, cache_dir, reuse_source_cache=None):

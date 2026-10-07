@@ -172,7 +172,11 @@ class JointPreprocessor(nn.Module):
             raise ValueError("slot must be 0 or 1")
         if missing is None:
             missing = ~torch.isfinite(x)
-        z = ((x.float() - p.location[:, None]) / p.scale[:, None]).masked_fill(missing, 0)
+        # Match the ordinary scaler's fixed range guard. A feature with tiny
+        # context variance can otherwise turn a finite query outlier into an
+        # input beyond float16 range in the frozen backbone's CUDA AMP path.
+        # This bound depends on no query statistics and is shared by train/eval.
+        z = ((x.float() - p.location[:, None]) / p.scale[:, None]).masked_fill(missing, 0).clamp(-100, 100)
         a = p.log_scale[:, slot, None].exp() * z + p.shift[:, slot, None]
         result = a
         if p.spline_controls is not None:

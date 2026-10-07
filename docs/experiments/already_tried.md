@@ -15,7 +15,15 @@ The v1 bank is an unused audit. Group those variants and rebuild all panels in
 v2, reusing identical raw sources and repeating eligibility/content audits.
 Full metadata review also removed explicit synthetic sources and grouped renamed
 satellite/spam/wine/financial copies. Cached descriptions cannot bypass exclusion.
-No GPU submission yet. Evidence/protocol:
+Final CPU preparation completed at `52799ce`; all 185 groups and 42 code hashes
+verified locally. Submitted SLURM array **33062914**, `jp-dd-s0-261007`, tasks
+0=40-source and 1=160-source, concurrency one. **Both failed before training**
+during initial validation references: an unbounded standardized query input
+exceeded FP16 range. Fixed [-100,100] standardized-input guard tested locally;
+52 repair checks pass. Reuse identical frozen data panels in v3; GPU preflight
+and replacement submission pending October 7. Evidence:
+[numerical repair](joint_preprocessing_dataset_diversity_numerical_repair_20261007.md).
+Protocol:
 [dataset-diversity experiment](joint_preprocessing_dataset_diversity_20261007.md).
 
 Agreed next diagnostic **2026-10-06**: two domain continuations, clinical versus
