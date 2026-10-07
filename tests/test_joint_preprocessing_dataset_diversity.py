@@ -263,6 +263,32 @@ def test_generated_source_description_exclusion_is_explicit():
     assert not bank.GENERATED_DESCRIPTION.search("Measurements from hospitals; features include temperature.")
 
 
+def test_numeric_array_coverage_matches_dataframe():
+    raw = source_family(rows=256, mixed=False)
+    frame = bank.bank.unpack_frame(raw["columns"])
+    episode = bank.bank.sample_real_episode(raw, 128, .7, 0)
+    a = bank.descriptors(frame, np.array(raw["labels"]), episode)
+    b = bank.descriptors(frame.to_numpy(), np.array(raw["labels"]), episode)
+    assert a == b
+
+
+def test_unfinished_preparation_repair_archives_intent_but_refuses_frozen_data(tmp_path, monkeypatch):
+    root = tmp_path / "run"
+    runner.pilot.json_write(root / "preparation.json", dict(settings="previous version"))
+    class StopBeforeLoading(Exception):
+        pass
+    def stop(*args):
+        raise StopBeforeLoading
+    monkeypatch.setattr(bank, "prepare", stop)
+    args = args_for(root, repair_unfinished_preparation=True)
+    with pytest.raises(StopBeforeLoading):
+        runner.prepare(args)
+    assert len(list((root / "preparation_revisions").glob("*.json"))) == 1
+    runner.pilot.json_write(root / "banks_manifest.json", dict(frozen=True))
+    with pytest.raises(ValueError, match="cannot repair frozen"):
+        runner.prepare(args_for(root, steps=3, repair_unfinished_preparation=True))
+
+
 def test_revision_pin_rejects_wrong_head_or_dirty_dependency(monkeypatch):
     import hashlib
     import subprocess

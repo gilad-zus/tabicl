@@ -1,9 +1,22 @@
 # Fresh real-data learning with 40 versus 160 datasets
 
-Authorized 2026-10-07. Status: implementation complete; **45 distinct targeted
-checks passed** (16 new-runner/bank/catalog checks, ten inherited ensemble-gradient
+Authorized 2026-10-07. Status: implementation complete; **47 distinct targeted
+checks passed** (18 new-runner/bank/catalog checks, ten inherited ensemble-gradient
 checks, 19 real-bank checks). CLI and source compilation passed. No remote
-preparation or GPU submission yet. Seed **0 only** for both runs.
+preparation or GPU submission at local-verification time. Seed **0 only** for both runs.
+
+Dispatch update: revision `26c5ec5` committed/pushed and synchronized. CPU bank
+preparation launched on dsiofir01, PID **3160688**, log
+`/home/dsi/zusmang/TabICL/tabicl/jp-dd-bank-261007.log`. Completion not yet
+verified; no GPU submission yet. Live execution details:
+[submission record](joint_preprocessing_dataset_diversity_submission_20261007.json).
+
+Preparation repair: PMLB numerical-only loaders can return NumPy arrays; coverage
+descriptors now normalize those arrays to DataFrames and copy numeric values
+before imputation so read-only pandas buffers are supported. The new regression
+checks pass. An explicit unfinished-preparation repair archives the old intent
+and reuses source caches; it refuses repair after any bank/initial-weight lock.
+Restart pending synchronization of the repair; no GPU time used.
 
 ## Question and closest predecessor
 

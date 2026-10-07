@@ -7,8 +7,11 @@ primary comparison at equal final budgets. Match row schedules, report coverage
 and common/large-only source probes. This changes initialization and dataset
 diversity from the synthetic-start continuation history; a negative larger-bank
 result cannot rule out insufficient optimization. Require 185 eligible source
-groups before GPU use; no final test opened. Implementation complete, 45 targeted
-checks passed; no remote preparation or GPU submission yet. Evidence/protocol:
+groups before GPU use; no final test opened. Implementation complete, 47 targeted
+checks passed. Committed/pushed `26c5ec5`; CPU bank preparation launched on
+dsiofir01, PID 3160688, log `jp-dd-bank-261007.log`; completion not yet verified.
+Array-returning PMLB coverage bug repaired/checked locally; restart pending sync.
+No GPU submission yet. Evidence/protocol:
 [dataset-diversity experiment](joint_preprocessing_dataset_diversity_20261007.md).
 
 Agreed next diagnostic **2026-10-06**: two domain continuations, clinical versus

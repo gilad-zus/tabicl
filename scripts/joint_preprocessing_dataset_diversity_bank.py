@@ -29,12 +29,14 @@ def stable_order(values, seed, key):
 def descriptors(frame, labels, e):
     """Unsupervised shape descriptors plus permitted source-label class balance."""
     columns = bank.pack_frame(frame)
+    if not hasattr(frame, "iloc"):
+        frame = bank.unpack_frame(columns)
     numeric = [i for i, c in enumerate(columns) if c["kind"] == "numerical"]
     raw = frame.iloc[np.linspace(0, len(frame) - 1, min(1024, len(frame)), dtype=int)]
     missing = float(raw.isna().to_numpy().mean())
     skew = correlation = 0.
     if numeric:
-        x = raw.iloc[:, numeric].to_numpy(dtype=np.float64)
+        x = raw.iloc[:, numeric].to_numpy(dtype=np.float64, copy=True)
         skew_values = raw.iloc[:, numeric].skew().to_numpy(dtype=np.float64)
         finite = np.isfinite(skew_values)
         skew = float(np.median(np.abs(skew_values[finite]))) if finite.any() else 0.

@@ -77,7 +77,13 @@ def prepare(args):
     path = args.output_dir / "preparation.json"
     if path.exists():
         if previous.read(path) != intent:
-            raise ValueError("preparation settings/code/candidates changed")
+            if not getattr(args, "repair_unfinished_preparation", False):
+                raise ValueError("preparation settings/code/candidates changed")
+            if any((args.output_dir / name).exists() for name in ("manifest.json", "banks_manifest.json", "initial.pt")):
+                raise ValueError("cannot repair frozen banks or weights; use a new result root")
+            old = previous.read(path)
+            pilot.json_write(args.output_dir / "preparation_revisions" / f"{previous.digest(old)}.json", old)
+            pilot.json_write(path, intent)
     else:
         if args.output_dir.exists() and any(args.output_dir.iterdir()):
             raise FileExistsError("use a new empty output root")
@@ -379,6 +385,7 @@ def main():
     p.add_argument("--resume", action="store_true")
     p.add_argument("--max-steps", type=int)
     p.add_argument("--expected-revision", help="Require this Git HEAD and all hashed dependencies to match its committed contents")
+    p.add_argument("--repair-unfinished-preparation", action="store_true", help="Archive changed preparation intent only before any banks or weights are frozen; retain source caches")
     args = p.parse_args()
     if args.command != "pipeline":
         globals()[args.command](args)
