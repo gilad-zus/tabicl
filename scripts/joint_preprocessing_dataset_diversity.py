@@ -88,7 +88,10 @@ def prepare(args):
         if args.output_dir.exists() and any(args.output_dir.iterdir()):
             raise FileExistsError("use a new empty output root")
         pilot.json_write(path, intent)
-    banks = bank.prepare(args.output_dir, args.candidate_manifest, args.cache_dir)
+    cache_options = {}
+    if getattr(args, "reuse_source_cache", None) is not None:
+        cache_options["reuse_source_cache"] = args.reuse_source_cache
+    banks = bank.prepare(args.output_dir, args.candidate_manifest, args.cache_dir, **cache_options)
     initial = args.output_dir / "initial.pt"
     if not initial.exists():
         pilot.atomic_save(initial, dict(model=pilot.state_cpu(new_model()), model_seed=0))
@@ -374,6 +377,7 @@ def main():
     p.add_argument("--output-dir", type=Path, required=True)
     p.add_argument("--candidate-manifest", type=Path, default=DEFAULT_CANDIDATES)
     p.add_argument("--cache-dir", type=Path, default=Path("results/pmlb_cache"))
+    p.add_argument("--reuse-source-cache", type=Path, help="Read raw source caches from an earlier unused preparation; never modify that cache or reuse its split allocation")
     p.add_argument("--device", default="cuda")
     p.add_argument("--checkpoint", type=Path)
     p.add_argument("--arm", choices=ARMS, default="small")

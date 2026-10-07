@@ -59,6 +59,13 @@ EXCLUDED_NAMES = {"higgs", "magictelescope", "magic", "estimationofobesitylevels
                   "fitnessclub", "mobileprice", "ibmemployeeattrition", "ibmemployeeperformance"}
 
 GROUP_ALIASES = {
+    # ADA prior explicitly derives from Adult. Conservatively hold the anonymous
+    # AutoML ADA version with that source too; feature hashes cannot detect all
+    # concealed/re-encoded versions of an original table.
+    "uci_adult_census": ["adult", "adult-census", "adult-test", "ada_prior", "ada"],
+    # Different targets/attributes from the same F16 control collection are not
+    # independent transfer sources for this experiment.
+    "f16_aircraft_control": ["ailerons", "elevators", "delta_ailerons", "delta_elevators"],
     "uci_horse_colic": ["colic", "horse_colic_outcome"],
     "uci_contraceptive": ["cmc", "contraceptive_method"],
     "uci_heart_disease": ["heart-c", "heart-h", "heart-statlog", "heart_disease_cleveland", "cleveland", "cleve", "hungarian", "heart-statlog-uci", "Heart_disease_prediction_20"],

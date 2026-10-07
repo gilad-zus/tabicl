@@ -7,10 +7,12 @@ primary comparison at equal final budgets. Match row schedules, report coverage
 and common/large-only source probes. This changes initialization and dataset
 diversity from the synthetic-start continuation history; a negative larger-bank
 result cannot rule out insufficient optimization. Require 185 eligible source
-groups before GPU use; no final test opened. Implementation complete, 47 targeted
-checks passed. Committed/pushed `26c5ec5`; CPU bank preparation launched on
-dsiofir01, PID 3160688, log `jp-dd-bank-261007.log`; completion not yet verified.
-Array-returning PMLB coverage bug repaired/checked locally; restart pending sync.
+groups before GPU use; no final test opened. Implementation complete, 49 targeted
+checks passed. Initial preparation exposed a PMLB NumPy-array coverage bug, now
+repaired and synchronized as `6d5f593`. Preparation completed with 185 declared
+groups; provenance review then identified Adult/ADA and F16 target variants.
+The v1 bank is an unused audit. Group those variants and rebuild all panels in
+v2, reusing identical raw sources and repeating eligibility/content audits.
 No GPU submission yet. Evidence/protocol:
 [dataset-diversity experiment](joint_preprocessing_dataset_diversity_20261007.md).
 

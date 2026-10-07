@@ -1,7 +1,7 @@
 # Fresh real-data learning with 40 versus 160 datasets
 
-Authorized 2026-10-07. Status: implementation complete; **47 distinct targeted
-checks passed** (18 new-runner/bank/catalog checks, ten inherited ensemble-gradient
+Authorized 2026-10-07. Status: implementation complete; **49 distinct targeted
+checks passed** (20 new-runner/bank/catalog checks, ten inherited ensemble-gradient
 checks, 19 real-bank checks). CLI and source compilation passed. No remote
 preparation or GPU submission at local-verification time. Seed **0 only** for both runs.
 
@@ -16,7 +16,28 @@ descriptors now normalize those arrays to DataFrames and copy numeric values
 before imputation so read-only pandas buffers are supported. The new regression
 checks pass. An explicit unfinished-preparation repair archives the old intent
 and reuses source caches; it refuses repair after any bank/initial-weight lock.
-Restart pending synchronization of the repair; no GPU time used.
+Repair committed/pushed as `6d5f593`, synchronized and restarted with existing
+source caches. Active PID **3161872**, log
+`/home/dsi/zusmang/TabICL/tabicl/jp-dd-bank-fix-261007.log`.
+That preparation completed with 185 declared groups, manifest SHA256
+`3159c1975e047a9954d9cc3a12f681bb21e6827bd9600ab37909abc5f18d8290`.
+It is retained as an **unused preparation audit**, not a training bank: subsequent
+provenance review identified Adult/ADA and F16 target variants needing grouping.
+No GPU time used.
+
+The corrected catalog holds `adult`, `ada_prior` and anonymous AutoML `ada` in one
+source group. The prior-knowledge ADA description explicitly names Adult as its
+raw data ([OpenML 1037](https://www.openml.org/search?type=data&id=1037)); grouping
+anonymous `ada` is conservative rather than established identity proof.
+Aircraft targets `ailerons`, `elevators`, `delta_ailerons`, `delta_elevators` are
+also held together because their descriptions identify the same F16 control
+domain ([OpenML 198](https://www.openml.org/search?type=data&id=198),
+[OpenML 216](https://www.openml.org/search?type=data&id=216)). This avoids treating
+alternative targets/feature tables as independent transfer datasets.
+Rebuild all allocations in a new v2 result root, using the prior raw cache only
+for identical data-loading fields. Provenance/group annotation changes are allowed;
+data IDs, targets, names, aliases and other loading fields must match. The old
+raw cache is read-only and all duplicate/eligibility audits rerun.
 
 ## Question and closest predecessor
 
@@ -74,7 +95,7 @@ Candidates are frozen in
 scoring. The public OpenML metadata snapshot yields reviewed candidate IDs;
 known prior PMLB/sklearn/OpenML candidates supply alternate availability sources.
 The catalog builder records snapshot hashes and explicit source-group aliases:
-374 candidate entries represent 223 declared groups before actual-source checks.
+374 candidate entries represent 219 declared groups before actual-source checks.
 Many entries are versions or alternative feature/target tables and do not count
 as independent datasets. Source-name review is incomplete provenance evidence.
 
@@ -160,7 +181,7 @@ Training/report entry points reject changed code, settings, banks or checkpoints
 ## Execution specification
 
 Result root:
-`results/hyperspline_joint_dataset_diversity/v1_seed20261007`.
+`results/hyperspline_joint_dataset_diversity/v2_seed20261007`.
 Remote repository: `/home/dsi/zusmang/TabICL/tabicl`.
 Python: `/home/eng/zusmang/try_micormamba/.venv_311_ticl/bin/python`.
 
@@ -168,15 +189,18 @@ CPU preparation on dsiofir01, after reproducible Git synchronization:
 `runnohup jp-dd-bank-261007 env OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 <python> -u -m scripts.joint_preprocessing_dataset_diversity prepare --output-dir <root> --device cpu`.
 Exact log: `/home/dsi/zusmang/TabICL/tabicl/jp-dd-bank-261007.log`.
 
-After bank completion/coverage verification, submit two serial SLURM allocations,
-small then large, with the large job depending on successful completion of small.
+After bank completion/coverage verification, submit a two-task SLURM array limited
+to one running task (`0-1%1`): task zero trains small, task one trains large.
+Scheduler task order is not assumed. Each task conditionally builds the paired
+report after both completion files exist; the second successful finisher reports.
 Profile uriofir, partition p_uriofir, account ug_uri_ofir, one GPU, 32G host RAM,
 four CPUs, six hours each, email notifications enabled. The measured previous
 ensemble run needed about one training hour per 1,024 updates; 4,096 updates plus
 larger evaluation panels motivate this limit. Resume durable state if needed.
 
 Full commands are recorded with exact revision, job IDs, output/error names and
-approvals in the submission record after dispatch. The large allocation ends by
-running the paired report. No GPU allocation waits for CPU preparation.
+approvals in the submission record after dispatch. No GPU allocation waits for
+CPU preparation. The array concurrency limit prevents simultaneous writes to
+the shared reference caches; one seed is used throughout.
 Launches pass `--expected-revision` and reject dirty experiment dependencies or
 candidate metadata; fingerprints also record Python/Torch/NumPy/sklearn versions.

@@ -1156,7 +1156,7 @@
       "name": "ailerons",
       "provenance": "reviewed source name; OpenML classification version on real observations; detailed collection provenance not fully verified",
       "source": "openml",
-      "source_group": "openml_ailerons"
+      "source_group": "f16_aircraft_control"
     },
     {
       "catalog_quality": {
@@ -2008,7 +2008,7 @@
       "name": "elevators",
       "provenance": "reviewed source name; OpenML classification version on real observations; detailed collection provenance not fully verified",
       "source": "openml",
-      "source_group": "openml_elevators"
+      "source_group": "f16_aircraft_control"
     },
     {
       "catalog_quality": {
@@ -2230,7 +2230,7 @@
       "name": "ada",
       "provenance": "reviewed source name; OpenML classification version on real observations; detailed collection provenance not fully verified",
       "source": "openml",
-      "source_group": "openml_ada"
+      "source_group": "uci_adult_census"
     },
     {
       "catalog_quality": {
@@ -3258,7 +3258,7 @@
       "name": "delta_elevators",
       "provenance": "reviewed source name; OpenML classification version on real observations; detailed collection provenance not fully verified",
       "source": "openml",
-      "source_group": "openml_deltaelevators"
+      "source_group": "f16_aircraft_control"
     },
     {
       "aliases": [
@@ -3998,7 +3998,7 @@
       "name": "ada_prior",
       "provenance": "reviewed source name; OpenML classification version on real observations; detailed collection provenance not fully verified",
       "source": "openml",
-      "source_group": "openml_adaprior"
+      "source_group": "uci_adult_census"
     },
     {
       "catalog_quality": {

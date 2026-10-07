@@ -60,6 +60,20 @@ def test_catalog_collapses_known_shared_sources_and_ignores_unreviewed_uploads()
     assert len({r["source_group"] for r in result["candidates"]}) == 1
 
 
+def test_catalog_holds_adult_derivatives_and_aircraft_targets_in_source_groups():
+    old = {"candidates": {"train": [dict(source="openml", data_id=1590,
+        name="adult", source_group="uci_adult_census")], "validation": [], "test": []}}
+    q = dict(NumberOfClasses=2, NumberOfFeatures=7, NumberOfInstances=300, NumberOfNumericFeatures=6)
+    rows = [dict(did=did, name=name, quality=[dict(name=k, value=v) for k, v in q.items()])
+            for did, name in [(1037, "ada_prior"), (41156, "ada"), (734, "ailerons"),
+                              (846, "elevators"), (819, "delta_elevators")]]
+    entries = catalog.build_catalog(dict(data=dict(dataset=rows)), old)["candidates"]
+    groups = {e["name"]: e["source_group"] for e in entries}
+    assert groups["adult"] == groups["ada_prior"] == groups["ada"]
+    assert groups["ailerons"] == groups["elevators"] == groups["delta_elevators"]
+    assert groups["adult"] != groups["ailerons"]
+
+
 def test_training_schedule_balances_visits_and_pairs_shapes():
     source_banks = dict(small=[source_family(f"f{i}", rows=256 + i) for i in range(40)],
                         large=[source_family(f"f{i}", rows=256 + i) for i in range(160)])
@@ -251,10 +265,39 @@ def test_bank_prepares_balanced_nested_panels_and_skips_copies_before_allocation
     assert len(validation) == 2
     assert len(runner.previous.read(root / "availability.json")["skipped"]) == 1
     bank.prepare(root, candidate, tmp_path / "cache")
+    # Recuration must rebuild allocations, while preserving the prior raw cache.
+    cache_hashes = {p.name: runner.pilot.hash_file(p) for p in (root / "source_cache").glob("*.pt")}
+    for e in entries:
+        e.update(source_group="curated_" + e["source_group"], provenance="reviewed provenance")
+    candidate.write_text(json.dumps(source))
+    def no_download(*args):
+        raise AssertionError("cached sources must not be downloaded again")
+    monkeypatch.setattr(bank, "load_candidate", no_download)
+    rebuilt = tmp_path / "recurated"
+    new = bank.prepare(rebuilt, candidate, tmp_path / "cache", reuse_source_cache=root / "source_cache")
+    assert len(new["selection"]["large"]) == 4
+    assert runner.previous.read(rebuilt / "availability.json")["reused_cached_sources"] == 6
+    assert all(r["source_group"].startswith("curated_") for r in new["selection"]["large"])
+    assert {p.name: runner.pilot.hash_file(p) for p in (root / "source_cache").glob("*.pt")} == cache_hashes
+    assert not (rebuilt / "source_cache").exists()
+    # Return the candidate metadata to the original lock before its tamper check.
+    for e in entries:
+        e["source_group"] = e["source_group"].removeprefix("curated_")
+        e.pop("provenance")
+    candidate.write_text(json.dumps(source))
     first = manifest["banks"]["small_train"]
     (root / first["path"]).write_bytes(b"changed")
     with pytest.raises(ValueError, match="frozen bank changed"):
         bank.prepare(root, candidate, tmp_path / "cache")
+
+
+def test_cache_recuration_never_relaxes_data_loading_identity():
+    original = dict(source="openml", data_id=1037, name="ada_prior",
+                    source_group="old", provenance="old", target="class")
+    curated = dict(original, source_group="uci_adult_census", provenance="reviewed")
+    assert bank.cached_entry_identity(original) == bank.cached_entry_identity(curated)
+    for field, value in [("data_id", 1590), ("name", "adult"), ("target", "other"), ("source", "pmlb")]:
+        assert bank.cached_entry_identity(original) != bank.cached_entry_identity(dict(curated, **{field: value}))
 
 
 def test_generated_source_description_exclusion_is_explicit():

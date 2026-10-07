@@ -107,7 +107,12 @@ def load_candidate(entry, cache_dir):
     return frame, labels, raw_hash, description
 
 
-def prepare(output_dir, candidate_path, cache_dir):
+def cached_entry_identity(entry):
+    """Allow curation annotations to change, preserving every data-load field."""
+    return {k: v for k, v in entry.items() if k not in {"source_group", "provenance"}}
+
+
+def prepare(output_dir, candidate_path, cache_dir, reuse_source_cache=None):
     source = json.loads(candidate_path.read_text())
     source_hash = pilot.hash_file(candidate_path)
     lock = output_dir / "banks_manifest.json"
@@ -121,7 +126,7 @@ def prepare(output_dir, candidate_path, cache_dir):
         return result
     counts = source["target_counts"]
     wanted = counts["large"] + counts["validation"]
-    status = dict(candidate_sha256=source_hash, accepted=[], failures=[], skipped=[])
+    status = dict(candidate_sha256=source_hash, accepted=[], failures=[], skipped=[], reused_cached_sources=0)
     accepted, fingerprints, used_groups = [], [], set()
     for entry in source["candidates"]:
         if len(accepted) == wanted:
@@ -130,13 +135,19 @@ def prepare(output_dir, candidate_path, cache_dir):
         if group in used_groups:
             continue
         path = output_dir / "source_cache" / f"{hashlib.sha256(bank._entry_identity(entry).encode()).hexdigest()[:20]}.pt"
+        read_path = path
+        if not path.exists() and reuse_source_cache is not None:
+            fallback = reuse_source_cache / path.name
+            if fallback.exists():
+                read_path = fallback
         try:
-            if path.exists():
-                saved = torch.load(path, weights_only=True)
-                if saved["entry"] != entry:
+            if read_path.exists():
+                saved = torch.load(read_path, weights_only=True)
+                if cached_entry_identity(saved["entry"]) != cached_entry_identity(entry):
                     raise ValueError("cached source identity changed")
                 frame, labels = bank.unpack_frame(saved["columns"]), np.asarray(saved["labels"])
                 raw_hash, description = saved["raw_hash"], saved["description"]
+                status["reused_cached_sources"] += 1
             else:
                 frame, labels, raw_hash, description = load_candidate(entry, cache_dir)
                 pilot.atomic_save(path, dict(entry=entry, columns=bank.pack_frame(frame),
