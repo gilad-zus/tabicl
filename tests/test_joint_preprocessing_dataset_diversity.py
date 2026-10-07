@@ -1,0 +1,279 @@
+import argparse
+import copy
+import json
+import random
+
+import numpy as np
+import pytest
+import torch
+
+from scripts import joint_preprocessing_dataset_diversity as runner
+from scripts import joint_preprocessing_dataset_diversity_bank as bank
+from scripts import joint_preprocessing_dataset_diversity_catalog as catalog
+from tests.test_joint_preprocessing_real_meta_continuation import (
+    Backbone, assert_nested_equal, initial_model, read_rows, real_episode, source_family,
+)
+
+
+@pytest.fixture(autouse=True)
+def one_thread():
+    count = torch.get_num_threads()
+    torch.set_num_threads(1)
+    yield
+    torch.set_num_threads(count)
+
+
+def args_for(root, **changes):
+    values = dict(output_dir=root, candidate_manifest=runner.DEFAULT_CANDIDATES,
+        cache_dir=root / "cache", arm="small", continuation_seed=0, device="cpu",
+        checkpoint=None, steps=2, evaluate_every=1, save_every=1, lr=.0003,
+        resume=False, max_steps=None)
+    values.update(changes)
+    return argparse.Namespace(**values)
+
+
+def records(count):
+    return [dict(family=f"source{i}", descriptors=dict(classes=2 if i % 3 else 3,
+        features=6 if i % 2 else 25, categorical_fraction=0. if i % 4 else .5)) for i in range(count)]
+
+
+def test_balanced_allocation_is_nested_disjoint_and_deterministic():
+    values = records(185)
+    counts = dict(small=40, large=160, validation=25)
+    a, b = bank.allocate(values, counts, 20261007), bank.allocate(list(reversed(values)), counts, 20261007)
+    for role in a:
+        assert {r["family"] for r in a[role]} == {r["family"] for r in b[role]}
+        assert len(a[role]) == counts[role]
+    small, large, val = [{r["family"] for r in a[k]} for k in ("small", "large", "validation")]
+    assert small < large and not large & val
+    assert {bank.stratum(r["descriptors"]) for r in a["small"]} == {bank.stratum(r["descriptors"]) for r in values}
+
+
+def test_catalog_collapses_known_shared_sources_and_ignores_unreviewed_uploads():
+    old = {"candidates": {"train": [], "validation": [], "test": []}}
+    def entry(did, name):
+        q = dict(NumberOfClasses=2, NumberOfFeatures=7, NumberOfInstances=300, NumberOfNumericFeatures=6)
+        return dict(did=did, name=name, quality=[dict(name=k, value=v) for k, v in q.items()])
+    snapshot = dict(data=dict(dataset=[entry(49, "heart-c"), entry(51, "heart-h"), entry(999999, "Synthetic-Copy")]))
+    result = catalog.build_catalog(snapshot, old)
+    assert len(result["candidates"]) == 2
+    assert len({r["source_group"] for r in result["candidates"]}) == 1
+
+
+def test_training_schedule_balances_visits_and_pairs_shapes():
+    source_banks = dict(small=[source_family(f"f{i}", rows=256 + i) for i in range(40)],
+                        large=[source_family(f"f{i}", rows=256 + i) for i in range(160)])
+    counts = {arm: {} for arm in runner.ARMS}
+    for step in range(1, 161):
+        for arm in runner.ARMS:
+            for f in runner.scheduled_sources(source_banks[arm], step):
+                counts[arm][f["family"]] = counts[arm].get(f["family"], 0) + 1
+    assert set(counts["small"].values()) == {16}
+    assert set(counts["large"].values()) == {4}
+    for step in (1, 10, 81, 1024):
+        a, b = [runner.training_batch(arm, step, source_banks) for arm in runner.ARMS]
+        for x, y in zip(a, b, strict=True):
+            assert (x["source_seed"], x["task_id"], x["n_context"], x["n_query"], x["paired_row_cap"]) == (
+                y["source_seed"], y["task_id"], y["n_context"], y["n_query"], y["paired_row_cap"])
+            assert not set(x["context_indices"].tolist()) & set(x["query_indices"].tolist())
+
+
+def test_fresh_initialization_is_independent_of_global_rng_and_preserves_it():
+    torch.manual_seed(99)
+    before = torch.get_rng_state().clone()
+    a = runner.new_model()
+    torch.testing.assert_close(torch.get_rng_state(), before, rtol=0, atol=0)
+    torch.rand(7)
+    b = runner.new_model()
+    assert_nested_equal(a.state_dict(), b.state_dict())
+    assert torch.count_nonzero(a.affine_head.weight) == 0
+
+
+def test_fresh_default_network_has_finite_learning_gradients_after_initial_update():
+    model, backbone, episode = runner.new_model(), Backbone(), real_episode()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=.0003, weight_decay=1e-4)
+    for step in range(2):
+        optimizer.zero_grad(set_to_none=True)
+        value = runner.objective.ensemble_backward(backbone, model, episode, 1.)
+        norms = runner.core.diagnostic.gradient_norms(model)
+        assert np.isfinite(float(value)) and all(np.isfinite(v) for v in norms.values())
+        assert sum(norms.values()) > 0
+        if step:
+            assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.encoder.parameters())
+        optimizer.step()
+    assert all(p.grad is None for p in backbone.parameters())
+
+
+@pytest.fixture
+def fixture(monkeypatch):
+    sources = dict(small=[source_family(f"source{i}") for i in range(4)],
+                   large=[source_family(f"source{i}") for i in range(8)])
+    values = {f"{k}_train": v for k, v in sources.items()}
+    values.update({p: [real_episode()] for p in runner.PANELS})
+    model = initial_model()
+    manifest = dict(fingerprint="diversity-fixture", initial_sha256="same-initial",
+        settings={}, banks={p: dict(count=len(v)) for p, v in values.items()})
+    loaded = []
+    monkeypatch.setattr(runner, "setup", lambda args: (Backbone(), model, manifest, torch.device("cpu")))
+    monkeypatch.setattr(runner, "checked_manifest", lambda args: manifest)
+    def load(root, manifest, panel):
+        loaded.append(panel)
+        return values[panel]
+    monkeypatch.setattr(bank, "load_bank", load)
+    monkeypatch.setattr(runner.core, "shape_for_step", lambda seed, step: (20, .5))
+    return model, manifest, loaded
+
+
+def train_fixture(args):
+    runner.pilot.json_write(args.output_dir / "backbone_lock.json", dict(sha256="fixture"))
+    runner.train(args)
+
+
+@pytest.mark.parametrize("arm", runner.ARMS)
+def test_resume_preserves_weights_optimizer_rng_and_logs(tmp_path, fixture, arm):
+    full, partial = tmp_path / "full", tmp_path / "partial"
+    original = copy.deepcopy(fixture[0].state_dict())
+    train_fixture(args_for(full, arm=arm))
+    train_fixture(args_for(partial, arm=arm, max_steps=1))
+    folder = runner.core.run_dir(partial, arm, 0)
+    with (folder / "training.csv").open("a") as f:
+        f.write("99,0,0\n")
+    random.random()
+    np.random.rand(3)
+    torch.rand(3)
+    train_fixture(args_for(partial, arm=arm, resume=True))
+    a, b = [torch.load(runner.core.run_dir(root, arm, 0) / "state.pt", weights_only=True) for root in (full, partial)]
+    for k in ("model", "optimizer", "best_model", "best_step", "best_score", "rng", "other_rng", "clipped"):
+        assert_nested_equal(a[k], b[k])
+    assert len(read_rows(folder / "presentations.csv")) == 8
+    assert len(read_rows(folder / "learning.csv")) == 9
+    assert [int(r["step"]) for r in read_rows(folder / "training.csv")] == [1, 2]
+    assert_nested_equal(fixture[0].state_dict(), original)
+
+
+def test_report_requires_both_runs_and_locks_completed_weights(tmp_path, fixture):
+    root = tmp_path / "run"
+    train_fixture(args_for(root, arm="small"))
+    with pytest.raises(FileNotFoundError):
+        runner.report(args_for(root))
+    train_fixture(args_for(root, arm="large"))
+    runner.report(args_for(root))
+    report = runner.previous.read(root / "complete.json")
+    assert set(report["large_versus_small"]) == {f"{choice}/{panel}" for choice in ("selected", "final") for panel in runner.PANELS}
+    assert set(fixture[2]) == {"small_train", "large_train", *runner.PANELS}
+    runner.report(args_for(root))
+    with pytest.raises(ValueError, match="locked"):
+        runner.train(args_for(root, resume=True))
+    (runner.core.run_dir(root, "large", 0) / "selected.pt").write_bytes(b"changed")
+    with pytest.raises(ValueError, match="checkpoint changed"):
+        runner.report(args_for(root))
+
+
+def test_selection_uses_arithmetic_mean_nll(tmp_path, fixture):
+    train_fixture(args_for(tmp_path))
+    folder = runner.core.run_dir(tmp_path, "small", 0)
+    rows = [r for r in read_rows(folder / "learning.csv") if r["panel"] == "real_validation"]
+    done = runner.previous.read(folder / "complete.json")
+    selected = min(rows, key=lambda r: float(r["mean_blend_nll"]))
+    assert done["selected_step"] == int(selected["step"])
+    assert done["selected_score"] == float(selected["mean_blend_nll"])
+
+
+def test_duplicate_evaluations_and_nonzero_seed_are_rejected(tmp_path):
+    rows = [dict(family="a", split_seed=0, blend_nll=.2)]
+    with pytest.raises(ValueError, match="duplicated"):
+        runner.grouped(rows * 2, "blend_nll", 2)
+    with pytest.raises(ValueError, match="seed zero"):
+        runner.settings(args_for(tmp_path, continuation_seed=1))
+    with pytest.raises(ValueError, match="test-bank"):
+        bank.load_bank(tmp_path, {}, "real_test")
+
+
+def test_success_threshold_requires_broad_wins_and_mean_benefit():
+    baseline = np.ones(25)
+    assert runner.passing(baseline * .99, baseline)
+    candidate = baseline.copy()
+    candidate[:10] *= .8
+    assert not runner.passing(candidate, baseline)
+    assert not runner.passing(baseline * .999, baseline)
+
+
+def test_bank_failure_cannot_create_ready_manifest(tmp_path, monkeypatch):
+    source = dict(format_version=1, target_counts=dict(large=4, small=2, validation=1), candidates=[],
+        minimum_rows=256, max_source_rows=16384, seed=20261007)
+    candidate = tmp_path / "candidates.json"
+    candidate.write_text(json.dumps(source))
+    with pytest.raises(RuntimeError, match="no GPU run"):
+        bank.prepare(tmp_path / "bank", candidate, tmp_path / "cache")
+    assert not (tmp_path / "bank/banks_manifest.json").exists()
+
+
+def test_prepare_and_manifest_reject_changed_code_candidates_or_initial_weights(tmp_path, monkeypatch):
+    banks = dict(counts=dict(small=40, large=160, validation=25), banks={})
+    def prepare(root, candidate, cache):
+        runner.pilot.json_write(root / "banks_manifest.json", banks)
+        return banks
+    monkeypatch.setattr(bank, "prepare", prepare)
+    root = tmp_path / "run"
+    args = args_for(root)
+    runner.prepare(args)
+    runner.prepare(args)
+    assert runner.checked_manifest(args)["no_test_bank"]
+    with pytest.raises(ValueError, match="changed"):
+        runner.prepare(args_for(root, steps=3))
+    (root / "initial.pt").write_bytes(b"changed")
+    with pytest.raises(ValueError, match="initial weights changed"):
+        runner.checked_manifest(args)
+
+
+def test_bank_prepares_balanced_nested_panels_and_skips_copies_before_allocation(tmp_path, monkeypatch):
+    entries = [dict(source="sklearn", name=f"table{i}", source_group=f"group{i}") for i in range(6)]
+    source = dict(format_version=1, target_counts=dict(large=4, small=2, validation=1), candidates=entries,
+        minimum_rows=256, max_source_rows=16384, seed=20261007, split_seeds=[0, 1], scope="fixture")
+    candidate = tmp_path / "candidates.json"
+    candidate.write_text(json.dumps(source))
+    def load(entry, cache):
+        raw = source_family(rows=256)
+        frame = bank.bank.unpack_frame(raw["columns"])
+        index = int(entry["name"][-1])
+        # First two entries are undeclared copies; the remaining four independent.
+        frame["column_0"] += max(0, index - 1)
+        return frame, np.array(raw["labels"]), None, "collected observations"
+    monkeypatch.setattr(bank, "load_candidate", load)
+    root = tmp_path / "bank"
+    manifest = bank.prepare(root, candidate, tmp_path / "cache")
+    assert len(manifest["selection"]["large"]) == 4
+    small = bank.load_bank(root, manifest, "small_train")
+    large = bank.load_bank(root, manifest, "large_train")
+    validation = bank.load_bank(root, manifest, "real_validation")
+    assert {f["family"] for f in small} < {f["family"] for f in large}
+    assert not {f["family"] for f in large} & {e["family"] for e in validation}
+    assert len(validation) == 2
+    assert len(runner.previous.read(root / "availability.json")["skipped"]) == 1
+    bank.prepare(root, candidate, tmp_path / "cache")
+    first = manifest["banks"]["small_train"]
+    (root / first["path"]).write_bytes(b"changed")
+    with pytest.raises(ValueError, match="frozen bank changed"):
+        bank.prepare(root, candidate, tmp_path / "cache")
+
+
+def test_generated_source_description_exclusion_is_explicit():
+    assert bank.GENERATED_DESCRIPTION.search("This synthetic dataset was generated for classification.")
+    assert bank.GENERATED_DESCRIPTION.search("simulated data from Monte Carlo simulation")
+    assert not bank.GENERATED_DESCRIPTION.search("Measurements from hospitals; features include temperature.")
+
+
+def test_revision_pin_rejects_wrong_head_or_dirty_dependency(monkeypatch):
+    import hashlib
+    import subprocess
+    spec = dict(expected_revision="approved", code_hashes={"runner.py": hashlib.sha256(b"a\nb\n").hexdigest()})
+    def call(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, stdout="approved\n" if "rev-parse" in argv else b"a\r\nb\r\n")
+    monkeypatch.setattr(runner.subprocess, "run", call)
+    runner.verify_revision(spec)
+    spec["code_hashes"]["runner.py"] = "changed"
+    with pytest.raises(ValueError, match="uncommitted"):
+        runner.verify_revision(spec)
+    spec["expected_revision"] = "different"
+    with pytest.raises(ValueError, match="Git revision"):
+        runner.verify_revision(spec)

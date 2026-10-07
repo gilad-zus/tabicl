@@ -1,5 +1,16 @@
 # Research memory: what we have already tried
 
+Agreed **2026-10-07**: fresh real-data ensemble learning with nested **40 versus
+160** independent training source groups, **seed 0 only**, 4,096 updates and four
+episodes/update each. Common 25-source validation; select by mean dataset NLL,
+primary comparison at equal final budgets. Match row schedules, report coverage
+and common/large-only source probes. This changes initialization and dataset
+diversity from the synthetic-start continuation history; a negative larger-bank
+result cannot rule out insufficient optimization. Require 185 eligible source
+groups before GPU use; no final test opened. Implementation complete, 45 targeted
+checks passed; no remote preparation or GPU submission yet. Evidence/protocol:
+[dataset-diversity experiment](joint_preprocessing_dataset_diversity_20261007.md).
+
 Agreed next diagnostic **2026-10-06**: two domain continuations, clinical versus
 financial, four independent source datasets each, **seed 0 only**, 1,024 updates
 each with ensemble CE from the same synthetic checkpoint. Common two-dataset
