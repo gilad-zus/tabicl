@@ -1,7 +1,7 @@
 # Fresh real-data learning with 40 versus 160 datasets
 
-Authorized 2026-10-07. Status: implementation complete; **49 distinct targeted
-checks passed** (20 new-runner/bank/catalog checks, ten inherited ensemble-gradient
+Authorized 2026-10-07. Status: implementation complete; **51 distinct targeted
+checks passed** (22 new-runner/bank/catalog checks, ten inherited ensemble-gradient
 checks, 19 real-bank checks). CLI and source compilation passed. No remote
 preparation or GPU submission at local-verification time. Seed **0 only** for both runs.
 
@@ -38,6 +38,16 @@ Rebuild all allocations in a new v2 result root, using the prior raw cache only
 for identical data-loading fields. Provenance/group annotation changes are allowed;
 data IDs, targets, names, aliases and other loading fields must match. The old
 raw cache is read-only and all duplicate/eligibility audits rerun.
+
+Full cached-description review additionally excluded `Loan_Approval_Status`
+(explicit synthetic version), `Dynamically-Generated-Hate-Speech-Dataset`
+(explicit synthetic content), and `students_scores` (collection provenance
+contradicts its name). Description screening now also runs on reused raw caches.
+Grouped source copies include Satellite/satimage, spam/spambase, Wine Quality's
+benchmark version named wine, re-encoded credit risk tables for China/modeling,
+Give Me Some Credit variants and a conservative CreditCardSubset/fraud grouping.
+Catalog inventories and class-count metadata support the financial copy grouping;
+not every shared-source inference is an established record-level identity.
 
 ## Question and closest predecessor
 
@@ -95,7 +105,7 @@ Candidates are frozen in
 scoring. The public OpenML metadata snapshot yields reviewed candidate IDs;
 known prior PMLB/sklearn/OpenML candidates supply alternate availability sources.
 The catalog builder records snapshot hashes and explicit source-group aliases:
-374 candidate entries represent 219 declared groups before actual-source checks.
+371 candidate entries represent 209 declared groups before actual-source checks.
 Many entries are versions or alternative feature/target tables and do not count
 as independent datasets. Source-name review is incomplete provenance evidence.
 

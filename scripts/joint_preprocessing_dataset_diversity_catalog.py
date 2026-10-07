@@ -56,7 +56,8 @@ REVIEWED_IDS = {
 }
 
 EXCLUDED_NAMES = {"higgs", "magictelescope", "magic", "estimationofobesitylevels",
-                  "fitnessclub", "mobileprice", "ibmemployeeattrition", "ibmemployeeperformance"}
+                  "fitnessclub", "mobileprice", "ibmemployeeattrition", "ibmemployeeperformance",
+                  "loanapprovalstatus", "dynamicallygeneratedhatespeechdataset", "studentsscores"}
 
 GROUP_ALIASES = {
     # ADA prior explicitly derives from Adult. Conservatively hold the anonymous
@@ -66,6 +67,13 @@ GROUP_ALIASES = {
     # Different targets/attributes from the same F16 control collection are not
     # independent transfer sources for this experiment.
     "f16_aircraft_control": ["ailerons", "elevators", "delta_ailerons", "delta_elevators"],
+    "uci_satimage": ["satimage", "Satellite"],
+    "uci_spambase": ["spambase", "spam"],
+    "kaggle_give_me_credit": ["Give-Me-Some-Credit", "Give-Me-Some-Credit-Sampled", "dataset_credit", "credit"],
+    "credit_risk_modeling": ["Credit_Risk_Modeling", "dataset_credit_risk_file_2"],
+    "credit_risk_china": ["credit_risk_china", "dataset_china"],
+    "telecom_churn_uci": ["churn", "UCI_churn"],
+    "kdd_cup_2009": ["KDDCup09_churn", "KDDCup09_upselling", "KDDCup09_appetency"],
     "uci_horse_colic": ["colic", "horse_colic_outcome"],
     "uci_contraceptive": ["cmc", "contraceptive_method"],
     "uci_heart_disease": ["heart-c", "heart-h", "heart-statlog", "heart_disease_cleveland", "cleveland", "cleve", "hungarian", "heart-statlog-uci", "Heart_disease_prediction_20"],
@@ -92,7 +100,7 @@ GROUP_ALIASES = {
     "corporate_credit_ratings": ["Multiclass_Classification_for_Corporate_Credit_Ratings", "Corporate_Credit_Rating_Classification", "Corporate_Credit", "Corporate_Credit_Rating", "Corporate_Credit_Ratings"],
     "credit_score_classification": ["credit-score-classification-Hzl", "Credit_Score_Classification", "Credit_Score_Classification_downsampled", "dataset_credit_score"],
     "mortgage_ny": ["EDA-Home-Mortgage-NY", "EDA-Home-Mortgage-NY-2", "EDA-Home-Mortgage-NY-Sampled", "EDA-Home-Mortgage-NY-Sampled-Dataset"],
-    "credit_card_fraud": ["Credit_Card_Fraud_Classification", "Credit_Card_Fraud", "Is_fraud", "Fraud-Detection-Updated)"],
+    "credit_card_fraud": ["Credit_Card_Fraud_Classification", "Credit_Card_Fraud", "Is_fraud", "Fraud-Detection-Updated)", "CreditCardSubset"],
     "loan_approval": ["Loan-Predication", "Loan_Approval_Status_Classification", "Loan_Status", "Loan_Approval_Status"],
     "osmi_mental_health": ["mental-health-in-tech-survey", "OSMI_Mental_Health_in_Tech_Survey"],
     "aztrees": ["aztrees3", "aztrees4"],
@@ -134,6 +142,9 @@ def build_catalog(snapshot, old):
             continue
         name = row["name"]
         group = aliases.get(bank.normalized_name(name), f"openml_{bank.normalized_name(name)}")
+        if int(row["did"]) == 43980:
+            # This benchmark's "wine" is Wine Quality, not UCI Wine Recognition.
+            group = "uci_wine_quality"
         eligible.append(dict(source="openml", data_id=int(row["did"]), name=name,
             source_group=group, catalog_quality=q,
             provenance="reviewed source name; OpenML classification version on real observations; detailed collection provenance not fully verified"))

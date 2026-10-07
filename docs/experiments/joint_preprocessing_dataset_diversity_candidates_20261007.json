@@ -1085,24 +1085,6 @@
     },
     {
       "catalog_quality": {
-        "MajorityClassSize": 518.0,
-        "MinorityClassSize": 482.0,
-        "NumberOfClasses": 2.0,
-        "NumberOfFeatures": 8.0,
-        "NumberOfInstances": 1000.0,
-        "NumberOfInstancesWithMissingValues": 0.0,
-        "NumberOfMissingValues": 0.0,
-        "NumberOfNumericFeatures": 3.0,
-        "NumberOfSymbolicFeatures": 0.0
-      },
-      "data_id": 43097,
-      "name": "students_scores",
-      "provenance": "reviewed source name; OpenML classification version on real observations; detailed collection provenance not fully verified",
-      "source": "openml",
-      "source_group": "uci_student_performance"
-    },
-    {
-      "catalog_quality": {
         "MajorityClassSize": 49264.0,
         "MaxNominalAttDistinctValues": 2.0,
         "MinorityClassSize": 49264.0,
@@ -1325,7 +1307,7 @@
       "name": "spam",
       "provenance": "reviewed source name; OpenML classification version on real observations; detailed collection provenance not fully verified",
       "source": "openml",
-      "source_group": "openml_spam"
+      "source_group": "uci_spambase"
     },
     {
       "catalog_quality": {
@@ -1801,24 +1783,6 @@
       "source_group": "uci_ecoli"
     },
     {
-      "catalog_quality": {
-        "MajorityClassSize": 35000.0,
-        "MinorityClassSize": 10000.0,
-        "NumberOfClasses": 2.0,
-        "NumberOfFeatures": 14.0,
-        "NumberOfInstances": 45000.0,
-        "NumberOfInstancesWithMissingValues": 0.0,
-        "NumberOfMissingValues": 0.0,
-        "NumberOfNumericFeatures": 13.0,
-        "NumberOfSymbolicFeatures": 1.0
-      },
-      "data_id": 46565,
-      "name": "Loan_Approval_Status",
-      "provenance": "reviewed source name; OpenML classification version on real observations; detailed collection provenance not fully verified",
-      "source": "openml",
-      "source_group": "loan_approval"
-    },
-    {
       "aliases": [
         "segment"
       ],
@@ -1843,7 +1807,7 @@
       "name": "Credit_Risk_Modeling",
       "provenance": "reviewed source name; OpenML classification version on real observations; detailed collection provenance not fully verified",
       "source": "openml",
-      "source_group": "openml_creditriskmodeling"
+      "source_group": "credit_risk_modeling"
     },
     {
       "catalog_quality": {
@@ -2173,7 +2137,7 @@
       "name": "Satellite",
       "provenance": "reviewed source name; OpenML classification version on real observations; detailed collection provenance not fully verified",
       "source": "openml",
-      "source_group": "openml_satellite"
+      "source_group": "uci_satimage"
     },
     {
       "catalog_quality": {
@@ -2330,24 +2294,6 @@
       "provenance": "previously declared real-bank source; availability still checked",
       "source": "pmlb",
       "source_group": "irish"
-    },
-    {
-      "catalog_quality": {
-        "MajorityClassSize": 22175.0,
-        "MinorityClassSize": 18969.0,
-        "NumberOfClasses": 2.0,
-        "NumberOfFeatures": 13.0,
-        "NumberOfInstances": 41144.0,
-        "NumberOfInstancesWithMissingValues": 11054.0,
-        "NumberOfMissingValues": 11054.0,
-        "NumberOfNumericFeatures": 3.0,
-        "NumberOfSymbolicFeatures": 0.0
-      },
-      "data_id": 46683,
-      "name": "Dynamically-Generated-Hate-Speech-Dataset",
-      "provenance": "reviewed source name; OpenML classification version on real observations; detailed collection provenance not fully verified",
-      "source": "openml",
-      "source_group": "openml_dynamicallygeneratedhatespeechdataset"
     },
     {
       "catalog_quality": {
@@ -2526,7 +2472,7 @@
       "name": "dataset_credit_risk_file_2",
       "provenance": "reviewed source name; OpenML classification version on real observations; detailed collection provenance not fully verified",
       "source": "openml",
-      "source_group": "openml_datasetcreditriskfile2"
+      "source_group": "credit_risk_modeling"
     },
     {
       "catalog_quality": {
@@ -2820,7 +2766,7 @@
       "name": "dataset_credit",
       "provenance": "reviewed source name; OpenML classification version on real observations; detailed collection provenance not fully verified",
       "source": "openml",
-      "source_group": "openml_datasetcredit"
+      "source_group": "kaggle_give_me_credit"
     },
     {
       "catalog_quality": {
@@ -3010,7 +2956,7 @@
       "name": "credit_risk_china",
       "provenance": "reviewed source name; OpenML classification version on real observations; detailed collection provenance not fully verified",
       "source": "openml",
-      "source_group": "openml_creditriskchina"
+      "source_group": "credit_risk_china"
     },
     {
       "catalog_quality": {
@@ -3084,7 +3030,7 @@
       "name": "wine",
       "provenance": "reviewed source name; OpenML classification version on real observations; detailed collection provenance not fully verified",
       "source": "openml",
-      "source_group": "openml_wine"
+      "source_group": "uci_wine_quality"
     },
     {
       "catalog_quality": {
@@ -4274,7 +4220,7 @@
       "name": "CreditCardSubset",
       "provenance": "reviewed source name; OpenML classification version on real observations; detailed collection provenance not fully verified",
       "source": "openml",
-      "source_group": "openml_creditcardsubset"
+      "source_group": "credit_card_fraud"
     },
     {
       "catalog_quality": {
@@ -4795,7 +4741,7 @@
       "name": "credit",
       "provenance": "reviewed source name; OpenML classification version on real observations; detailed collection provenance not fully verified",
       "source": "openml",
-      "source_group": "openml_credit"
+      "source_group": "kaggle_give_me_credit"
     },
     {
       "catalog_quality": {
@@ -5240,7 +5186,7 @@
       "name": "dataset_china",
       "provenance": "reviewed source name; OpenML classification version on real observations; detailed collection provenance not fully verified",
       "source": "openml",
-      "source_group": "openml_datasetchina"
+      "source_group": "credit_risk_china"
     },
     {
       "catalog_quality": {
@@ -6037,7 +5983,7 @@
       "name": "UCI_churn",
       "provenance": "reviewed source name; OpenML classification version on real observations; detailed collection provenance not fully verified",
       "source": "openml",
-      "source_group": "openml_ucichurn"
+      "source_group": "telecom_churn_uci"
     },
     {
       "catalog_quality": {
@@ -6185,7 +6131,7 @@
       "name": "KDDCup09_upselling",
       "provenance": "reviewed source name; OpenML classification version on real observations; detailed collection provenance not fully verified",
       "source": "openml",
-      "source_group": "openml_kddcup09upselling"
+      "source_group": "kdd_cup_2009"
     },
     {
       "catalog_quality": {

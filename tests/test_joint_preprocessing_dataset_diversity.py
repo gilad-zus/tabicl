@@ -300,9 +300,45 @@ def test_cache_recuration_never_relaxes_data_loading_identity():
         assert bank.cached_entry_identity(original) != bank.cached_entry_identity(dict(curated, **{field: value}))
 
 
+def test_reused_cache_cannot_bypass_new_synthetic_description_exclusion(tmp_path, monkeypatch):
+    import hashlib
+    entries = [dict(source="sklearn", name=f"cached{i}", source_group=f"source{i}") for i in range(2)]
+    source = dict(target_counts=dict(large=1, small=1, validation=1), candidates=entries,
+        minimum_rows=256, max_source_rows=16384, seed=20261007, split_seeds=[0, 1], scope="fixture")
+    candidate = tmp_path / "candidates.json"
+    candidate.write_text(json.dumps(source))
+    cache = tmp_path / "old_cache"
+    for i, entry in enumerate(entries):
+        raw = source_family(rows=256)
+        key = hashlib.sha256(bank.bank._entry_identity(entry).encode()).hexdigest()[:20]
+        runner.pilot.atomic_save(cache / f"{key}.pt", dict(entry=entry, columns=raw["columns"],
+            labels=raw["labels"], raw_hash=None,
+            description="A synthetic version inspired by observations" if i == 0 else "real measurements"))
+    def no_download(*args):
+        raise AssertionError("all sources are already cached")
+    monkeypatch.setattr(bank, "load_candidate", no_download)
+    root = tmp_path / "run"
+    with pytest.raises(RuntimeError, match="no GPU run"):
+        bank.prepare(root, candidate, tmp_path / "cache", reuse_source_cache=cache)
+    failures = runner.previous.read(root / "availability.json")["failures"]
+    assert len(failures) == 1 and "generated/simulated" in failures[0]["reason"]
+
+
+def test_curated_renamed_copies_share_groups_and_synthetic_names_are_excluded():
+    aliases = catalog.alias_map({"candidates": {}})
+    for names in [("satimage", "Satellite"), ("spam", "spambase"),
+                  ("Credit_Risk_Modeling", "dataset_credit_risk_file_2"),
+                  ("credit_risk_china", "dataset_china"), ("credit", "Give-Me-Some-Credit-Sampled"),
+                  ("CreditCardSubset", "Credit_Card_Fraud_Classification")]:
+        assert len({aliases[bank.bank.normalized_name(n)] for n in names}) == 1
+    assert catalog.EXCLUDED_NAMES == bank.KNOWN_GENERATED
+
+
 def test_generated_source_description_exclusion_is_explicit():
     assert bank.GENERATED_DESCRIPTION.search("This synthetic dataset was generated for classification.")
     assert bank.GENERATED_DESCRIPTION.search("simulated data from Monte Carlo simulation")
+    assert bank.GENERATED_DESCRIPTION.search("This dataset is a synthetic version inspired by a real dataset.")
+    assert bank.GENERATED_DESCRIPTION.search("All content is synthetic.")
     assert not bank.GENERATED_DESCRIPTION.search("Measurements from hospitals; features include temperature.")
 
 

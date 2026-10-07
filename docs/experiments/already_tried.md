@@ -7,12 +7,14 @@ primary comparison at equal final budgets. Match row schedules, report coverage
 and common/large-only source probes. This changes initialization and dataset
 diversity from the synthetic-start continuation history; a negative larger-bank
 result cannot rule out insufficient optimization. Require 185 eligible source
-groups before GPU use; no final test opened. Implementation complete, 49 targeted
+groups before GPU use; no final test opened. Implementation complete, 51 targeted
 checks passed. Initial preparation exposed a PMLB NumPy-array coverage bug, now
 repaired and synchronized as `6d5f593`. Preparation completed with 185 declared
 groups; provenance review then identified Adult/ADA and F16 target variants.
 The v1 bank is an unused audit. Group those variants and rebuild all panels in
 v2, reusing identical raw sources and repeating eligibility/content audits.
+Full metadata review also removed explicit synthetic sources and grouped renamed
+satellite/spam/wine/financial copies. Cached descriptions cannot bypass exclusion.
 No GPU submission yet. Evidence/protocol:
 [dataset-diversity experiment](joint_preprocessing_dataset_diversity_20261007.md).
 

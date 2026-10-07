@@ -16,10 +16,19 @@ from scripts import joint_preprocessing_synthetic_pilot as pilot
 
 GENERATED_DESCRIPTION = re.compile(
     r"synthetic (?:data(?:set)?|examples)|artificial (?:data(?:set)?|examples)|"
+    r"synthetic (?:version|content)|(?:all )?content is synthetic|"
     r"randomly generated (?:data|examples)|simulated (?:data(?:set)?|examples)|"
     r"monte.?carlo (?:simulation|generated)", re.I)
 KNOWN_GENERATED = {"higgs", "magictelescope", "magic", "estimationofobesitylevels",
-                   "fitnessclub", "mobileprice", "ibmemployeeattrition", "ibmemployeeperformance"}
+                   "fitnessclub", "mobileprice", "ibmemployeeattrition", "ibmemployeeperformance",
+                   "loanapprovalstatus", "dynamicallygeneratedhatespeechdataset", "studentsscores"}
+
+
+def validate_provenance(entry, description):
+    if bank.normalized_name(entry["name"]) in KNOWN_GENERATED:
+        raise ValueError("excluded generated or uncertain source")
+    if GENERATED_DESCRIPTION.search(description or ""):
+        raise ValueError("source description identifies generated/simulated data")
 
 
 def stable_order(values, seed, key):
@@ -91,8 +100,7 @@ def allocate(records, counts, seed):
 
 
 def load_candidate(entry, cache_dir):
-    if bank.normalized_name(entry["name"]) in KNOWN_GENERATED:
-        raise ValueError("known generated/simulated source excluded")
+    validate_provenance(entry, None)
     description = None
     if entry["source"] == "openml":
         path = cache_dir / "metadata" / f"openml_{entry['data_id']}.json"
@@ -101,8 +109,7 @@ def load_candidate(entry, cache_dir):
                 pilot.json_write(path, json.load(response))
         metadata = json.loads(path.read_text())["data_set_description"]
         description = metadata.get("description", "")
-        if GENERATED_DESCRIPTION.search(description):
-            raise ValueError("source description identifies generated/simulated data")
+        validate_provenance(entry, description)
     frame, labels, raw_hash = bank._load_candidate(entry, cache_dir)
     return frame, labels, raw_hash, description
 
@@ -152,6 +159,8 @@ def prepare(output_dir, candidate_path, cache_dir, reuse_source_cache=None):
                 frame, labels, raw_hash, description = load_candidate(entry, cache_dir)
                 pilot.atomic_save(path, dict(entry=entry, columns=bank.pack_frame(frame),
                     labels=labels.tolist(), raw_hash=raw_hash, description=description))
+            # A reused raw cache must never bypass a stricter provenance audit.
+            validate_provenance(entry, description)
             _, class_counts = np.unique(labels, return_counts=True)
             if len(labels) < source["minimum_rows"] or not 2 <= len(class_counts) <= 10 or class_counts.min() < 2:
                 raise ValueError("ineligible source rows/classes/class coverage")
