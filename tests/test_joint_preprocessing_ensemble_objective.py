@@ -49,13 +49,20 @@ def test_memory_bounded_backward_matches_full_autograd_for_every_parameter(mixed
 
 
 @pytest.mark.parametrize("grouping", [False, True])
-def test_actual_tabicl_deployment_value_and_backpropagation_parity(tmp_path, grouping):
+@pytest.mark.parametrize("sampled_task", [False, True])
+def test_actual_tabicl_deployment_value_and_backpropagation_parity(tmp_path, grouping, sampled_task):
     backbone = TabICL(max_classes=2, embed_dim=8, col_num_blocks=1, col_nhead=1,
         col_num_inds=2, col_feature_group=grouping, row_num_blocks=1, row_nhead=1,
         row_num_cls=1, icl_num_blocks=1, icl_nhead=1, col_ssmax=True,
         icl_ssmax=True, dropout=0., zero_init=False).train().requires_grad_(False)
     model, e = initial_model(), real_episode()
+    if not sampled_task:
+        e.pop("task_id")
+        e.pop("source_seed")
     runner.execution_audit(backbone, model, e, tmp_path, torch.device("cpu"))
+    audit = runner.previous.read(tmp_path / 'execution_audit.json')
+    assert audit['task_id'] == e.get('task_id')
+    assert (audit['family'], audit['split_seed']) == (e['family'], e['split_seed'])
     expected = naive_loss(backbone, model, e)
     expected.backward()
     staged = initial_model()

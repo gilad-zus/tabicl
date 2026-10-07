@@ -20,8 +20,13 @@ verified locally. Submitted SLURM array **33062914**, `jp-dd-s0-261007`, tasks
 0=40-source and 1=160-source, concurrency one. **Both failed before training**
 during initial validation references: an unbounded standardized query input
 exceeded FP16 range. Fixed [-100,100] standardized-input guard tested locally;
-52 repair checks pass. Reuse identical frozen data panels in v3; GPU preflight
-and replacement submission pending October 7. Evidence:
+52 numerical repair checks pass. V3 copied identical frozen panels; replacement
+array **33112644** reproduced the unbounded AMP overflow on GPU, then stopped in
+audit metadata serialization (`task_id` absent on frozen validation). No training
+updates occurred. Repair the audit's optional task ID, retain source/split identity
+and test lifecycle fixtures matching real metadata. V4 restart pending October 7.
+All 36 diversity/audit regression checks pass.
+Evidence:
 [numerical repair](joint_preprocessing_dataset_diversity_numerical_repair_20261007.md).
 Protocol:
 [dataset-diversity experiment](joint_preprocessing_dataset_diversity_20261007.md).

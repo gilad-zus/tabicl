@@ -34,12 +34,35 @@ Start from the same CPU seed-zero fresh parameter values. Keep v2 as a failed
 startup artifact. Recompute all model-dependent references under the repaired code;
 do not import old references, optimizer states or model checkpoints.
 
-Before resubmission, run a small GPU preflight on the failing episode: unbounded
+Before training, run a small GPU preflight on the failing episode: unbounded
 initial-standardization reconstruction on default AMP, followed by repaired
 default AMP, FP32 train/inference parity and finite nonzero learning gradients.
-No optimizer updates occur in preflight. GPU verification and replacement job IDs
-are pending at this document's initial status.
+No optimizer updates occur in preflight. It runs at the start of the first serial
+SLURM task; a failed marker prevents either arm from entering training.
 
 The replacement experiment retains one seed, two serial 40/160-source arms,
 4,096 updates each and the common 25-source development validation. No confirmation
 test bank is opened. All source fingerprints and data-panel hashes stay locked.
+
+October 7 restart audit: CPU preparation of v3 completed from `63e9b61`, PID
+3186652, log `/home/dsi/zusmang/TabICL/tabicl/jp-dd-amp-bank-261007.log`.
+All five data-panel hashes and the bank-selection manifest are identical to v2;
+185 declared groups and 42 committed dependency hashes were verified locally.
+Replacement array **33112644**, `jp-dd-amp-s0-261007`, was submitted at 23:11 IDT,
+one GPU/32G/four CPUs/six hours per arm, serial concurrency one and email enabled.
+
+Its preflight reproduced the original problem on an A100: unbounded standardized
+maximum 257,587, default AMP logits nonfinite. The repaired execution then reached
+the end of the FP32 parity/gradient audit, but audit serialization raised
+`KeyError: task_id`. Frozen real validation episodes identify their source and
+split rather than a sampled training task; the audit erroneously required the
+latter field. The gate stopped both arms before training.
+
+Metadata repair: audit records now retain family/split and allow a null task ID
+for frozen validation. CPU lifecycle fixtures now use the actual frozen-bank
+metadata shape; native TabICL parity/backpropagation checks cover episodes with
+and without sampled IDs. All 36 dataset-diversity and ensemble-audit regression
+checks pass (including the preflight and both-arm resume lifecycle); diff checks
+pass. The corrected restart will use a new immutable v4 root,
+identical frozen data panels and fresh seed-zero weights. GPU verification and
+replacement submission remain pending until recorded below.

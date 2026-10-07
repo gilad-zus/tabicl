@@ -123,7 +123,9 @@ def fixture(monkeypatch):
     sources = dict(small=[source_family(f"source{i}") for i in range(4)],
                    large=[source_family(f"source{i}") for i in range(8)])
     values = {f"{k}_train": v for k, v in sources.items()}
-    values.update({p: [real_episode()] for p in runner.PANELS})
+    values.update({p: [{k: v for k, v in real_episode().items()
+                       if k not in ("task_id", "source_seed")}]
+                   for p in runner.PANELS})
     model = initial_model()
     manifest = dict(fingerprint="diversity-fixture", initial_sha256="same-initial",
         settings={}, banks={p: dict(count=len(v)) for p, v in values.items()})
@@ -153,6 +155,9 @@ def test_preflight_checks_inference_and_gradients_without_training(tmp_path, fix
     assert_nested_equal(initial, fixture[0].state_dict())
     result = runner.previous.read(root / 'preflight' / 'complete.json')
     assert result['default_amp_finite'] and result['no_optimizer_update']
+    audit = runner.previous.read(root / 'preflight' / 'execution_audit.json')
+    assert audit['task_id'] is None
+    assert (audit['family'], audit['split_seed']) == (episode['family'], episode['split_seed'])
     assert not (root / 'runs').exists()
 
 

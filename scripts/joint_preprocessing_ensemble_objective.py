@@ -217,7 +217,10 @@ def execution_audit(backbone, initial, e, folder, device):
         raise FloatingPointError("ensemble objective has no finite nonzero learning gradient")
     if any(p.grad is not None for p in backbone.parameters()):
         raise AssertionError("frozen backbone received parameter gradients")
-    report = dict(task_id=e["task_id"], learned_max_absolute_difference=float((learned - deployed_learned).abs().max()),
+    # Frozen real validation episodes have a source and split, but no sampled
+    # training-task identifier. Keep that distinction in the audit metadata.
+    report = dict(task_id=e.get("task_id"), family=e["family"], split_seed=e["split_seed"],
+                  learned_max_absolute_difference=float((learned - deployed_learned).abs().max()),
                   ordinary_max_absolute_difference=float((ordinary - deployed_ordinary).abs().max()),
                   ensemble_ce=float(value), deployed_ce=float(expected_ce),
                   default_amp_deployed_ce=float(default_ce),
