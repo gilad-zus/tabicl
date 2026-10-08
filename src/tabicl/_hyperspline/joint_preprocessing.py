@@ -58,6 +58,9 @@ class RawContextEncoder(nn.Module):
         z = ((x.float() - stats.location[:, None]) / stats.scale[:, None]).masked_fill(~valid, 0).clamp(-8, 8)
         features = torch.stack((z, z.square(), z.abs(), valid.float()), dim=-1)
         cells = self.cell_encoder(features) + self.column_encoder(stats.summary[..., :UNSUPERVISED_SUMMARY_DIM])[:, None]
+        return self.pool_cells(cells, y)
+
+    def pool_cells(self, cells: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         b, n, d, h = cells.shape
         rows = cells.reshape(b * n, d, h)
         attended, _ = self.row_attention(rows, rows, rows, need_weights=False)
@@ -138,6 +141,10 @@ class JointPreprocessor(nn.Module):
         with torch.no_grad():
             stats = summarize_context(x_context, context_missing, y_context, eps=self.eps)
         tokens = self.encoder(x_context, y_context, stats, context_missing)[:, None] + self.slot_embeddings[None, :, None]
+        return self.parameters_from_tokens(tokens, stats)
+
+    def parameters_from_tokens(self, tokens: torch.Tensor, stats: ColumnStatistics) -> JointParameters:
+        """Shared transformation heads; tokens already include the two view slots."""
         affine = self.affine_head(tokens)
         shift, log_scale = affine[..., 0].tanh(), affine[..., 1].tanh()
         controls = spline_gate = None
@@ -156,7 +163,7 @@ class JointPreprocessor(nn.Module):
             neural_gate = self.neural_gate_head(tokens).sigmoid().squeeze(-1)
             left = self.mix_left_head(tokens)
             right = self.mix_right_head(tokens)
-            rank = min(self.rank, x_context.shape[-1])
+            rank = min(self.rank, tokens.shape[-2])
             raw_mix = left[..., :rank] @ right[..., :rank].transpose(-1, -2) / rank
             # Frobenius norm bounds spectral norm, including with varying D.
             bounded = 0.1 * raw_mix / raw_mix.norm(dim=(-2, -1), keepdim=True).clamp_min(self.eps)

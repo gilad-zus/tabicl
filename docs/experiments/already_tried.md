@@ -1,5 +1,16 @@
 # Research memory: what we have already tried
 
+Agreed/implemented **2026-10-08**: seed-zero raw versus frozen-TabICL context
+conditioning, same 160/25 real source bank, 4,096 updates per arm. Both generators
+residual-adapt eight of the exact sixteen native views and initialize to ordinary16.
+Full-context embeddings include categories; conditioning sees no queries. Closest
+previous work: 40/160 fresh generator and September input-preserving per-target
+adapters. This changes the encoder within a shared zero-shot residual formulation;
+comparison with the old model also changes view placement. 52 targeted local checks
+passed. Remote preparation/submission pending as of 2026-10-08. Development
+validation remains reused; no synthetic mix, teacher fitting or test bank opened.
+Evidence/protocol: [residual conditioning](joint_preprocessing_residual_conditioning_20261008.md).
+
 Agreed **2026-10-07**: fresh real-data ensemble learning with nested **40 versus
 160** independent training source groups, **seed 0 only**, 4,096 updates and four
 episodes/update each. Common 25-source validation; select by mean dataset NLL,
