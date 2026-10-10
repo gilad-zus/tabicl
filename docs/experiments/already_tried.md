@@ -1,5 +1,20 @@
 # Research memory: what we have already tried
 
+Authorized **2026-10-10**: one seed-zero statistics-only shared residual generator
+(8,187 trainable parameters, no conditioner attention), retaining all current
+affine/spline/neural/mixing heads and native16 deployment. Same 160/25 real source
+bank, 4,096 updates; each source gets its own row cap. Eight training-source direct
+maps receive 250 updates each, selected on inner-context holdouts and scored on
+outer held-out rows; these query IDs are excluded from shared meta-training. No
+teacher targets, synthetic mix or final test bank. Closest work: October 8 raw/
+backbone residual run and October 3 synthetic fitting diagnostic; older statistics
+HyperSpline real transfer was weak. This tests a simple shared conditioner plus
+real held-out-row transformation headroom; historical comparisons also change
+sampling. Row-cap audit: 45.75% of old episodes reduced; actual/requested rows
+59.71%, requested-1024 mean actual 403.73. Implemented; 25 targeted CPU checks passed; remote launch pending. Evidence/protocol:
+[statistics diagnostic](joint_preprocessing_statistics_diagnostic_20261010.md),
+[row-cap audit](joint_preprocessing_row_cap_audit_20261010.json).
+
 Agreed/implemented **2026-10-08**: seed-zero raw versus frozen-TabICL context
 conditioning, same 160/25 real source bank, 4,096 updates per arm. Both generators
 residual-adapt eight of the exact sixteen native views and initialize to ordinary16.

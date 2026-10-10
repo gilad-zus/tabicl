@@ -1,0 +1,38 @@
+{
+  "presentations": 16384,
+  "reduced_fraction": 0.45751953125,
+  "mean_requested": 480.0,
+  "mean_actual": 286.627685546875,
+  "fraction_of_requested_rows": 0.5971410115559895,
+  "actual_over_requested_percentiles": {
+    "0": 0.2587890625,
+    "10": 0.302734375,
+    "25": 0.517578125,
+    "50": 1.0,
+    "75": 1.0,
+    "90": 1.0,
+    "100": 1.0
+  },
+  "by_requested_rows": {
+    "128": {
+      "presentations": 4096,
+      "reduced_fraction": 0.0,
+      "mean_actual": 128.0
+    },
+    "256": {
+      "presentations": 4096,
+      "reduced_fraction": 0.0,
+      "mean_actual": 256.0
+    },
+    "512": {
+      "presentations": 4096,
+      "reduced_fraction": 0.8720703125,
+      "mean_actual": 358.7802734375
+    },
+    "1024": {
+      "presentations": 4096,
+      "reduced_fraction": 0.9580078125,
+      "mean_actual": 403.73046875
+    }
+  }
+}

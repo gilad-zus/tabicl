@@ -8,6 +8,7 @@ import json
 import math
 import random
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -56,8 +57,14 @@ def new_model(arm, embedding_dim=128):
         return ResidualPreprocessor(arm, embedding_dim=embedding_dim)
 
 
-def prepare(args):
-    spec = settings(args)
+def manifest_extras(args, manifest):
+    return {}
+
+
+def prepare(args, protocol=None):
+    # A new protocol can reuse the locked data and training machinery with its own model.
+    protocol = protocol or sys.modules[__name__]
+    spec = protocol.settings(args)
     diversity.verify_revision(spec)
     intent = dict(settings=spec)
     path = args.output_dir / "preparation.json"
@@ -86,8 +93,8 @@ def prepare(args):
         feature_group=backbone.col_embedder.feature_group,
         feature_group_size=backbone.col_embedder.feature_group_size)
     hashes, parameter_counts = {}, {}
-    for arm in ARMS:
-        model = new_model(arm, embedding_dim)
+    for arm in protocol.ARMS:
+        model = protocol.new_model(arm, embedding_dim)
         path = args.output_dir / f"initial_{arm}.pt"
         if not path.exists():
             pilot.atomic_save(path, dict(model=pilot.state_cpu(model), model_seed=0))
@@ -107,6 +114,8 @@ def prepare(args):
         banks_manifest_sha256=pilot.hash_file(args.output_dir / "banks_manifest.json"),
         initial_sha256=hashes, backbone=backbone_lock, parameter_counts=parameter_counts,
         source_fingerprint=source_manifest["fingerprint"], no_test_bank=True)
+    # Additional frozen diagnostic banks participate in the root fingerprint.
+    manifest.update(protocol.manifest_extras(args, manifest))
     manifest["fingerprint"] = previous.digest(manifest)
     path = args.output_dir / "manifest.json"
     if path.exists() and previous.read(path) != manifest:
@@ -115,14 +124,15 @@ def prepare(args):
     print(f"Prepared residual-conditioning comparison: {path}", flush=True)
 
 
-def checked_manifest(args):
+def checked_manifest(args, protocol=None):
+    protocol = protocol or sys.modules[__name__]
     manifest = previous.read(args.output_dir / "manifest.json")
-    if manifest["settings"] != settings(args) or previous.digest(
+    if manifest["settings"] != protocol.settings(args) or previous.digest(
             {k: v for k, v in manifest.items() if k != "fingerprint"}) != manifest["fingerprint"]:
         raise ValueError("settings/code/manifest changed")
     if pilot.hash_file(args.output_dir / "banks_manifest.json") != manifest["banks_manifest_sha256"]:
         raise ValueError("bank manifest changed")
-    for arm in ARMS:
+    for arm in protocol.ARMS:
         if pilot.hash_file(args.output_dir / f"initial_{arm}.pt") != manifest["initial_sha256"][arm]:
             raise ValueError("initial weights changed")
     if previous.read(args.output_dir / "backbone_lock.json") != manifest["backbone"]:
@@ -131,8 +141,9 @@ def checked_manifest(args):
     return manifest
 
 
-def setup(args):
-    manifest = checked_manifest(args)
+def setup(args, protocol=None):
+    protocol = protocol or sys.modules[__name__]
+    manifest = protocol.checked_manifest(args)
     device = torch.device(args.device)
     backbone, path, sha = pilot.load_frozen(args, device)
     lock = manifest["backbone"]
@@ -142,7 +153,7 @@ def setup(args):
     for module in backbone.modules():
         if isinstance(module, torch.nn.Dropout):
             module.p = 0.
-    initial = new_model(args.arm, lock["embedding_dim"]).to(device)
+    initial = protocol.new_model(args.arm, lock["embedding_dim"]).to(device)
     initial.load_state_dict(torch.load(args.output_dir / f"initial_{args.arm}.pt",
                            map_location="cpu", weights_only=True)["model"])
     return backbone, initial, manifest, device
@@ -172,12 +183,18 @@ def prepared_episode(e, device):
     context = dict(x=e["x_context"][..., keep][..., positions].to(device),
         y=e["y_context"].to(device), missing=e["context_missing"][None, :, numerical_keep].to(device),
         full=canonical_context, positions=torch.as_tensor(positions, device=device, dtype=torch.long),
+        original_numerical_positions=torch.as_tensor(np.flatnonzero(numerical_keep), device=device, dtype=torch.long),
         all_missing=torch.cat((e["context_missing"][None, :, numerical_keep],
                                e["query_missing"][None, :, numerical_keep]), 1).to(device))
     return context, views
 
 
 def generate(model, backbone, context):
+    # Direct maps keep parameters in the original numerical-column ordering, even
+    # when an inner context removes a different subset of constant columns.
+    if model.conditioning == "direct":
+        return model.generate(context["x"], context["y"], context["missing"],
+            numerical_column_positions=context["original_numerical_positions"])
     features = frozen_context_features(backbone, context["full"], context["y"], context["positions"]) if model.conditioning == "backbone" else None
     return model.generate(context["x"], context["y"], context["missing"], frozen_features=features)
 
@@ -311,11 +328,12 @@ def execution_audit(backbone, initial, e, folder, device):
     return report
 
 
-def preflight(args):
-    for arm in ARMS:
+def preflight(args, protocol=None):
+    protocol = protocol or sys.modules[__name__]
+    for arm in protocol.ARMS:
         current = copy.copy(args)
         current.arm = arm
-        backbone, model, manifest, device = setup(current)
+        backbone, model, manifest, device = protocol.setup(current)
         episodes = bank.load_bank(args.output_dir, manifest, "real_validation")
         chosen = next(e for e in episodes if e["family"] == args.preflight_family and e["split_seed"] == args.preflight_split_seed)
         folder = args.output_dir / "preflight" / arm
@@ -326,13 +344,17 @@ def preflight(args):
         if device.type == "cuda":
             torch.cuda.empty_cache()
     pilot.json_write(args.output_dir / "preflight" / "complete.json", dict(
-        fingerprint=manifest["fingerprint"], arms=list(ARMS), both_passed=True))
+        fingerprint=manifest["fingerprint"], arms=list(protocol.ARMS), both_passed=True))
 
 
 def training_batch(arm, step, source_banks):
     if arm not in ARMS:
         raise ValueError("unknown conditioning arm")
     return diversity.training_batch("large", step, source_banks)
+
+
+def load_source_banks(args, manifest):
+    return {name: bank.load_bank(args.output_dir, manifest, f"{name}_train") for name in diversity.ARMS}
 
 
 def references(backbone, initial, episodes, root, panel, fp):
@@ -398,11 +420,12 @@ def evaluate(backbone, model, panels, refs, folder, step, device):
     return result
 
 
-def train(args):
+def train(args, protocol=None):
+    protocol = protocol or sys.modules[__name__]
     root, arm = args.output_dir, args.arm
     if (root / "complete.json").exists():
         raise ValueError("completed choices are locked; further training forbidden")
-    backbone, initial, manifest, device = setup(args)
+    backbone, initial, manifest, device = protocol.setup(args)
     fp = manifest["fingerprint"]
     if device.type == "cuda":
         gate = previous.read(root / "preflight" / "complete.json")
@@ -416,7 +439,7 @@ def train(args):
         return
     if folder.exists() and any(folder.iterdir()) and not args.resume:
         raise FileExistsError("run exists; pass --resume")
-    source_banks = {k: bank.load_bank(root, manifest, f"{k}_train") for k in diversity.ARMS}
+    source_banks = protocol.load_source_banks(args, manifest)
     panels = {p: bank.load_bank(root, manifest, p) for p in PANELS}
     refs = {p: references(backbone, initial, es, root, p, fp) for p, es in panels.items()}
     torch.manual_seed(451001)
@@ -442,7 +465,7 @@ def train(args):
         for name in objective.LOGS:
             core.capacity.trim_csv(folder / name, step)
     else:
-        execution_audit(backbone, model, training_batch(arm, 1, source_banks)[0], folder, device)
+        execution_audit(backbone, model, protocol.training_batch(arm, 1, source_banks)[0], folder, device)
         last = evaluate(backbone, model, panels, refs, folder, 0, device)
         best_score, best_model = last["real_validation"]["mean_blend_nll"], pilot.state_cpu(model)
     pilot.json_write(folder / "config.json", dict(fingerprint=runfp, experiment_fingerprint=fp,
@@ -469,7 +492,7 @@ def train(args):
         backbone.train()
         optimizer.zero_grad(set_to_none=True)
         losses = []
-        for position, e in enumerate(training_batch(arm, step, source_banks)):
+        for position, e in enumerate(protocol.training_batch(arm, step, source_banks)):
             losses.append(float(ensemble_backward(backbone, model, e)))
             pilot.csv_append(folder / "presentations.csv", dict(step=step, position=position, domain=arm,
                 family=e["family"], source_seed=e["source_seed"], task_id=e["task_id"],
