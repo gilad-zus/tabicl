@@ -13,6 +13,7 @@ from sklearn.metrics import roc_auc_score
 from scripts import joint_preprocessing_statistics_diagnostic as diagnostic
 from tabicl._experiments.direct_spline_openml import load_tabarena_openml_task
 from tabicl._sklearn.preprocessing import TransformToNumerical
+from tabicl._hyperspline.cross_preprocessing import DirectCrossPreprocessor
 
 residual, pilot, previous = diagnostic.residual, diagnostic.pilot, diagnostic.previous
 ARMS = ("fixed", "resampled")
@@ -26,9 +27,18 @@ TASK_IDS = (363612, 363613, 363614, 363615, 363616, 363618, 363619, 363620,
 CHECKPOINT_HASH = "bdc7dbd5e4ff21f8f0456fcf90c6b7cdf72dbea960f2d05b19bec19f9b3d4ed0"
 SOURCE_FINGERPRINT = "60e0745f4221d102fc84e563b99f8cb5b2866afd446a1536a7686edf402ae04f"
 SOURCE_REPORT_HASH = "49f293b701f631aa55e5bbdb56a05863422dc400db140528f76cf664dff304db"
+RESTRICTED_FINGERPRINT = "a118acfde02d0f05476cf6917091364c5b2cfd157403bad1f1f07e5441dfa11d"
+RESTRICTED_REPORT_HASH = "0732f859bef2a497fcdfc6bb93558506987a74637fe6277f0e31499f68bb8799"
+COMPARISON_ARMS = ("spline_low_lr", "cross_low_lr")
+
+
+def reuses_source(args):
+    return getattr(args, "transformation", "full") in ("restricted", "comparison")
 
 
 def experiment_arms(args):
+    if getattr(args, "transformation", "full") == "comparison":
+        return COMPARISON_ARMS
     return ("resampled",) if getattr(args, "transformation", "full") == "restricted" else ARMS
 
 
@@ -52,8 +62,13 @@ def settings(args):
         repository / "src/tabicl/_hyperspline/statistics_preprocessing.py")
     transformation = getattr(args, "transformation", "full")
     source_dir = getattr(args, "source_dir", None)
-    if transformation not in ("full", "restricted") or ((transformation == "restricted") != (source_dir is not None)):
+    if transformation not in ("full", "restricted", "comparison") or (reuses_source(args) != (source_dir is not None)):
         raise ValueError("restricted fitting requires --source-dir; full fitting must prepare its own bank")
+    restricted_reference_dir = getattr(args, "restricted_reference_dir", None)
+    if (transformation == "comparison") != (restricted_reference_dir is not None):
+        raise ValueError("comparison requires --restricted-reference-dir exclusively")
+    if transformation == "comparison" and args.lr != .0003:
+        raise ValueError("the paired comparison fixes constant learning rate at 0.0003")
     specification = dict(version=1, suite_id=457, task_ids=list(TASK_IDS), arms=list(experiment_arms(args)), model_seed=0,
         split_seed=20261011, outer_split=dict(repeat=0, fold=0, sample=0),
         outer_train_rows=args.outer_train_rows, fitting_fraction=.8, training_context_fraction=.75,
@@ -71,6 +86,18 @@ def settings(args):
             source_manifest_fingerprint=SOURCE_FINGERPRINT, source_report_sha256=SOURCE_REPORT_HASH,
             transformation="direct affine and monotone K20 spline only; neural/mixing parameters absent, two slots",
             test_use="full official test after all 33 restricted maps lock; completed full maps are read-only references")
+    if transformation == "comparison":
+        cross_path = repository / "src/tabicl/_hyperspline/cross_preprocessing.py"
+        code_hashes[cross_path.relative_to(repository).as_posix()] = residual.objective.canonical_hash(cross_path)
+        specification.update(version=3, source_dir=source_dir.as_posix(),
+            source_manifest_fingerprint=SOURCE_FINGERPRINT, source_report_sha256=SOURCE_REPORT_HASH,
+            restricted_reference_dir=restricted_reference_dir.as_posix(),
+            restricted_manifest_fingerprint=RESTRICTED_FINGERPRINT, restricted_report_sha256=RESTRICTED_REPORT_HASH,
+            transformation="paired restricted affine/K20 spline versus affine/rank4 multiplicative cross, two slots",
+            cross_layer=dict(depth=1, rank=4, initial_gate=.02, input_factor_seed=0,
+                input_factor_scale="1/sqrt(original numerical columns)", output_factors="zero",
+                formula="affine + gate * affine * ((affine @ input_factors) @ output_factors.T + bias)"),
+            test_use="full official test after all 66 new fits lock; completed full/restricted maps are read-only references")
     return specification
 
 
@@ -160,6 +187,9 @@ def prediction_episode(entry, query_partition):
 
 
 def training_episode(entry, arm, step, *, probe_number=None):
+    # Both new conditions receive the exact existing resampled row schedule.
+    if arm in COMPARISON_ARMS:
+        arm = "resampled"
     if arm not in ARMS:
         raise ValueError("unknown training arm")
     # A step-derived seed makes row roles reproducible across restart boundaries.
@@ -179,7 +209,7 @@ def task_folder(args, task_id):
 
 def bank_folder(args, task_id):
     # The restriction experiment reads the original encoded banks without copying or rebuilding them.
-    bank_root = args.source_dir if getattr(args, "transformation", "full") == "restricted" else args.output_dir
+    bank_root = args.source_dir if reuses_source(args) else args.output_dir
     return bank_root / "tasks" / str(task_id)
 
 
@@ -193,6 +223,8 @@ def checked_source(args):
     current_settings = settings(args)
     # These fields describe the deliberate intervention or its revision, rather than the paired protocol.
     changed_fields = {"version", "arms", "transformation", "test_use", "code_hashes", "expected_revision"}
+    if getattr(args, "transformation", "full") == "comparison":
+        changed_fields.add("lr")
     for setting_name, source_value in source_manifest["settings"].items():
         if setting_name not in changed_fields and current_settings[setting_name] != source_value:
             raise ValueError(f"restricted protocol differs from source: {setting_name}")
@@ -213,10 +245,36 @@ def checked_source(args):
     return source_manifest
 
 
+def checked_restricted_reference(args, source_manifest):
+    reference_root = args.restricted_reference_dir
+    reference_manifest = previous.read(reference_root / "manifest.json")
+    reference_content = {name: value for name, value in reference_manifest.items() if name != "fingerprint"}
+    if previous.digest(reference_content) != RESTRICTED_FINGERPRINT or reference_manifest["fingerprint"] != RESTRICTED_FINGERPRINT:
+        raise ValueError("restricted reference manifest changed")
+    if pilot.hash_file(reference_root / "complete.json") != RESTRICTED_REPORT_HASH:
+        raise ValueError("restricted reference report changed")
+    if reference_manifest["accepted"] != source_manifest["accepted"] or reference_manifest["excluded"] != source_manifest["excluded"]:
+        raise ValueError("restricted reference membership differs")
+    if args.output_dir.resolve() == reference_root.resolve():
+        raise ValueError("comparison outputs must not overwrite the restricted reference")
+    # Check map locks without deserializing historical test predictions during fitting.
+    for record in source_manifest["accepted"]:
+        reference_folder = reference_root / "tasks" / str(record["task_id"]) / "resampled"
+        completion = previous.read(reference_folder / "fit_complete.json")
+        if completion["fingerprint"] != RESTRICTED_FINGERPRINT or completion["steps"] != args.steps:
+            raise ValueError("restricted reference fit incomplete or changed")
+        for choice in ("selected", "final"):
+            if pilot.hash_file(reference_folder / f"{choice}.pt") != completion[f"{choice}_sha256"]:
+                raise ValueError("restricted reference map lock changed")
+    return reference_manifest
+
+
 def prepare_restricted(args):
     specification = settings(args)
     residual.diversity.verify_revision(specification)
     source_manifest = checked_source(args)
+    if getattr(args, "transformation", "full") == "comparison":
+        checked_restricted_reference(args, source_manifest)
     manifest = dict(settings=specification, accepted=source_manifest["accepted"], excluded=source_manifest["excluded"])
     manifest["fingerprint"] = previous.digest(manifest)
     manifest_path = args.output_dir / "manifest.json"
@@ -224,21 +282,25 @@ def prepare_restricted(args):
         raise ValueError("restricted preparation changed")
     pilot.json_write(args.output_dir / "intent.json", specification)
     pilot.json_write(manifest_path, manifest)
-    print(f"Reused {len(manifest['accepted'])} frozen source banks; only restricted resampled fits will run", flush=True)
+    print(f"Reused {len(manifest['accepted'])} frozen source banks; conditions={experiment_arms(args)}", flush=True)
 
 
-def direct_model(args, initial, entry, device):
+def direct_model(args, initial, entry, device, *, arm=None):
     episode = prediction_episode(entry, entry["validation"])
-    if getattr(args, "transformation", "full") != "restricted":
+    if not reuses_source(args):
         return diagnostic.direct_model(initial, episode, device)
     numerical_mask = episode["numerical_mask"]
-    return diagnostic.DirectResidualPreprocessor(initial,
+    if getattr(args, "transformation", "full") == "comparison" and arm not in COMPARISON_ARMS:
+        raise ValueError("comparison model requires its named condition")
+    model_class = DirectCrossPreprocessor if arm == "cross_low_lr" else diagnostic.DirectResidualPreprocessor
+    model_options = {} if arm == "cross_low_lr" else dict(restricted=True)
+    return model_class(initial,
         episode["x_context"][..., numerical_mask].to(device), episode["y_context"].to(device),
-        episode["context_missing"][None].to(device), restricted=True).to(device)
+        episode["context_missing"][None].to(device), **model_options).to(device)
 
 
 def prepare(args):
-    if getattr(args, "transformation", "full") == "restricted":
+    if reuses_source(args):
         return prepare_restricted(args)
     specification = settings(args)
     residual.diversity.verify_revision(specification)
@@ -295,8 +357,10 @@ def checked_manifest(args):
     if manifest["settings"] != settings(args):
         raise ValueError("experiment settings/code changed")
     residual.diversity.verify_revision(manifest["settings"])
-    if getattr(args, "transformation", "full") == "restricted":
+    if reuses_source(args):
         source_manifest = checked_source(args)
+        if getattr(args, "transformation", "full") == "comparison":
+            checked_restricted_reference(args, source_manifest)
         if manifest["accepted"] != source_manifest["accepted"] or manifest["excluded"] != source_manifest["excluded"]:
             raise ValueError("restricted task membership differs from source")
     for record in manifest["accepted"]:
@@ -327,6 +391,30 @@ def score_partition(backbone, model, entry, partition, chunk_rows):
     return score
 
 
+def comparison_transform_metrics(model, backbone, probe_episode, arm):
+    """Measure actual corrections on fixed fitting rows, separately from loss."""
+    context, views = residual.prepared_episode(probe_episode, next(backbone.parameters()).device)
+    with torch.no_grad():
+        adapted_values, _ = residual.numeric_views(model, backbone, context, views)
+        metrics = {}
+        observed_cells = ~context["all_missing"]
+        for slot in (0, 1):
+            view_position = next(position for position, view in enumerate(views)
+                                 if view["adapted"] and view["slot"] == slot)
+            native_values = views[view_position]["x"].index_select(-1, views[view_position]["columns"])
+            corrections = (adapted_values[view_position] - native_values)[observed_cells]
+            metrics[f"slot{slot}_correction_rms"] = float(corrections.square().mean().sqrt()) if corrections.numel() else 0.
+        if arm == "cross_low_lr":
+            metrics.update(cross_gate_mean=float(model.raw_outputs["cross_gate"].sigmoid().mean()),
+                cross_input_factor_norm=float(model.raw_outputs["cross_input_factors"].norm()),
+                cross_output_factor_norm=float(model.raw_outputs["cross_output_factors"].norm()))
+        else:
+            metrics["spline_gate_mean"] = float(model.raw_outputs["spline_gate_head"].sigmoid().mean())
+    if not all(math.isfinite(value) for value in metrics.values()):
+        raise FloatingPointError("nonfinite comparison transformation diagnostic")
+    return metrics
+
+
 def fit_arm(args, backbone, initial, manifest, entry, arm):
     folder = task_folder(args, entry["metadata"]["task_id"]) / arm
     if (folder / "fit_complete.json").exists():
@@ -338,7 +426,7 @@ def fit_arm(args, backbone, initial, manifest, entry, arm):
                 raise ValueError("locked map changed")
         return completion
     device = next(backbone.parameters()).device
-    model = direct_model(args, initial, entry, device)
+    model = direct_model(args, initial, entry, device, arm=arm)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=.0001)
     state_path = folder / "state.pt"
     probe_episodes = [training_episode(entry, "resampled", 0, probe_number=number) for number in range(3)]
@@ -384,6 +472,8 @@ def fit_arm(args, backbone, initial, manifest, entry, arm):
             train_probe_gain_percent=100 * (1 - probe_nll / np.mean(baseline_probes)),
             selected_step=selected_step, query_exposure_min=int(exposure.min()),
             query_exposure_max=int(exposure.max()), query_exposure_fraction=float((exposure > 0).float().mean()))
+        if arm in COMPARISON_ARMS:
+            row.update(comparison_transform_metrics(model, backbone, probe_episodes[0], arm))
         pilot.csv_append(folder / "validation.csv", row)
         pilot.atomic_save(folder / "checkpoints" / f"step_{step:04d}.pt", dict(model=pilot.state_cpu(model), step=step,
             fingerprint=manifest["fingerprint"]))
@@ -406,9 +496,19 @@ def fit_arm(args, backbone, initial, manifest, entry, arm):
         optimizer.step()
         fitting_row_lookup = {int(row_id): position for position, row_id in enumerate(entry["fitting"]["row_ids"])}
         exposure[torch.tensor([fitting_row_lookup[int(row_id)] for row_id in episode["query_indices"]])] += 1
-        pilot.csv_append(folder / "training.csv", dict(step=step, fitting_nll=float(loss),
+        training_metrics = dict(step=step, fitting_nll=float(loss),
             preclip_gradient_norm=gradient_norm, clipped=gradient_norm > 1.,
-            context_rows=episode["n_context"], query_rows=episode["n_query"], seconds=time.perf_counter() - started))
+            context_rows=episode["n_context"], query_rows=episode["n_query"], seconds=time.perf_counter() - started)
+        if arm in COMPARISON_ARMS:
+            # Component norms reveal whether learning reaches the new cross
+            # factors or spline, rather than only the common affine parameters.
+            affine_gradient = model.raw_outputs["affine_head"].grad
+            other_gradients = [parameter.grad for name, parameter in model.raw_outputs.items()
+                               if name != "affine_head" and parameter.grad is not None]
+            training_metrics.update(learning_rate=optimizer.param_groups[0]["lr"],
+                affine_gradient_norm=float(affine_gradient.norm()),
+                non_affine_gradient_norm=float(torch.stack([gradient.square().sum() for gradient in other_gradients]).sum().sqrt()))
+        pilot.csv_append(folder / "training.csv", training_metrics)
         if step == 1 or step % args.evaluate_every == 0 or step == stop_step:
             evaluate()
     if step < args.steps:
@@ -455,12 +555,18 @@ def report(args, backbone, initial, manifest):
                     raise ValueError("selected/final map changed")
     rows = []
     source_results = None
-    if getattr(args, "transformation", "full") == "restricted":
+    restricted_results = None
+    if reuses_source(args):
         # Historical test scores are used only after every new map has been locked.
         source_report = previous.read(args.source_dir / "complete.json")
         source_results = {record["task_id"]: record for record in source_report["results"]}
         if set(source_results) != {record["task_id"] for record in manifest["accepted"]}:
             raise ValueError("source report task coverage differs")
+        if getattr(args, "transformation", "full") == "comparison":
+            restricted_report = previous.read(args.restricted_reference_dir / "complete.json")
+            restricted_results = {record["task_id"]: record for record in restricted_report["results"]}
+            if set(restricted_results) != set(source_results):
+                raise ValueError("restricted report task coverage differs")
     for record in manifest["accepted"]:
         folder = task_folder(args, record["task_id"])
         result_path = folder / "test_scores.json"
@@ -481,8 +587,15 @@ def report(args, backbone, initial, manifest):
                     raise ValueError("ordinary16 baseline differs from the reused full-map experiment")
                 for choice in ("selected", "final"):
                     scores[f"full_resampled_{choice}"] = source_scores[f"resampled_{choice}"]
+                if restricted_results is not None:
+                    restricted_scores = restricted_results[record["task_id"]]
+                    if (scores["ordinary16"]["rows"] != restricted_scores["ordinary16"]["rows"] or
+                            not math.isclose(scores["ordinary16"]["nll"], restricted_scores["ordinary16"]["nll"], rel_tol=1e-5, abs_tol=1e-6)):
+                        raise ValueError("ordinary16 differs from the reused restricted experiment")
+                    for choice in ("selected", "final"):
+                        scores[f"restricted_constant_{choice}"] = restricted_scores[f"resampled_{choice}"]
             for arm in experiment_arms(args):
-                model = direct_model(args, initial, entry, next(backbone.parameters()).device)
+                model = direct_model(args, initial, entry, next(backbone.parameters()).device, arm=arm)
                 for choice in ("selected", "final"):
                     state = torch.load(folder / arm / f"{choice}.pt", map_location="cpu", weights_only=True)
                     model.load_state_dict(state["model"])
@@ -496,16 +609,27 @@ def report(args, backbone, initial, manifest):
     if source_results is None:
         summaries.update({f"resampled_vs_fixed_{choice}": comparison([row[f"resampled_{choice}"]["nll"] for row in rows],
             [row[f"fixed_{choice}"]["nll"] for row in rows]) for choice in ("selected", "final")})
-    else:
+    elif restricted_results is None:
         summaries.update({f"restricted_vs_full_resampled_{choice}": comparison([row[f"resampled_{choice}"]["nll"] for row in rows],
             [row[f"full_resampled_{choice}"]["nll"] for row in rows]) for choice in ("selected", "final")})
+    else:
+        for choice in ("selected", "final"):
+            summaries[f"spline_lower_vs_original_lr_{choice}"] = comparison(
+                [row[f"spline_low_lr_{choice}"]["nll"] for row in rows],
+                [row[f"restricted_constant_{choice}"]["nll"] for row in rows])
+            summaries[f"cross_vs_spline_same_lr_{choice}"] = comparison(
+                [row[f"cross_low_lr_{choice}"]["nll"] for row in rows],
+                [row[f"spline_low_lr_{choice}"]["nll"] for row in rows])
     pilot.json_write(args.output_dir / "complete.json", dict(fingerprint=manifest["fingerprint"],
         datasets=len(rows), results=rows, comparisons=summaries, exclusions=manifest["excluded"],
         qualification="One seed, one official outer fold, capped fitting pool, full test; per-dataset adaptation diagnostic, not zero-shot transfer or official leaderboard replication."))
 
 
 def run(args):
-    if getattr(args, "transformation", "full") == "restricted" and not (args.output_dir / "manifest.json").exists():
+    requested_arm = getattr(args, "arm", None)
+    if requested_arm is not None and requested_arm not in experiment_arms(args):
+        raise ValueError("requested condition is outside this experiment")
+    if reuses_source(args) and not (args.output_dir / "manifest.json").exists():
         prepare_restricted(args)
     manifest = checked_manifest(args)
     device = torch.device(args.device)
@@ -521,17 +645,28 @@ def run(args):
     for record in manifest["accepted"]:
         entry = torch.load(bank_folder(args, record["task_id"]) / "fit_validation.pt", map_location="cpu", weights_only=True)
         for arm in experiment_arms(args):
+            if requested_arm is not None and arm != requested_arm:
+                continue
             fit_arm(args, backbone, initial, manifest, entry, arm)
     if args.max_steps is None or args.max_steps >= args.steps:
-        report(args, backbone, initial, manifest)
+        # Serial array tasks fit one condition each. Only the last completed
+        # condition can open test banks, after all new maps have been locked.
+        all_fits_ready = all((task_folder(args, record["task_id"]) / arm / "fit_complete.json").exists()
+                             for record in manifest["accepted"] for arm in experiment_arms(args))
+        if all_fits_ready:
+            report(args, backbone, initial, manifest)
+        else:
+            print("Condition complete; test scoring waits for the remaining condition's map locks", flush=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("prepare", "run"))
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--transformation", choices=("full", "restricted"), default="full")
+    parser.add_argument("--transformation", choices=("full", "restricted", "comparison"), default="full")
     parser.add_argument("--source-dir", type=Path)
+    parser.add_argument("--restricted-reference-dir", type=Path)
+    parser.add_argument("--arm", choices=COMPARISON_ARMS)
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--steps", type=int, default=250)
