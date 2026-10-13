@@ -55,9 +55,10 @@ class DirectResidualPreprocessor(nn.Module):
 
     apply_native = ResidualPreprocessor.apply_native
 
-    def __init__(self, initial, numerical_context, context_labels, context_missing):
+    def __init__(self, initial, numerical_context, context_labels, context_missing, *, restricted=False):
         super().__init__()
         self.conditioning, self.eps, self.rank = "direct", initial.eps, initial.rank
+        self.restricted = restricted
         for buffer_name in ("knots", "identity_gaps", "native_identity_controls"):
             self.register_buffer(buffer_name, getattr(initial, buffer_name).detach().clone())
         # Capture raw outputs once. There is no trainable encoder or shared head here.
@@ -68,6 +69,7 @@ class DirectResidualPreprocessor(nn.Module):
             self.raw_outputs = nn.ParameterDict({
                 head_name: nn.Parameter(head(slot_tokens).detach().clone())
                 for head_name, head in initial.named_children() if head_name.endswith("_head")
+                and (not restricted or head_name in ("affine_head", "spline_head", "spline_gate_head"))
             })
 
     def generate(self, numerical_context, context_labels, context_missing=None, *, numerical_column_positions):
@@ -87,22 +89,28 @@ class DirectResidualPreprocessor(nn.Module):
         spline_controls = torch.cat((torch.full_like(spline_gaps[..., :1], -1.),
                                      -1. + spline_gaps.cumsum(-1)), dim=-1)
         spline_strength = raw_outputs["spline_gate_head"].sigmoid().squeeze(-1)
-        neural_first = raw_outputs["neural_first_head"]
-        neural_last = raw_outputs["neural_last_head"]
-        neural_strength = raw_outputs["neural_gate_head"].sigmoid().squeeze(-1)
+        # Restricted fitting contains no neural/mixing parameters or computations.
+        neural_first_weights = neural_first_biases = neural_last_weights = neural_last_biases = None
+        neural_strength = numerical_mixing = None
+        if not self.restricted:
+            neural_first_outputs = raw_outputs["neural_first_head"]
+            neural_last_outputs = raw_outputs["neural_last_head"]
+            neural_first_weights, neural_first_biases = neural_first_outputs[..., :8], neural_first_outputs[..., 8:]
+            neural_last_weights, neural_last_biases = neural_last_outputs[..., :8], neural_last_outputs[..., 8]
+            neural_strength = raw_outputs["neural_gate_head"].sigmoid().squeeze(-1)
 
-        # Use the same rank and Frobenius bound as the generated mixing matrix.
-        effective_rank = min(self.rank, numerical_context.shape[-1])
-        mixing_left = raw_outputs["mix_left_head"][..., :effective_rank]
-        mixing_right = raw_outputs["mix_right_head"][..., :effective_rank]
-        raw_mixing = mixing_left @ mixing_right.transpose(-1, -2) / effective_rank
-        bounded_mixing = .1 * raw_mixing / raw_mixing.norm(dim=(-2, -1), keepdim=True).clamp_min(self.eps)
-        mixing_strength = raw_outputs["mix_gate_head"].mean(dim=-2).tanh()[..., None]
+            # Use the same rank and Frobenius bound as the generated mixing matrix.
+            effective_rank = min(self.rank, numerical_context.shape[-1])
+            mixing_left = raw_outputs["mix_left_head"][..., :effective_rank]
+            mixing_right = raw_outputs["mix_right_head"][..., :effective_rank]
+            raw_mixing = mixing_left @ mixing_right.transpose(-1, -2) / effective_rank
+            bounded_mixing = .1 * raw_mixing / raw_mixing.norm(dim=(-2, -1), keepdim=True).clamp_min(self.eps)
+            mixing_strength = raw_outputs["mix_gate_head"].mean(dim=-2).tanh()[..., None]
+            numerical_mixing = mixing_strength * bounded_mixing
         with torch.no_grad():
             statistics = summarize_context(numerical_context, context_missing, context_labels, eps=self.eps)
         return JointParameters(
             statistics.location, statistics.scale, column_shifts, column_log_scales,
-            spline_controls, spline_strength, neural_first[..., :8], neural_first[..., 8:],
-            neural_last[..., :8], neural_last[..., 8], neural_strength,
-            mixing_strength * bounded_mixing,
+            spline_controls, spline_strength, neural_first_weights, neural_first_biases,
+            neural_last_weights, neural_last_biases, neural_strength, numerical_mixing,
         )

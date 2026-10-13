@@ -24,6 +24,12 @@ TASK_IDS = (363612, 363613, 363614, 363615, 363616, 363618, 363619, 363620,
     363691, 363693, 363694, 363696, 363697, 363698, 363699, 363700, 363702,
     363704, 363705, 363706, 363707, 363708, 363711, 363712)
 CHECKPOINT_HASH = "bdc7dbd5e4ff21f8f0456fcf90c6b7cdf72dbea960f2d05b19bec19f9b3d4ed0"
+SOURCE_FINGERPRINT = "60e0745f4221d102fc84e563b99f8cb5b2866afd446a1536a7686edf402ae04f"
+SOURCE_REPORT_HASH = "49f293b701f631aa55e5bbdb56a05863422dc400db140528f76cf664dff304db"
+
+
+def experiment_arms(args):
+    return ("resampled",) if getattr(args, "transformation", "full") == "restricted" else ARMS
 
 
 def settings(args):
@@ -44,7 +50,11 @@ def settings(args):
     # The direct map class lives separately from the original residual generator.
     code_hashes["src/tabicl/_hyperspline/statistics_preprocessing.py"] = residual.objective.canonical_hash(
         repository / "src/tabicl/_hyperspline/statistics_preprocessing.py")
-    return dict(version=1, suite_id=457, task_ids=list(TASK_IDS), arms=list(ARMS), model_seed=0,
+    transformation = getattr(args, "transformation", "full")
+    source_dir = getattr(args, "source_dir", None)
+    if transformation not in ("full", "restricted") or ((transformation == "restricted") != (source_dir is not None)):
+        raise ValueError("restricted fitting requires --source-dir; full fitting must prepare its own bank")
+    specification = dict(version=1, suite_id=457, task_ids=list(TASK_IDS), arms=list(experiment_arms(args)), model_seed=0,
         split_seed=20261011, outer_split=dict(repeat=0, fold=0, sample=0),
         outer_train_rows=args.outer_train_rows, fitting_fraction=.8, training_context_fraction=.75,
         steps=args.steps, evaluate_every=args.evaluate_every, lr=args.lr, weight_decay=.0001,
@@ -56,6 +66,12 @@ def settings(args):
         preprocessing="raw encoding/imputation fitted on fitting pool only; native transforms on episode context",
         test_use="full official test partition, report only after both arms' selections locked",
         code_hashes=code_hashes, expected_revision=args.expected_revision)
+    if transformation == "restricted":
+        specification.update(version=2, source_dir=source_dir.as_posix(),
+            source_manifest_fingerprint=SOURCE_FINGERPRINT, source_report_sha256=SOURCE_REPORT_HASH,
+            transformation="direct affine and monotone K20 spline only; neural/mixing parameters absent, two slots",
+            test_use="full official test after all 33 restricted maps lock; completed full maps are read-only references")
+    return specification
 
 
 def split_positions(labels, context_rows, seed, *, reserve_per_class=1):
@@ -161,7 +177,69 @@ def task_folder(args, task_id):
     return args.output_dir / "tasks" / str(task_id)
 
 
+def bank_folder(args, task_id):
+    # The restriction experiment reads the original encoded banks without copying or rebuilding them.
+    bank_root = args.source_dir if getattr(args, "transformation", "full") == "restricted" else args.output_dir
+    return bank_root / "tasks" / str(task_id)
+
+
+def checked_source(args):
+    source_manifest = previous.read(args.source_dir / "manifest.json")
+    source_content = {name: value for name, value in source_manifest.items() if name != "fingerprint"}
+    if previous.digest(source_content) != SOURCE_FINGERPRINT or source_manifest["fingerprint"] != SOURCE_FINGERPRINT:
+        raise ValueError("source benchmark manifest changed")
+    if pilot.hash_file(args.source_dir / "complete.json") != SOURCE_REPORT_HASH:
+        raise ValueError("source benchmark report changed")
+    current_settings = settings(args)
+    # These fields describe the deliberate intervention or its revision, rather than the paired protocol.
+    changed_fields = {"version", "arms", "transformation", "test_use", "code_hashes", "expected_revision"}
+    for setting_name, source_value in source_manifest["settings"].items():
+        if setting_name not in changed_fields and current_settings[setting_name] != source_value:
+            raise ValueError(f"restricted protocol differs from source: {setting_name}")
+    if args.output_dir.resolve() == args.source_dir.resolve():
+        raise ValueError("restricted outputs must use a separate result directory")
+    # Validate the reused bank bytes and locked control maps; never deserialize test data here.
+    for record in source_manifest["accepted"]:
+        source_folder = bank_folder(args, record["task_id"])
+        for filename, hash_key in (("fit_validation.pt", "fitting_sha256"), ("test.pt", "test_sha256")):
+            if pilot.hash_file(source_folder / filename) != record[hash_key]:
+                raise ValueError(f"source task {record['task_id']} {filename} changed")
+        completion = previous.read(source_folder / "resampled" / "fit_complete.json")
+        if completion["fingerprint"] != SOURCE_FINGERPRINT or completion["steps"] != args.steps:
+            raise ValueError("source full-map fit incomplete or changed")
+        for choice in ("selected", "final"):
+            if pilot.hash_file(source_folder / "resampled" / f"{choice}.pt") != completion[f"{choice}_sha256"]:
+                raise ValueError("source full-map lock changed")
+    return source_manifest
+
+
+def prepare_restricted(args):
+    specification = settings(args)
+    residual.diversity.verify_revision(specification)
+    source_manifest = checked_source(args)
+    manifest = dict(settings=specification, accepted=source_manifest["accepted"], excluded=source_manifest["excluded"])
+    manifest["fingerprint"] = previous.digest(manifest)
+    manifest_path = args.output_dir / "manifest.json"
+    if manifest_path.exists() and previous.read(manifest_path) != manifest:
+        raise ValueError("restricted preparation changed")
+    pilot.json_write(args.output_dir / "intent.json", specification)
+    pilot.json_write(manifest_path, manifest)
+    print(f"Reused {len(manifest['accepted'])} frozen source banks; only restricted resampled fits will run", flush=True)
+
+
+def direct_model(args, initial, entry, device):
+    episode = prediction_episode(entry, entry["validation"])
+    if getattr(args, "transformation", "full") != "restricted":
+        return diagnostic.direct_model(initial, episode, device)
+    numerical_mask = episode["numerical_mask"]
+    return diagnostic.DirectResidualPreprocessor(initial,
+        episode["x_context"][..., numerical_mask].to(device), episode["y_context"].to(device),
+        episode["context_missing"][None].to(device), restricted=True).to(device)
+
+
 def prepare(args):
+    if getattr(args, "transformation", "full") == "restricted":
+        return prepare_restricted(args)
     specification = settings(args)
     residual.diversity.verify_revision(specification)
     intent_path = args.output_dir / "intent.json"
@@ -217,8 +295,12 @@ def checked_manifest(args):
     if manifest["settings"] != settings(args):
         raise ValueError("experiment settings/code changed")
     residual.diversity.verify_revision(manifest["settings"])
+    if getattr(args, "transformation", "full") == "restricted":
+        source_manifest = checked_source(args)
+        if manifest["accepted"] != source_manifest["accepted"] or manifest["excluded"] != source_manifest["excluded"]:
+            raise ValueError("restricted task membership differs from source")
     for record in manifest["accepted"]:
-        folder = task_folder(args, record["task_id"])
+        folder = bank_folder(args, record["task_id"])
         for filename, hash_key in (("fit_validation.pt", "fitting_sha256"), ("test.pt", "test_sha256")):
             if pilot.hash_file(folder / filename) != record[hash_key]:
                 raise ValueError(f"task {record['task_id']} {filename} changed")
@@ -256,7 +338,7 @@ def fit_arm(args, backbone, initial, manifest, entry, arm):
                 raise ValueError("locked map changed")
         return completion
     device = next(backbone.parameters()).device
-    model = diagnostic.direct_model(initial, prediction_episode(entry, entry["validation"]), device)
+    model = direct_model(args, initial, entry, device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=.0001)
     state_path = folder / "state.pt"
     probe_episodes = [training_episode(entry, "resampled", 0, probe_number=number) for number in range(3)]
@@ -337,6 +419,7 @@ def fit_arm(args, backbone, initial, manifest, entry, arm):
         pilot.atomic_save(folder / f"{choice}.pt", dict(model=parameters, step=choice_step,
             fingerprint=manifest["fingerprint"]))
     completion = dict(fingerprint=manifest["fingerprint"], steps=step, selected_step=selected_step,
+        trainable_parameters=sum(parameter.numel() for parameter in model.parameters()),
         selected_validation_nll=selected_score, ordinary16_validation_nll=baseline_validation,
         selected_sha256=pilot.hash_file(folder / "selected.pt"), final_sha256=pilot.hash_file(folder / "final.pt"),
         test_labels_used_for_optimization=False, test_labels_used_for_selection=False)
@@ -362,7 +445,7 @@ def comparison(candidate, baseline):
 def report(args, backbone, initial, manifest):
     # Verify every fit and map lock before opening any test bank.
     for record in manifest["accepted"]:
-        for arm in ARMS:
+        for arm in experiment_arms(args):
             folder = task_folder(args, record["task_id"]) / arm
             completion = previous.read(folder / "fit_complete.json")
             if completion["fingerprint"] != manifest["fingerprint"] or completion["steps"] != args.steps:
@@ -371,6 +454,13 @@ def report(args, backbone, initial, manifest):
                 if pilot.hash_file(folder / f"{choice}.pt") != completion[f"{choice}_sha256"]:
                     raise ValueError("selected/final map changed")
     rows = []
+    source_results = None
+    if getattr(args, "transformation", "full") == "restricted":
+        # Historical test scores are used only after every new map has been locked.
+        source_report = previous.read(args.source_dir / "complete.json")
+        source_results = {record["task_id"]: record for record in source_report["results"]}
+        if set(source_results) != {record["task_id"] for record in manifest["accepted"]}:
+            raise ValueError("source report task coverage differs")
     for record in manifest["accepted"]:
         folder = task_folder(args, record["task_id"])
         result_path = folder / "test_scores.json"
@@ -379,12 +469,20 @@ def report(args, backbone, initial, manifest):
             if scores["fingerprint"] != manifest["fingerprint"]:
                 raise ValueError("test report fingerprint changed")
         else:
-            entry = torch.load(folder / "fit_validation.pt", map_location="cpu", weights_only=True)
-            test = torch.load(folder / "test.pt", map_location="cpu", weights_only=True)
+            data_folder = bank_folder(args, record["task_id"])
+            entry = torch.load(data_folder / "fit_validation.pt", map_location="cpu", weights_only=True)
+            test = torch.load(data_folder / "test.pt", map_location="cpu", weights_only=True)
             scores = dict(task_id=record["task_id"], family=record["family"], fingerprint=manifest["fingerprint"],
                 ordinary16=score_partition(backbone, None, entry, test, args.query_chunk_rows))
-            for arm in ARMS:
-                model = diagnostic.direct_model(initial, prediction_episode(entry, entry["validation"]), next(backbone.parameters()).device)
+            if source_results is not None:
+                source_scores = source_results[record["task_id"]]
+                if (scores["ordinary16"]["rows"] != source_scores["ordinary16"]["rows"] or
+                        not math.isclose(scores["ordinary16"]["nll"], source_scores["ordinary16"]["nll"], rel_tol=1e-5, abs_tol=1e-6)):
+                    raise ValueError("ordinary16 baseline differs from the reused full-map experiment")
+                for choice in ("selected", "final"):
+                    scores[f"full_resampled_{choice}"] = source_scores[f"resampled_{choice}"]
+            for arm in experiment_arms(args):
+                model = direct_model(args, initial, entry, next(backbone.parameters()).device)
                 for choice in ("selected", "final"):
                     state = torch.load(folder / arm / f"{choice}.pt", map_location="cpu", weights_only=True)
                     model.load_state_dict(state["model"])
@@ -394,15 +492,21 @@ def report(args, backbone, initial, manifest):
         print(f"Test complete: {record['family']} ({record['official_test_rows']} rows)", flush=True)
     baseline = [row["ordinary16"]["nll"] for row in rows]
     summaries = {f"{arm}_{choice}_vs_ordinary16": comparison([row[f"{arm}_{choice}"]["nll"] for row in rows], baseline)
-                 for arm in ARMS for choice in ("selected", "final")}
-    summaries.update({f"resampled_vs_fixed_{choice}": comparison([row[f"resampled_{choice}"]["nll"] for row in rows],
-        [row[f"fixed_{choice}"]["nll"] for row in rows]) for choice in ("selected", "final")})
+                 for arm in experiment_arms(args) for choice in ("selected", "final")}
+    if source_results is None:
+        summaries.update({f"resampled_vs_fixed_{choice}": comparison([row[f"resampled_{choice}"]["nll"] for row in rows],
+            [row[f"fixed_{choice}"]["nll"] for row in rows]) for choice in ("selected", "final")})
+    else:
+        summaries.update({f"restricted_vs_full_resampled_{choice}": comparison([row[f"resampled_{choice}"]["nll"] for row in rows],
+            [row[f"full_resampled_{choice}"]["nll"] for row in rows]) for choice in ("selected", "final")})
     pilot.json_write(args.output_dir / "complete.json", dict(fingerprint=manifest["fingerprint"],
         datasets=len(rows), results=rows, comparisons=summaries, exclusions=manifest["excluded"],
         qualification="One seed, one official outer fold, capped fitting pool, full test; per-dataset adaptation diagnostic, not zero-shot transfer or official leaderboard replication."))
 
 
 def run(args):
+    if getattr(args, "transformation", "full") == "restricted" and not (args.output_dir / "manifest.json").exists():
+        prepare_restricted(args)
     manifest = checked_manifest(args)
     device = torch.device(args.device)
     backbone, _, checkpoint_hash = pilot.load_frozen(args, device)
@@ -415,8 +519,8 @@ def run(args):
         print("Benchmark already complete", flush=True)
         return
     for record in manifest["accepted"]:
-        entry = torch.load(task_folder(args, record["task_id"]) / "fit_validation.pt", map_location="cpu", weights_only=True)
-        for arm in ARMS:
+        entry = torch.load(bank_folder(args, record["task_id"]) / "fit_validation.pt", map_location="cpu", weights_only=True)
+        for arm in experiment_arms(args):
             fit_arm(args, backbone, initial, manifest, entry, arm)
     if args.max_steps is None or args.max_steps >= args.steps:
         report(args, backbone, initial, manifest)
@@ -426,6 +530,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("prepare", "run"))
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--transformation", choices=("full", "restricted"), default="full")
+    parser.add_argument("--source-dir", type=Path)
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--steps", type=int, default=250)

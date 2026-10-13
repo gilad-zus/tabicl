@@ -126,8 +126,11 @@ class ResidualPreprocessor(JointPreprocessor):
         identity = self.native_identity_controls.expand_as(p.spline_controls[:, slot])
         anchor = evaluate_bspline(u, identity, self.knots, 3)
         delta = delta + p.spline_gate[:, slot, None] * 4. * (spline - anchor)
-        hidden = torch.tanh(a[..., None] * p.neural_first_weight[:, slot, None] + p.neural_first_bias[:, slot, None])
-        residual = (hidden * p.neural_last_weight[:, slot, None]).sum(-1) + p.neural_last_bias[:, slot, None]
-        delta = delta + p.neural_gate[:, slot, None] * torch.tanh(residual)
-        delta = delta + (native + delta) @ p.mixing[:, slot]
+        # Restricted direct maps omit these two branches entirely.
+        if p.neural_first_weight is not None:
+            neural_activations = torch.tanh(a[..., None] * p.neural_first_weight[:, slot, None] + p.neural_first_bias[:, slot, None])
+            numerical_corrections = (neural_activations * p.neural_last_weight[:, slot, None]).sum(-1) + p.neural_last_bias[:, slot, None]
+            delta = delta + p.neural_gate[:, slot, None] * torch.tanh(numerical_corrections)
+        if p.mixing is not None:
+            delta = delta + (native + delta) @ p.mixing[:, slot]
         return native + delta.masked_fill(missing, 0)
