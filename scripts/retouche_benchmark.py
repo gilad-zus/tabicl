@@ -28,6 +28,8 @@ from tabicl import TabICLClassifier
 from tabicl._experiments import direct_spline_openml as native
 from tabicl._experiments.direct_spline_protocol import FoldPreprocessor, choose_identity_guard, deployment_error
 from tabicl._experiments.retouche import RetoucheAdapter, coslog4, epoch_episodes
+from scripts.matched_preprocessing_reference import (COMMON_TASKS, checked_reference,
+    check_task_reference, check_fold_reference, reference_folder, reference_predictions)
 
 
 # Frozen suite-457 classification membership, including categorical-only tasks.
@@ -36,6 +38,13 @@ CLASSIFICATION_TASKS = (363613,363614,363616,363618,363619,363620,363621,363623,
     363676,363677,363679,363681,363682,363683,363684,363685,363689,363691,
     363694,363696,363699,363700,363702,363704,363706,363707,363711,363712)
 CLASSIFIER_SHA256 = "bdc7dbd5e4ff21f8f0456fcf90c6b7cdf72dbea960f2d05b19bec19f9b3d4ed0"
+
+
+def build_adapter(args, feature_count):
+    if getattr(args, "adapter", "cross") == "cross":
+        return RetoucheAdapter(feature_count)
+    from tabicl._experiments.matched_spline import make_adapter
+    return make_adapter(feature_count, "spline")
 
 
 def write_json(path, value):
@@ -117,9 +126,13 @@ def protocol(args):
     dependency_paths += [path for directory in ("_model","_sklearn")
         for path in (repository/"src/tabicl"/directory).glob("*.py")
         if path.name not in ("quantile_dist.py", "regressor.py")]
+    dependency_paths.append(repository/"scripts/matched_preprocessing_reference.py")
+    if getattr(args, "adapter", "cross") == "spline":
+        dependency_paths += [repository/"src/tabicl/_experiments/matched_spline.py",
+                             repository/"src/tabicl/_hyperspline/bspline.py"]
     code_hashes = {path.relative_to(repository).as_posix():hashlib.sha256(path.read_bytes().replace(b"\r\n",b"\n")).hexdigest()
                    for path in dependency_paths}
-    return dict(version=1, revision=revision, code_hashes=code_hashes,
+    specification = dict(version=1, revision=revision, code_hashes=code_hashes,
         task_ids=list(args.task_ids or CLASSIFICATION_TASKS), outer_split=[0,0,0], seed=0, folds=8,
         epochs=args.epochs, patience=args.patience, context_rows=args.context_rows,
         query_rows=args.query_rows, prediction_context_rows=args.prediction_context_rows,
@@ -133,6 +146,17 @@ def protocol(args):
             selection="minimum deployment-metric validation error; 0.5% guard against native raw-input fold baseline",
             feature_guard="fixed standardized input clamp [-100,100] after fold-local scaling",
             scope="38 classification tasks; regression deferred; no HPO"))
+    if getattr(args, "adapter", "cross") == "spline":
+        specification.update(version=2, adapter="spline", adapter_details=dict(
+            control_points=20, degree=3, scope="all standardized numerical and ordinal categorical coordinates",
+            affine="tanh-bounded shift and log scale", spline="monotone normalized exp(2*tanh) gaps",
+            gate="direct [0,1], initial 0.1", identity="exact subtractive anchor",
+            slots=1, projection="same initialization as reference cross, learned by both arms"))
+        specification["reconstruction_choices"]["scope"] = "33 common classification tasks, one seed, no HPO"
+        specification["cross_reference"] = checked_reference(args, specification)
+        if specification["cross_reference"] is None:
+            raise ValueError("Matched spline experiment requires --reference-dir")
+    return specification
 
 
 def checked_manifest(args):
@@ -211,13 +235,15 @@ def fit_fold(args, task, fitting_positions, validation_positions, fold_number, b
     validation_features = np.clip(preprocessor.transform(validation_frame),-100,100)
     device = next(backbone.parameters()).device
     torch.manual_seed(native._seed(0,task.task_id,fold_number))
-    adapter = RetoucheAdapter(fitting_features.shape[1]).to(device)
+    adapter = build_adapter(args, fitting_features.shape[1]).to(device)
     initial_adapter = copy.deepcopy(adapter).eval()
     optimizer = adapter.optimizer()
     support_positions = native.sample_prediction_context(fitting_labels,problem_type=task.problem_type,
         max_context_rows=args.prediction_context_rows or len(fitting_labels),
         rng=np.random.default_rng(native._seed(0,task.task_id,fold_number,42)))
     context_features, context_labels = fitting_features[support_positions], fitting_labels[support_positions]
+    check_fold_reference(args, task.task_id, fold_number, fitting_positions,
+                         validation_positions, support_positions, preprocessor)
     probe_context_positions,probe_query_positions=next(epoch_episodes(fitting_labels,
         context_rows=args.context_rows,query_rows=args.query_rows,seed=native._seed(0,task.task_id,fold_number,777)))
     epoch_number, batch_number, updates, stale_epochs = 0, 0, 0, 0
@@ -243,6 +269,11 @@ def fit_fold(args, task, fitting_positions, validation_positions, fold_number, b
         truncate_csv(folder/"training.csv","update",0)
         truncate_csv(folder/"validation.csv","epoch",0)
     baseline_path = folder/"baseline_validation.npz"
+    source_fold = reference_folder(args, task.task_id, fold_number)
+    if source_fold is not None and not baseline_path.exists():
+        with np.load(source_fold/"baseline_validation.npz") as source_baseline:
+            np.testing.assert_array_equal(source_baseline["labels"], validation_labels)
+            save_predictions(baseline_path, **dict(source_baseline))
     if baseline_path.exists():
         baseline_validation = np.load(baseline_path)["probabilities"]
     else:
@@ -277,6 +308,7 @@ def fit_fold(args, task, fitting_positions, validation_positions, fold_number, b
             for parameter_group in optimizer.param_groups:
                 parameter_group["lr"] = (.015 if parameter_group["group_name"] == "gate" else .005)*rate_factor
             optimizer.zero_grad(set_to_none=True)
+            update_started = time.perf_counter()
             loss = forward_loss(backbone,adapter,
                 tensor_features(fitting_features[context_positions],device),tensor_features(fitting_labels[context_positions],device),
                 tensor_features(fitting_features[query_positions],device),tensor_features(fitting_labels[query_positions],device),task.n_classes)
@@ -294,7 +326,11 @@ def fit_fold(args, task, fitting_positions, validation_positions, fold_number, b
                 loss=float(loss.detach()),learning_rate=.005*rate_factor,gate_learning_rate=.015*rate_factor,
                 gradient_norm=float(gradient_norm),gate_mean=float(adapter.gate.detach().mean()),
                 context_rows=len(context_positions),query_rows=len(query_positions),
-                query_coverage=float((query_exposures>0).mean())))
+                query_coverage=float((query_exposures>0).mean()),
+                **(dict(update_seconds=time.perf_counter()-update_started,
+                        episode_sha256=hashlib.sha256(context_positions.astype("<i8").tobytes()
+                            +query_positions.astype("<i8").tobytes()).hexdigest())
+                   if getattr(args,"adapter","cross")=="spline" else {})))
             if updates % 10 == 0:
                 checkpoint_state()
         candidate = predict(backbone,adapter,context_features,context_labels,validation_features,task.n_classes,args.query_chunk_rows)
@@ -361,7 +397,7 @@ def score_task(args, task, splits, backbone, manifest, deadline):
             fitting_features = np.clip(preprocessor.transform(fitting_frame),-100,100)
             test_features = np.clip(preprocessor.transform(task.x_test),-100,100)
             device = next(backbone.parameters()).device
-            adapter = RetoucheAdapter(fitting_features.shape[1]).to(device)
+            adapter = build_adapter(args, fitting_features.shape[1]).to(device)
             selected = torch.load(folder/"selected.pt",map_location="cpu",weights_only=True)
             adapter.load_state_dict(selected["adapter"])
             support_positions = np.array(metadata["support_positions"])
@@ -371,15 +407,26 @@ def score_task(args, task, splits, backbone, manifest, deadline):
             with torch.no_grad():
                 adapter.gate.zero_()
             identity_prediction = predict(backbone,adapter,fitting_features[support_positions],fitting_labels[support_positions],test_features,task.n_classes,args.query_chunk_rows)
-            estimator = native_estimator(args,fitting_frame,fitting_labels)
-            native_prediction = estimator.predict_proba(task.x_test.copy())
-            del estimator
+            reference_fold_predictions = reference_predictions(args, task.task_id, fold_number)
+            if reference_fold_predictions is None:
+                estimator = native_estimator(args,fitting_frame,fitting_labels)
+                native_prediction = estimator.predict_proba(task.x_test.copy())
+                del estimator
+            else:
+                # Replayed identity must agree before the common native control is reused.
+                np.testing.assert_allclose(identity_prediction, reference_fold_predictions["standardized_identity"],
+                                           atol=1e-6, rtol=1e-5)
+                native_prediction = reference_fold_predictions["native_bagged"]
             predictions = dict(native_bagged=native_prediction,standardized_identity=identity_prediction,
                 adapted=adapted_prediction,guarded=adapted_prediction if locks[fold_number]["guard"]["use_adapted"] else native_prediction)
             save_predictions(predictions_path,**predictions)
         for method in all_predictions:
             all_predictions[method].append(predictions[method])
     full_baseline_path = task_folder/"native_full_predictions.npz"
+    source_task = reference_folder(args, task.task_id)
+    if source_task is not None and not full_baseline_path.exists():
+        with np.load(source_task/"native_full_predictions.npz") as source_baseline:
+            save_predictions(full_baseline_path, **dict(source_baseline))
     if full_baseline_path.exists():
         native_full = np.load(full_baseline_path)["probabilities"]
     else:
@@ -389,6 +436,13 @@ def score_task(args, task, splits, backbone, manifest, deadline):
         del estimator
     combined = {method:np.mean(predictions,axis=0) for method,predictions in all_predictions.items()}
     combined["native_full"] = native_full
+    if source_task is not None:
+        # Both arms are locked; only now expose the previous cross test predictions.
+        with np.load(source_task/"predictions.npz") as source_predictions:
+            np.testing.assert_array_equal(source_predictions["labels"], task.y_test)
+            for method in ("native_bagged", "native_full", "standardized_identity"):
+                np.testing.assert_allclose(combined[method], source_predictions[method], atol=1e-6, rtol=1e-5)
+            combined.update(cross_adapted=source_predictions["adapted"], cross_guarded=source_predictions["guarded"])
     save_predictions(task_folder/"predictions.npz",labels=task.y_test,**combined)
     write_json(completion_path,dict(fingerprint=manifest["fingerprint"],task_id=task.task_id,dataset=task.dataset_name,
         problem_type=task.problem_type,folds=len(splits),adapted_folds=sum(lock["guard"]["use_adapted"] for lock in locks),
@@ -403,6 +457,9 @@ def run(args):
     if args.output_dir.exists() and any(args.output_dir.iterdir()) and not args.resume:
         raise ValueError("nonempty output directory requires --resume")
     manifest = checked_manifest(args)
+    if (args.output_dir/"complete.json").exists():
+        print("Experiment already complete; no model load or additional fitting required", flush=True)
+        return
     deadline = time.monotonic()+args.max_runtime_minutes*60
     device = torch.device(args.device)
     backbone,_,_ = native.load_frozen_backbone(problem_type="binary",device=device,
@@ -413,7 +470,7 @@ def run(args):
         preflight_records=[]
         for feature_count in (8,500):
             torch.manual_seed(0)
-            adapter=RetoucheAdapter(feature_count).to(device)
+            adapter=build_adapter(args, feature_count).to(device)
             features=torch.randn(80,feature_count,device=device)
             labels=torch.arange(80,device=device)%2
             loss=forward_loss(backbone,adapter,features[:64],labels[:64],features[64:],labels[64:],2)
@@ -443,6 +500,7 @@ def run(args):
         task_record=dict(task_id=task_id,dataset_id=task.dataset_id,dataset=task.dataset_name,data_sha256=data_hash,
             outer_split_hash=task.outer_split_hash,official_train_rows=len(task.y_train),official_test_rows=len(task.y_test),
             n_classes=task.n_classes,effective_folds=len(splits),fingerprint=manifest["fingerprint"])
+        check_task_reference(args, task_record)
         task_path=task_folder/"task.json"
         if task_path.exists() and json.loads(task_path.read_text())!=task_record:
             raise ValueError("task data or official split changed")
@@ -473,8 +531,14 @@ def main():
     parser.add_argument("--max-runtime-minutes",type=float,default=465)
     parser.add_argument("--expected-revision")
     parser.add_argument("--task-ids",type=int,nargs="+")
+    parser.add_argument("--adapter", choices=("cross", "spline"), default="cross")
+    parser.add_argument("--reference-dir", type=Path)
     parser.add_argument("--resume",action="store_true")
     args=parser.parse_args()
+    if args.reference_dir is not None and args.adapter != "spline":
+        parser.error("--reference-dir requires --adapter spline")
+    if args.reference_dir is not None and args.task_ids is None:
+        args.task_ids = COMMON_TASKS
     try:
         run(args)
     finally:
