@@ -6,7 +6,7 @@ import math
 import torch
 from torch import nn
 
-from .joint_preprocessing import JointParameters
+from .joint_preprocessing import JointParameters, JointPreprocessor
 from .residual_preprocessing import ResidualPreprocessor
 from .statistics import SUMMARY_DIM, summarize_context
 
@@ -48,6 +48,20 @@ class StatisticsResidualPreprocessor(ResidualPreprocessor):
         super().__init__("raw")
         self.encoder = StatisticsContextEncoder(self.hidden_dim)
         self.conditioning = "statistics"
+
+
+class StatisticsSplineResidualPreprocessor(ResidualPreprocessor):
+    """Generate only affine and monotone spline corrections from context summaries."""
+
+    def __init__(self):
+        # Construct the restricted heads directly so no unused neural/mixing weights remain.
+        JointPreprocessor.__init__(self, "restricted")
+        self.encoder = StatisticsContextEncoder(self.hidden_dim)
+        self.conditioning = "statistics"
+        identity_gaps = 2. * self.identity_gaps / self.identity_gaps.sum().clamp_min(self.eps)
+        identity_controls = torch.cat((identity_gaps.new_full((1,), -1.),
+                                       -1. + identity_gaps.cumsum(-1)))
+        self.register_buffer("native_identity_controls", identity_controls)
 
 
 class DirectResidualPreprocessor(nn.Module):
