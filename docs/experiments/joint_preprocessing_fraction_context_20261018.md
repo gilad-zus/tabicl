@@ -1,5 +1,40 @@
 # Full 80/20 row episodes for shared zero-shot preprocessing
 
+## Active capped revision, authorized October18
+
+After the uncapped159618-row check remained in progress, the user explicitly
+requested a practical cap and then specified **20000 context rows**. Job35663641
+was cancelled at18m50s. This cancellation is a resource decision, not evidence
+about learning. The passed12479-row check remains a hardware observation only.
+
+The active recipe first makes the same80/20 row partition, then uses
+min(nominal_context_rows,20000) labelled context rows. When necessary, a seeded
+stratified subset of the nominal80% context preserves class support. ALL of
+the original20% query rows remain; they are not capped at2048. Query chunks
+remain2048 and receive their exact row weights. Larger datasets leave some
+nominal context rows unused on a visit; record that explicitly. Training,
+validation and final evaluation use the same20000 cap and matched native rows.
+
+Reuse all151 locked source entries, cache hashes, memberships and reserved
+training probes from the completed uncapped preparation; no new downloads or
+whole-table fingerprint rebuild. A new manifest/result root keeps protocols
+separate: `results/hyperspline_fraction_context/v2_cap20000_seed20261018`.
+
+Submit ONE eight-hour GPU pipeline job (uriofir,1GPU/4CPU/32G,email on), which
+performs a single maximum-cell-count check at the cap and then immediately
+starts training. The check does not select a model or alter saved weights.
+No separate profiling allocation or manual gate is required. Training begins
+without a full step-zero validation sweep: exact identity's baseline remains
+eligible, with its score supplied by the native results at the first scheduled
+validation. Every256 updates and final still receive full three-partition
+validation. The four-episode update rule, all-query loss and2048-update target
+are unchanged. Resume may span eight-hour allocations; no unbounded chain.
+
+All12 current targeted CPU tests passed, including the cap's unchanged query
+membership, class support, reuse of reservations, full-query gradients and
+mid-episode resume. The original uncapped protocol below is historical;
+this active revision supersedes its resource gate and uncapped-context claims.
+
 Authorized October 18, 2026. One seed-zero shared model. Implement locally,
 validate correctness, and measure actual uncapped GPU resource use before
 committing the full training budget. This replaces the proposed 512-context
@@ -131,3 +166,13 @@ aggregation, raw-cache manifest replay, and interrupted/resumed gradients,
 weights, optimizer, row coverage and evaluation queries. The actual resource
 profile path also passed with a tiny CPU backbone without changing initial
 weights. No remote operation yet.
+
+Launch update October18: revision5870e26 synchronized, all48 code dependencies
+verified. CPU preparation completed and151 entries/row fractions/raw source
+hashes audited locally. Experiment fingerprint
+`ea1185039ddb00a6f2aad0b5b79147802da34a03a8cdc82e13b86f0e91fe130e`.
+Resource profile35663641 RUNNING on dsiuriofir01 at startup, one GPU/four CPUs/
+32G/one hour/email enabled. Loaded the real frozen checkpoint; first uncapped
+profile is NewspaperChurn12479 context/3120 queries. Full training has not
+started; review profile memory/runtime before its first allocation.
+[Launch record](joint_preprocessing_fraction_context_submission_20261018.json).

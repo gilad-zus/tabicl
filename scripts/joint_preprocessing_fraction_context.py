@@ -25,8 +25,8 @@ SOURCE_FINGERPRINT = "f28b919a88dac747f4a4c998edf9ce996cd374bf0c8b307ff01af6fd4e
 CATALOG_FINGERPRINT = "4aae70bd8544a962a8c83448b5b00ea6779632b575a2bb9d027c7d0c781a8405"
 
 
-def split_positions(labels, available_positions, seed):
-    """Partition the complete available pool; no context or query row cap."""
+def split_positions(labels, available_positions, seed, context_row_cap=None):
+    """Keep all20% queries; optionally subsample only the nominal80% context."""
     available_positions = np.asarray(available_positions, dtype=np.int64)
     if len(np.unique(available_positions)) != len(available_positions):
         raise ValueError("available rows must be unique")
@@ -36,16 +36,22 @@ def split_positions(labels, available_positions, seed):
         np.asarray(labels)[available_positions], query_count, random_generator, reserve=1)
     query_positions = available_positions[query_local_positions]
     context_positions = random_generator.permutation(np.setdiff1d(available_positions, query_positions))
+    if context_row_cap is not None and len(context_positions) > context_row_cap:
+        context_local_positions = prior.stratified_positions(
+            np.asarray(labels)[context_positions], context_row_cap, random_generator)
+        context_positions = context_positions[context_local_positions]
     return dict(context=context_positions, query=query_positions)
 
 
-def episode_for(entry, source_cache, *, step=None, episode_position=0, split=0, probe=False):
+def episode_for(entry, source_cache, *, step=None, episode_position=0, split=0, probe=False, context_row_cap=None):
     source = source_cache.get(entry["family"])
     if probe:
         query_positions = entry["probe_query_positions"].numpy()
         random_generator = np.random.default_rng(SEED + split)
         fitting_positions = entry["fitting_positions"].numpy()
         context_count = math.floor(CONTEXT_FRACTION * len(fitting_positions))
+        if context_row_cap is not None:
+            context_count = min(context_count, context_row_cap)
         context_local_positions = prior.stratified_positions(
             np.asarray(source["labels"])[fitting_positions], context_count, random_generator)
         positions = dict(context=fitting_positions[context_local_positions], query=query_positions)
@@ -53,7 +59,7 @@ def episode_for(entry, source_cache, *, step=None, episode_position=0, split=0, 
     else:
         seed = int(np.random.SeedSequence([SEED, step or 0, episode_position, split]).generate_state(1)[0])
         available_positions = entry["fitting_positions"].numpy() if entry["panel"] == "train" else np.arange(len(source["labels"]))
-        positions = split_positions(source["labels"], available_positions, seed)
+        positions = split_positions(source["labels"], available_positions, seed, context_row_cap)
     episode = prior.episode_from_rows(source, positions["context"], positions["query"], seed)
     episode.update(source_seed=seed, split=split)
     return episode
@@ -154,8 +160,12 @@ def specification(args):
     for path in (Path(__file__), Path(prior.__file__), ROOT / "scripts/run_joint_preprocessing_fraction_context.sh",
                  ROOT / "src/tabicl/_hyperspline/statistics_preprocessing.py"):
         settings["code_hashes"][path.relative_to(ROOT).as_posix()] = residual.objective.canonical_hash(path)
+    context_row_cap = getattr(args, "context_row_cap", None)
+    if context_row_cap is not None and context_row_cap < 10:
+        raise ValueError("context cap must retain support for all supported classes")
     settings.update(arms=["fraction"], alpha=None, seed=SEED, context_fraction=.8, query_fraction=.2,
-        context_row_cap=None, query_row_cap=None, query_chunk_rows=args.query_chunk_rows,
+        context_row_cap=context_row_cap, query_row_cap=None, query_chunk_rows=args.query_chunk_rows,
+        reuse_prepared_dir=str(getattr(args, "reuse_prepared_dir", None)),
         initialization="fresh seed0 restricted statistics hypernetwork; exact native16 identity",
         model_parameters=5912, training_precision="FP32; per-view replay; encoder activation recomputation",
         evaluation_precision="same FP32 forward as training; complete context retained in every query chunk",
@@ -166,7 +176,8 @@ def specification(args):
         source_dir=str(args.source_dir), catalog_dir=str(args.catalog_dir),
         evaluation_timing="final and selected only after training locks; no target fitting",
         hypothesis="substantial context and query fractions improve zero-shot preprocessing",
-        runtime_gate="resource profile must pass at actual uncapped representative sizes before training")
+        runtime_gate="one maximum-cell-count capped gradient check inside training job" if context_row_cap else
+            "resource profile must pass at actual uncapped representative sizes before training")
     return settings
 
 
@@ -185,6 +196,8 @@ def prepare(args):
     if (args.output_dir / "manifest.json").exists():
         checked_manifest(args)
         return
+    if getattr(args, "reuse_prepared_dir", None) is not None:
+        return prepare_from_locked(args, settings)
     source_manifest = verified_json(args.source_dir, "sources.pt")
     if source_manifest["fingerprint"] != SOURCE_FINGERPRINT:
         raise ValueError("unexpected original context bank")
@@ -248,6 +261,34 @@ def prepare(args):
     pilot.json_write(args.output_dir / "manifest.json", manifest)
 
 
+def prepare_from_locked(args, settings):
+    """Reuse audited full-table membership/reservations; change only episode context limits."""
+    source_manifest = verified_json(args.reuse_prepared_dir, "sources.pt")
+    if source_manifest["fingerprint"] != "ea1185039ddb00a6f2aad0b5b79147802da34a03a8cdc82e13b86f0e91fe130e":
+        raise ValueError("wrong uncapped preparation to reuse")
+    if source_manifest["source_fingerprint"] != SOURCE_FINGERPRINT or source_manifest["catalog_fingerprint"] != CATALOG_FINGERPRINT:
+        raise ValueError("source membership changed")
+    entries = torch.load(args.reuse_prepared_dir / "sources.pt", weights_only=True, map_location="cpu")["entries"]
+    if source_manifest["counts"] != EXPECTED_COUNTS:
+        raise ValueError("source counts changed")
+    for entry in entries:
+        entry["nominal_context_rows"] = entry["context_rows"]
+        entry["context_rows"] = min(entry["context_rows"], args.context_row_cap)
+        entry["unused_context_rows"] = entry["nominal_context_rows"] - entry["context_rows"]
+    pilot.atomic_save(args.output_dir / "sources.pt", dict(entries=entries))
+    pilot.atomic_save(args.output_dir / "initial.pt", dict(model=pilot.state_cpu(prior.new_model())))
+    pilot.json_write(args.output_dir / "allocation.json", dict(counts=source_manifest["counts"], entries=[
+        {name: value for name, value in entry.items() if not isinstance(value, torch.Tensor)} for entry in entries]))
+    manifest = dict(settings=settings, counts=source_manifest["counts"], source_fingerprint=SOURCE_FINGERPRINT,
+        catalog_fingerprint=CATALOG_FINGERPRINT, reused_preparation_fingerprint=source_manifest["fingerprint"],
+        backbone=source_manifest["backbone"], previous_checkpoints=source_manifest["previous_checkpoints"],
+        files={filename: pilot.hash_file(args.output_dir / filename) for filename in ("sources.pt", "initial.pt", "allocation.json")})
+    manifest["fingerprint"] = previous.digest(manifest)
+    pilot.json_write(args.output_dir / "manifest.json", manifest)
+    print(f"Prepared capped experiment: counts={manifest['counts']}, context_cap={args.context_row_cap}, "
+          f"all20% queries retained, fingerprint={manifest['fingerprint']}", flush=True)
+
+
 def checked_manifest(args):
     manifest = previous.read(args.output_dir / "manifest.json")
     if manifest["settings"] != specification(args) or previous.digest({key: value for key, value in manifest.items()
@@ -293,6 +334,8 @@ def profile(args):
     median_training = training_candidates[len(training_candidates) // 2]
     selected = {entry["family"]: entry for entry in (
         median_training, max(candidates, key=lambda entry: entry["context_rows"]), maximum_cells)}
+    if getattr(args, "context_row_cap", None) is not None:
+        selected = {maximum_cells["family"]: maximum_cells}
     reports = []
     for entry in selected.values():
         report_path = args.output_dir / "profile" / f"{entry['family'].replace('/', '_')}.json"
@@ -303,8 +346,8 @@ def profile(args):
             reports.append(saved)
             continue
         started = time.monotonic()
-        episode = episode_for(entry, cache, step=1)
-        print(f"PROFILE START {entry['family']}: context={episode['n_context']} queries={episode['n_query']}; no row caps", flush=True)
+        episode = episode_for(entry, cache, step=1, context_row_cap=getattr(args, "context_row_cap", None))
+        print(f"STARTUP CHECK {entry['family']}: context={episode['n_context']} queries={episode['n_query']}", flush=True)
         prepared = PreparedEpisode(episode)
         preparation_seconds = time.monotonic() - started
         if args.device.startswith("cuda"):
@@ -432,7 +475,7 @@ def validation(args, backbone, model, entries, manifest, step, deadline):
     cache = prior.SourceCache(entries, capacity=1)
     for source_position, entry in enumerate(entry for entry in entries if entry["panel"] == "validation"):
         for split in range(3):
-            episode = episode_for(entry, cache, split=split)
+            episode = episode_for(entry, cache, split=split, context_row_cap=getattr(args, "context_row_cap", None))
             fingerprint = previous.digest(dict(experiment=manifest["fingerprint"], step=step,
                 source=entry["source_group"], split=split, panel="validation"))
             record = prediction_record(args, backbone, dict(candidate=model), episode,
@@ -484,7 +527,7 @@ def train(args):
             log_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
     else:
         state = dict(fingerprint=manifest["fingerprint"], step=0, episode_position=0, query_offset=0,
-            episode_loss_sum=0., update_loss_sum=0., record=0, pending_validation=True,
+            episode_loss_sum=0., update_loss_sum=0., record=0, pending_validation=False,
             best_score=float("inf"), best_step=0, best_model=pilot.state_cpu(model),
             coverage={entry["family"]: {role: torch.zeros(entry["full_rows"], dtype=torch.bool)
                       for role in ("context", "query")} for entry in train_entries})
@@ -501,6 +544,9 @@ def train(args):
             if result is None:
                 save()
                 return False
+            # Exact identity is an eligible checkpoint without delaying training for its full evaluation.
+            if math.isinf(state["best_score"]):
+                state["best_score"] = result["native_mean_nll"]
             if result["mean_nll"] < state["best_score"]:
                 state.update(best_score=result["mean_nll"], best_step=state["step"], best_model=pilot.state_cpu(model))
             state["pending_validation"] = False
@@ -512,7 +558,8 @@ def train(args):
             return False
         scheduled_entries = residual.diversity.scheduled_sources(train_entries, state["step"] + 1)
         entry = scheduled_entries[state["episode_position"]]
-        episode = episode_for(entry, cache, step=state["step"] + 1, episode_position=state["episode_position"])
+        episode = episode_for(entry, cache, step=state["step"] + 1, episode_position=state["episode_position"],
+            context_row_cap=getattr(args, "context_row_cap", None))
         coverage = state["coverage"][entry["family"]]
         coverage["context"][episode["context_indices"]] = True
         prepared = PreparedEpisode(episode)
@@ -608,7 +655,8 @@ def evaluate(args):
     cache = prior.SourceCache(entries, capacity=1)
     for source_position, entry in enumerate(entries):
         for split in range(2):
-            episode = episode_for(entry, cache, split=split, probe=entry["panel"] == "train")
+            episode = episode_for(entry, cache, split=split, probe=entry["panel"] == "train",
+                context_row_cap=getattr(args, "context_row_cap", None))
             fingerprint = previous.digest(dict(experiment=manifest["fingerprint"], checkpoints=completed["checkpoints"],
                 source=entry["source_group"], split=split, stage="final_evaluation"))
             record = prediction_record(args, backbone, models, episode,
@@ -620,7 +668,8 @@ def evaluate(args):
     summaries = {f"{panel}/{method}": aggregate_records([record for record in records if record["panel"] == panel], method)
                  for panel in ("train", "validation", "evaluation") for method in models}
     pilot.json_write(args.output_dir / "complete.json", dict(fingerprint=manifest["fingerprint"],
-        summaries=summaries, records=records, evaluation_context_fraction=.8,
+        summaries=summaries, records=records, nominal_evaluation_context_fraction=.8,
+        context_row_cap=getattr(args, "context_row_cap", None),
         additional_context_fractions_status="50% and100% sweeps not run; actual-size resource measurement first"))
     return True
 
@@ -631,6 +680,8 @@ def parse_args():
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--source-dir", type=Path, required=True)
     parser.add_argument("--catalog-dir", type=Path, required=True)
+    parser.add_argument("--reuse-prepared-dir", type=Path)
+    parser.add_argument("--context-row-cap", type=int, default=20000)
     parser.add_argument("--candidate-manifest", type=Path, default=residual.DEFAULT_CANDIDATES)
     parser.add_argument("--expected-revision")
     parser.add_argument("--checkpoint", type=Path)

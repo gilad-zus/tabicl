@@ -147,7 +147,7 @@ def test_mid_episode_training_resume_matches_uninterrupted(tmp_path, monkeypatch
         fitting_positions=torch.arange(88), probe_query_positions=torch.arange(88, 96))
     manifest = dict(fingerprint="fixture")
     monkeypatch.setattr(runner, "setup", lambda options: (tiny(), runner.prior.new_model(), [entry], manifest))
-    monkeypatch.setattr(runner, "validation", lambda *arguments: dict(mean_nll=1.))
+    monkeypatch.setattr(runner, "validation", lambda *arguments: dict(mean_nll=1., native_mean_nll=1.))
     for root in (tmp_path / "full", tmp_path / "resumed"):
         runner.pilot.json_write(root / "profile/complete.json", dict(fingerprint="fixture", passed=True))
     assert runner.train(args(tmp_path / "full", query_chunk_rows=11))
@@ -239,3 +239,37 @@ def test_resource_profile_uses_full_context_and_preserves_initial_model(tmp_path
     assert {report["context_rows"] for report in result["reports"]} == {70, 102}
     assert all(report["gradient_norm"] > 0 and report["no_optimizer_update"] for report in result["reports"])
     assert_nested_equal(initial, model.state_dict())
+
+
+def test_context_cap_preserves_every_original_query_and_class_support():
+    labels = np.arange(60003) % 7
+    available_positions = np.arange(256, len(labels))
+    uncapped = runner.split_positions(labels, available_positions, 71)
+    capped = runner.split_positions(labels, available_positions, 71, context_row_cap=20000)
+    assert len(capped["context"]) == 20000
+    np.testing.assert_array_equal(capped["query"], uncapped["query"])
+    assert set(capped["context"]) <= set(uncapped["context"])
+    assert not set(capped["context"]) & set(capped["query"])
+    assert set(labels[capped["context"]]) == set(range(7))
+    small = runner.split_positions(labels, np.arange(1000), 71, context_row_cap=20000)
+    assert len(small["context"]) == 800 and len(small["query"]) == 200
+
+
+def test_reuse_prepared_bank_changes_only_context_limit(tmp_path, monkeypatch):
+    options = args(tmp_path / "capped")
+    options.context_row_cap = 20000
+    options.reuse_prepared_dir = tmp_path / "uncapped"
+    entry = dict(family="large", panel="train", full_rows=60000, context_rows=47795,
+        query_rows=11949, fitting_positions=torch.arange(59744), probe_query_positions=torch.arange(59744, 60000))
+    runner.pilot.atomic_save(options.reuse_prepared_dir / "sources.pt", dict(entries=[entry]))
+    source_manifest = dict(fingerprint="ea1185039ddb00a6f2aad0b5b79147802da34a03a8cdc82e13b86f0e91fe130e",
+        source_fingerprint=runner.SOURCE_FINGERPRINT, catalog_fingerprint=runner.CATALOG_FINGERPRINT,
+        counts=dict(train=1), backbone=dict(path="fixture"), previous_checkpoints={})
+    monkeypatch.setattr(runner, "verified_json", lambda *arguments: source_manifest)
+    monkeypatch.setattr(runner, "EXPECTED_COUNTS", dict(train=1))
+    runner.prepare_from_locked(options, dict(context_row_cap=20000))
+    saved = torch.load(options.output_dir / "sources.pt", weights_only=True)["entries"][0]
+    assert saved["context_rows"] == 20000 and saved["query_rows"] == entry["query_rows"]
+    assert saved["nominal_context_rows"] == entry["context_rows"]
+    torch.testing.assert_close(saved["fitting_positions"], entry["fitting_positions"])
+    torch.testing.assert_close(saved["probe_query_positions"], entry["probe_query_positions"])
