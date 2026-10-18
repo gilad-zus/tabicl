@@ -323,7 +323,8 @@ def test_query_budget_requires_one_chunk_and_preserves_small_query_pools(tmp_pat
     torch.testing.assert_close(sampled["query_indices"], complete["query_indices"])
 
 
-def test_continuation_validates_before_updates_and_resumes_sampled_queries(tmp_path, monkeypatch):
+@pytest.mark.parametrize("parent_step,validate_imported", [(46, True), (142, False)])
+def test_continuation_validation_schedule_and_sampled_query_resume(tmp_path, monkeypatch, parent_step, validate_imported):
     source = source_family("training", rows=96, mixed=False)
     cache_path = tmp_path / "source.pt"
     runner.pilot.atomic_save(cache_path, source)
@@ -334,7 +335,7 @@ def test_continuation_validates_before_updates_and_resumes_sampled_queries(tmp_p
     optimizer = torch.optim.AdamW(parent_model.parameters(), lr=.0003, weight_decay=1e-4)
     sum(parameter.square().sum() for parameter in parent_model.parameters()).backward()
     optimizer.step()
-    parent_state = dict(fingerprint="parent", step=46, episode_position=1, query_offset=0,
+    parent_state = dict(fingerprint="parent", step=parent_step, episode_position=int(validate_imported), query_offset=0,
         episode_loss_sum=0., update_loss_sum=.25, record=681, pending_validation=False,
         best_score=float("inf"), best_step=0, best_model=runner.pilot.state_cpu(runner.prior.new_model()),
         model=runner.pilot.state_cpu(parent_model), optimizer=optimizer.state_dict(),
@@ -343,20 +344,20 @@ def test_continuation_validates_before_updates_and_resumes_sampled_queries(tmp_p
     parent_dir = tmp_path / "parent"
     runner.pilot.atomic_save(parent_dir / "state.pt", parent_state)
     locked = dict(parent_dir=str(parent_dir), state_sha256=runner.pilot.hash_file(parent_dir / "state.pt"),
-        parent_fingerprint="parent", completed_updates=46)
+        parent_fingerprint="parent", completed_updates=parent_step, validate_imported_checkpoint=validate_imported)
     manifest = dict(fingerprint="continuation", continuation=locked)
-    options = args(tmp_path / "continued", steps=48, evaluate_every=32,
+    options = args(tmp_path / "continued", steps=parent_step + 2, evaluate_every=320,
         training_query_row_cap=7, resume=True, max_records=1)
     imported = runner.imported_state(options, manifest)
     assert_nested_equal(imported["model"], parent_state["model"])
     assert_nested_equal(imported["optimizer"], parent_state["optimizer"])
-    assert imported["step"] == 46 and imported["episode_position"] == 0 and imported["record"] == 0
+    assert imported["step"] == parent_step and imported["episode_position"] == 0 and imported["record"] == 0
     assert all(gradient is None for gradient in imported["gradients"].values())
     validation_steps = []
 
     def validation_before_updates(options, backbone, model, entries, manifest, step, deadline):
         validation_steps.append(step)
-        if step == 46:
+        if step == parent_step:
             assert_nested_equal(runner.pilot.state_cpu(model), parent_state["model"])
         return dict(mean_nll=1., native_mean_nll=1.)
 
@@ -366,9 +367,9 @@ def test_continuation_validates_before_updates_and_resumes_sampled_queries(tmp_p
     assert not runner.train(options)
     options.max_records = None
     assert runner.train(options)
-    assert validation_steps == [46, 48]
+    assert validation_steps == ([parent_step, parent_step + 2] if validate_imported else [parent_step + 2])
     records = [json.loads(line) for line in (options.output_dir / "chunks.jsonl").read_text().splitlines()]
-    assert len(records) == 8 and {record["step"] for record in records} == {47, 48}
+    assert len(records) == 8 and {record["step"] for record in records} == {parent_step + 1, parent_step + 2}
     assert all(record["query_start"] == 0 and record["query_stop"] == 7 and record["query_pool_rows"] == 18 for record in records)
     # The old state remains byte-for-byte unchanged after continuation and resume.
     assert runner.pilot.hash_file(parent_dir / "state.pt") == locked["state_sha256"]
@@ -376,25 +377,33 @@ def test_continuation_validates_before_updates_and_resumes_sampled_queries(tmp_p
         runner.imported_state(options, dict(manifest, continuation=dict(locked, state_sha256="wrong")))
 
 
-def test_continuation_lock_rejects_optimizer_or_model_changes(tmp_path, monkeypatch):
+@pytest.mark.parametrize("bounded", [False, True])
+def test_continuation_lock_rejects_optimizer_or_model_changes(tmp_path, monkeypatch, bounded):
     parent_dir = tmp_path / "parent"
-    options = args(tmp_path / "new", continue_from_dir=parent_dir)
+    options = args(tmp_path / "new", continue_from_dir=parent_dir, bounded_continuation=bounded)
     settings = dict(lr=.0003, context_row_cap=20000, query_chunk_rows=2048, query_row_cap=2048,
         evaluate_every=32, code_hashes={"model.py": "unchanged", "scripts/joint_preprocessing_fraction_context.py": "new"})
-    parent_settings = dict(settings, query_row_cap=None, evaluate_every=256,
+    parent_settings = dict(settings, query_row_cap=2048 if bounded else None, evaluate_every=32 if bounded else 256,
         code_hashes=dict(settings["code_hashes"], **{"scripts/joint_preprocessing_fraction_context.py": "old"}))
     parent_manifest = dict(fingerprint="parent", settings=parent_settings)
     monkeypatch.setattr(runner, "verified_json", lambda *arguments: parent_manifest)
-    monkeypatch.setattr(runner, "CONTINUATION_FINGERPRINT", "parent")
-    runner.pilot.atomic_save(parent_dir / "state.pt", dict(fingerprint="parent", step=46, episode_position=1, query_offset=0))
+    monkeypatch.setattr(runner, "BOUNDED_PARENT_FINGERPRINT" if bounded else "CONTINUATION_FINGERPRINT", "parent")
+    parent_step = 142 if bounded else 46
+    runner.pilot.atomic_save(parent_dir / "state.pt", dict(fingerprint="parent", step=parent_step,
+        episode_position=0 if bounded else 1, query_offset=0, pending_validation=False, gradients={"head": None}))
     runner.pilot.json_write(parent_dir / "profile/complete.json", dict(fingerprint="parent", passed=True))
-    monkeypatch.setattr(runner, "CONTINUATION_STATE_SHA256", runner.pilot.hash_file(parent_dir / "state.pt"))
+    monkeypatch.setattr(runner, "BOUNDED_PARENT_STATE_SHA256" if bounded else "CONTINUATION_STATE_SHA256",
+        runner.pilot.hash_file(parent_dir / "state.pt"))
     locked = runner.lock_continuation(options, settings)
-    assert locked["completed_updates"] == 46
+    assert locked["completed_updates"] == parent_step
+    assert locked["validate_imported_checkpoint"] is not bounded
     with pytest.raises(ValueError, match="setting change: lr"):
         runner.lock_continuation(options, dict(settings, lr=.001))
     with pytest.raises(ValueError, match="model/dependency changed"):
         runner.lock_continuation(options, dict(settings, code_hashes=dict(settings["code_hashes"], **{"model.py": "changed"})))
+    if bounded:
+        with pytest.raises(ValueError, match="setting change: query_row_cap"):
+            runner.lock_continuation(options, dict(settings, query_row_cap=256))
 
 
 def test_continuation_reuses_passed_gpu_shape_check_without_another_backward(tmp_path, monkeypatch):
@@ -410,3 +419,23 @@ def test_continuation_reuses_passed_gpu_shape_check_without_another_backward(tmp
     assert inherited["passed"] and inherited["fingerprint"] == "continuation"
     assert inherited["reused_parent_fingerprint"] == "parent"
     assert inherited["reports"] == [dict(context_rows=20000)]
+
+
+def test_bounded_specification_requires_exact_stop_and_validation_schedule(tmp_path):
+    options = args(tmp_path, continue_from_dir=tmp_path / "parent", reuse_prepared_dir=tmp_path / "bank",
+        bounded_continuation=True, training_query_row_cap=7, steps=320, evaluate_every=320)
+    settings = runner.specification(options)
+    assert settings["bounded_continuation"] and "step142" in settings["initialization"]
+    assert settings["steps"] == settings["evaluate_every"] == 320
+    options.evaluate_every = 32
+    with pytest.raises(ValueError, match="validate at320 only"):
+        runner.specification(options)
+
+
+def test_bounded_pipeline_stops_after_validation_without_catalog_inference(tmp_path, monkeypatch):
+    options = args(tmp_path, command="pipeline", bounded_continuation=True)
+    monkeypatch.setattr(runner, "parse_args", lambda: options)
+    monkeypatch.setattr(runner, "profile", lambda options: None)
+    monkeypatch.setattr(runner, "train", lambda options: True)
+    monkeypatch.setattr(runner, "evaluate", lambda options: pytest.fail("bounded allocation must stop after validation"))
+    runner.main()

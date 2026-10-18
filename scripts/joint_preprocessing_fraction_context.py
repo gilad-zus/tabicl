@@ -25,6 +25,8 @@ SOURCE_FINGERPRINT = "f28b919a88dac747f4a4c998edf9ce996cd374bf0c8b307ff01af6fd4e
 CATALOG_FINGERPRINT = "4aae70bd8544a962a8c83448b5b00ea6779632b575a2bb9d027c7d0c781a8405"
 CONTINUATION_FINGERPRINT = "8e406f6e46e0550b01c089b846753a3570f40dbabb467d28a48d34a82760cf10"
 CONTINUATION_STATE_SHA256 = "930fa1981520f689e665242ac7fc278bdf223536ad7d985bbf2c92af16c21b1e"
+BOUNDED_PARENT_FINGERPRINT = "facd59803d5ae333b3c712d498db20cc41f45d2a175c3061d5115a7dae9cff0b"
+BOUNDED_PARENT_STATE_SHA256 = "807e0643a7534b88e722ad191dff842f2e486cc09f982f1297405dbb2ce11d17"
 
 
 def split_positions(labels, available_positions, seed, context_row_cap=None):
@@ -201,6 +203,15 @@ def specification(args):
         settings.update(continue_from_dir=str(args.continue_from_dir),
             initialization="completed step46 model and AdamW state; discard unfinished step47 gradients",
             continuation_validation="validate imported checkpoint before any update; then every32 absolute updates")
+        if getattr(args, "bounded_continuation", False):
+            if args.steps != 320 or args.evaluate_every != 320:
+                raise ValueError("bounded continuation must stop and validate at320 only")
+            settings.update(bounded_continuation=True,
+                initialization="completed step142 model, AdamW moments and historical selection; exact update-boundary resume",
+                continuation_validation="no initial sweep; full validation at320 only",
+                evaluation_timing="stop after step320 validation; catalog inference deferred pending decision")
+    elif getattr(args, "bounded_continuation", False):
+        raise ValueError("bounded continuation requires a parent experiment")
     return settings
 
 
@@ -319,16 +330,24 @@ def prepare_from_locked(args, settings):
 
 
 def lock_continuation(args, settings):
-    """Permit only the authorized query-policy/cadence change from the audited step46 run."""
+    """Lock the audited parent and permit only the requested continuation changes."""
+    bounded_continuation = getattr(args, "bounded_continuation", False)
+    parent_fingerprint = BOUNDED_PARENT_FINGERPRINT if bounded_continuation else CONTINUATION_FINGERPRINT
+    expected_state_sha256 = BOUNDED_PARENT_STATE_SHA256 if bounded_continuation else CONTINUATION_STATE_SHA256
+    completed_updates = 142 if bounded_continuation else 46
     parent_manifest = verified_json(args.continue_from_dir, "sources.pt")
-    if parent_manifest["fingerprint"] != CONTINUATION_FINGERPRINT:
+    if parent_manifest["fingerprint"] != parent_fingerprint:
         raise ValueError("unexpected continuation experiment")
     state_path = args.continue_from_dir / "state.pt"
-    if pilot.hash_file(state_path) != CONTINUATION_STATE_SHA256:
+    if pilot.hash_file(state_path) != expected_state_sha256:
         raise ValueError("continuation checkpoint differs from downloaded audited state")
     # Optimizer, backbone, source membership and transformation implementation must match.
     allowed_settings = {"code_hashes", "expected_revision", "query_row_cap", "evaluate_every", "objective",
                         "initialization", "continue_from_dir", "continuation_validation"}
+    if bounded_continuation:
+        # Training policy is identical; only the stopping/evaluation schedule and provenance change.
+        allowed_settings -= {"query_row_cap", "objective"}
+        allowed_settings |= {"steps", "bounded_continuation", "evaluation_timing"}
     parent_settings = parent_manifest["settings"]
     for name in set(parent_settings) | set(settings):
         if name not in allowed_settings and parent_settings.get(name) != settings.get(name):
@@ -338,18 +357,23 @@ def lock_continuation(args, settings):
         if filename not in allowed_code and parent_settings["code_hashes"].get(filename) != settings["code_hashes"].get(filename):
             raise ValueError(f"continuation model/dependency changed: {filename}")
     parent_state = torch.load(state_path, weights_only=True, map_location="cpu")
-    if parent_state["fingerprint"] != CONTINUATION_FINGERPRINT or parent_state["step"] != 46:
-        raise ValueError("expected completed step46 checkpoint")
-    if (parent_state["episode_position"], parent_state["query_offset"]) != (1, 0):
-        raise ValueError("unexpected unfinished step47 cursor")
+    if parent_state["fingerprint"] != parent_fingerprint or parent_state["step"] != completed_updates:
+        raise ValueError(f"expected completed step{completed_updates} checkpoint")
+    expected_cursor = (0, 0) if bounded_continuation else (1, 0)
+    if (parent_state["episode_position"], parent_state["query_offset"]) != expected_cursor:
+        raise ValueError("unexpected continuation episode/query cursor")
+    if bounded_continuation and (parent_state["pending_validation"] or
+            any(gradient is not None for gradient in parent_state["gradients"].values())):
+        raise ValueError("bounded continuation requires a clean update boundary")
     profile_path = args.continue_from_dir / "profile/complete.json"
     profile_result = previous.read(profile_path)
-    if profile_result["fingerprint"] != CONTINUATION_FINGERPRINT or not profile_result["passed"]:
+    if profile_result["fingerprint"] != parent_fingerprint or not profile_result["passed"]:
         raise ValueError("parent profile did not pass")
-    return dict(parent_dir=str(args.continue_from_dir), parent_fingerprint=CONTINUATION_FINGERPRINT,
-        state_sha256=CONTINUATION_STATE_SHA256, completed_updates=46,
+    return dict(parent_dir=str(args.continue_from_dir), parent_fingerprint=parent_fingerprint,
+        state_sha256=expected_state_sha256, completed_updates=completed_updates,
         parent_profile_sha256=pilot.hash_file(profile_path),
-        discarded_partial_update=dict(step=47, completed_episodes=1),
+        validate_imported_checkpoint=not bounded_continuation,
+        discarded_partial_update=None if bounded_continuation else dict(step=47, completed_episodes=1),
         coverage="historical exposure retained, including discarded partial update; new chunks logged separately")
 
 
@@ -363,7 +387,8 @@ def imported_state(args, manifest):
     if state["fingerprint"] != locked["parent_fingerprint"] or state["step"] != locked["completed_updates"]:
         raise ValueError("locked continuation cursor changed")
     state.update(fingerprint=manifest["fingerprint"], episode_position=0, query_offset=0,
-        episode_loss_sum=0., update_loss_sum=0., record=0, pending_validation=True,
+        episode_loss_sum=0., update_loss_sum=0., record=0,
+        pending_validation=locked.get("validate_imported_checkpoint", True),
         gradients={name: None for name in state["gradients"]}, continuation=locked)
     return state
 
@@ -414,7 +439,8 @@ def profile(args):
         inherited_profile = previous.read(parent_profile_path)
         pilot.json_write(args.output_dir / "profile/complete.json", dict(inherited_profile,
             fingerprint=manifest["fingerprint"], reused_parent_fingerprint=locked["parent_fingerprint"]))
-        print("Reusing passed 20000-context/2048-query GPU check; validating step46 before training", flush=True)
+        next_action = "training next update" if not locked.get("validate_imported_checkpoint", True) else "validating imported checkpoint"
+        print(f"Reusing passed 20000-context/2048-query GPU check; {next_action}", flush=True)
         return
     candidates = [entry for entry in entries if entry["panel"] != "evaluation"]
     # Include the longest context, median training table and largest cell count.
@@ -777,6 +803,7 @@ def parse_args():
     parser.add_argument("--catalog-dir", type=Path, required=True)
     parser.add_argument("--reuse-prepared-dir", type=Path)
     parser.add_argument("--continue-from-dir", type=Path, help="Import the audited step46 checkpoint and AdamW moments")
+    parser.add_argument("--bounded-continuation", action="store_true", help="Resume audited step142; train/validate through320, then stop")
     parser.add_argument("--context-row-cap", type=int, default=20000)
     parser.add_argument("--training-query-row-cap", type=int, help="Uniform query subset per training visit; evaluation remains complete")
     parser.add_argument("--candidate-manifest", type=Path, default=residual.DEFAULT_CANDIDATES)
@@ -805,7 +832,7 @@ def main():
             if args.wall_minutes <= 0:
                 return
             training_started = time.monotonic()
-            if train(args):
+            if train(args) and not args.bounded_continuation:
                 args.wall_minutes -= (time.monotonic() - training_started) / 60
                 if args.wall_minutes > 0:
                     evaluate(args)
