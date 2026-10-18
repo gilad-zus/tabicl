@@ -273,3 +273,140 @@ def test_reuse_prepared_bank_changes_only_context_limit(tmp_path, monkeypatch):
     assert saved["nominal_context_rows"] == entry["context_rows"]
     torch.testing.assert_close(saved["fitting_positions"], entry["fitting_positions"])
     torch.testing.assert_close(saved["probe_query_positions"], entry["probe_query_positions"])
+
+
+def test_training_query_sampling_preserves_context_and_complete_evaluation(tmp_path):
+    source = source_family("training", rows=12000, mixed=False)
+    cache_path = tmp_path / "source.pt"
+    runner.pilot.atomic_save(cache_path, source)
+    entry = dict(family="training", panel="train", source_group="training", full_rows=12000,
+        cache_path=str(cache_path), cache_sha256=runner.pilot.hash_file(cache_path),
+        fitting_positions=torch.arange(11744), probe_query_positions=torch.arange(11744, 12000))
+    cache = runner.prior.SourceCache([entry])
+    complete = runner.episode_for(entry, cache, step=47, context_row_cap=4000)
+    sampled = runner.episode_for(entry, cache, step=47, context_row_cap=4000, training_query_row_cap=2048)
+    repeated = runner.episode_for(entry, cache, step=47, context_row_cap=4000, training_query_row_cap=2048)
+    revisited = runner.episode_for(entry, cache, step=48, context_row_cap=4000, training_query_row_cap=2048)
+    assert sampled["n_query"] == 2048 and sampled["query_pool_rows"] == complete["n_query"] == 2349
+    torch.testing.assert_close(sampled["context_indices"], complete["context_indices"])
+    torch.testing.assert_close(sampled["query_indices"], repeated["query_indices"])
+    assert len(set(sampled["query_indices"].tolist())) == 2048
+    assert set(sampled["query_indices"].tolist()) <= set(complete["query_indices"].tolist())
+    assert not set(sampled["query_indices"].tolist()) & set(sampled["context_indices"].tolist())
+    assert not set(sampled["query_indices"].tolist()) & set(range(11744, 12000))
+    assert not torch.equal(sampled["query_indices"], revisited["query_indices"])
+    # No step means evaluation, even on a training source; held-out probes stay reserved.
+    evaluated = runner.episode_for(entry, cache, context_row_cap=4000, training_query_row_cap=2048)
+    assert evaluated["n_query"] == evaluated["query_pool_rows"] == 2349
+    probe = runner.episode_for(entry, cache, probe=True, context_row_cap=4000, training_query_row_cap=100)
+    torch.testing.assert_close(probe["query_indices"], entry["probe_query_positions"])
+    validation_entry = dict(entry, panel="validation")
+    validation = runner.episode_for(validation_entry, cache, context_row_cap=4000, training_query_row_cap=2048)
+    assert validation["n_query"] == 2400
+
+
+def test_query_budget_requires_one_chunk_and_preserves_small_query_pools(tmp_path):
+    settings = runner.specification(args(tmp_path, training_query_row_cap=7))
+    assert settings["query_row_cap"] == 7
+    with pytest.raises(ValueError, match="one positive query chunk"):
+        runner.specification(args(tmp_path, training_query_row_cap=8))
+    with pytest.raises(ValueError, match="one positive query chunk"):
+        runner.specification(args(tmp_path, training_query_row_cap=0))
+    source = source_family("small", rows=96, mixed=False)
+    cache_path = tmp_path / "small.pt"
+    runner.pilot.atomic_save(cache_path, source)
+    entry = dict(family="small", panel="train", source_group="small", cache_path=str(cache_path),
+        cache_sha256=runner.pilot.hash_file(cache_path), fitting_positions=torch.arange(88))
+    cache = runner.prior.SourceCache([entry])
+    complete = runner.episode_for(entry, cache, step=1)
+    sampled = runner.episode_for(entry, cache, step=1, training_query_row_cap=2048)
+    torch.testing.assert_close(sampled["query_indices"], complete["query_indices"])
+
+
+def test_continuation_validates_before_updates_and_resumes_sampled_queries(tmp_path, monkeypatch):
+    source = source_family("training", rows=96, mixed=False)
+    cache_path = tmp_path / "source.pt"
+    runner.pilot.atomic_save(cache_path, source)
+    entry = dict(family="training", panel="train", source_group="training", full_rows=96,
+        cache_path=str(cache_path), cache_sha256=runner.pilot.hash_file(cache_path),
+        fitting_positions=torch.arange(88), probe_query_positions=torch.arange(88, 96))
+    parent_model = trained_model()
+    optimizer = torch.optim.AdamW(parent_model.parameters(), lr=.0003, weight_decay=1e-4)
+    sum(parameter.square().sum() for parameter in parent_model.parameters()).backward()
+    optimizer.step()
+    parent_state = dict(fingerprint="parent", step=46, episode_position=1, query_offset=0,
+        episode_loss_sum=0., update_loss_sum=.25, record=681, pending_validation=False,
+        best_score=float("inf"), best_step=0, best_model=runner.pilot.state_cpu(runner.prior.new_model()),
+        model=runner.pilot.state_cpu(parent_model), optimizer=optimizer.state_dict(),
+        gradients={name: torch.ones_like(parameter) for name, parameter in parent_model.named_parameters()},
+        coverage={"training": {role: torch.zeros(96, dtype=torch.bool) for role in ("context", "query")}})
+    parent_dir = tmp_path / "parent"
+    runner.pilot.atomic_save(parent_dir / "state.pt", parent_state)
+    locked = dict(parent_dir=str(parent_dir), state_sha256=runner.pilot.hash_file(parent_dir / "state.pt"),
+        parent_fingerprint="parent", completed_updates=46)
+    manifest = dict(fingerprint="continuation", continuation=locked)
+    options = args(tmp_path / "continued", steps=48, evaluate_every=32,
+        training_query_row_cap=7, resume=True, max_records=1)
+    imported = runner.imported_state(options, manifest)
+    assert_nested_equal(imported["model"], parent_state["model"])
+    assert_nested_equal(imported["optimizer"], parent_state["optimizer"])
+    assert imported["step"] == 46 and imported["episode_position"] == 0 and imported["record"] == 0
+    assert all(gradient is None for gradient in imported["gradients"].values())
+    validation_steps = []
+
+    def validation_before_updates(options, backbone, model, entries, manifest, step, deadline):
+        validation_steps.append(step)
+        if step == 46:
+            assert_nested_equal(runner.pilot.state_cpu(model), parent_state["model"])
+        return dict(mean_nll=1., native_mean_nll=1.)
+
+    monkeypatch.setattr(runner, "setup", lambda options: (tiny(), runner.prior.new_model(), [entry], manifest))
+    monkeypatch.setattr(runner, "validation", validation_before_updates)
+    runner.pilot.json_write(options.output_dir / "profile/complete.json", dict(fingerprint="continuation", passed=True))
+    assert not runner.train(options)
+    options.max_records = None
+    assert runner.train(options)
+    assert validation_steps == [46, 48]
+    records = [json.loads(line) for line in (options.output_dir / "chunks.jsonl").read_text().splitlines()]
+    assert len(records) == 8 and {record["step"] for record in records} == {47, 48}
+    assert all(record["query_start"] == 0 and record["query_stop"] == 7 and record["query_pool_rows"] == 18 for record in records)
+    # The old state remains byte-for-byte unchanged after continuation and resume.
+    assert runner.pilot.hash_file(parent_dir / "state.pt") == locked["state_sha256"]
+    with pytest.raises(ValueError, match="checkpoint changed"):
+        runner.imported_state(options, dict(manifest, continuation=dict(locked, state_sha256="wrong")))
+
+
+def test_continuation_lock_rejects_optimizer_or_model_changes(tmp_path, monkeypatch):
+    parent_dir = tmp_path / "parent"
+    options = args(tmp_path / "new", continue_from_dir=parent_dir)
+    settings = dict(lr=.0003, context_row_cap=20000, query_chunk_rows=2048, query_row_cap=2048,
+        evaluate_every=32, code_hashes={"model.py": "unchanged", "scripts/joint_preprocessing_fraction_context.py": "new"})
+    parent_settings = dict(settings, query_row_cap=None, evaluate_every=256,
+        code_hashes=dict(settings["code_hashes"], **{"scripts/joint_preprocessing_fraction_context.py": "old"}))
+    parent_manifest = dict(fingerprint="parent", settings=parent_settings)
+    monkeypatch.setattr(runner, "verified_json", lambda *arguments: parent_manifest)
+    monkeypatch.setattr(runner, "CONTINUATION_FINGERPRINT", "parent")
+    runner.pilot.atomic_save(parent_dir / "state.pt", dict(fingerprint="parent", step=46, episode_position=1, query_offset=0))
+    runner.pilot.json_write(parent_dir / "profile/complete.json", dict(fingerprint="parent", passed=True))
+    monkeypatch.setattr(runner, "CONTINUATION_STATE_SHA256", runner.pilot.hash_file(parent_dir / "state.pt"))
+    locked = runner.lock_continuation(options, settings)
+    assert locked["completed_updates"] == 46
+    with pytest.raises(ValueError, match="setting change: lr"):
+        runner.lock_continuation(options, dict(settings, lr=.001))
+    with pytest.raises(ValueError, match="model/dependency changed"):
+        runner.lock_continuation(options, dict(settings, code_hashes=dict(settings["code_hashes"], **{"model.py": "changed"})))
+
+
+def test_continuation_reuses_passed_gpu_shape_check_without_another_backward(tmp_path, monkeypatch):
+    parent_profile_path = tmp_path / "parent/profile/complete.json"
+    runner.pilot.json_write(parent_profile_path, dict(fingerprint="parent", passed=True, reports=[dict(context_rows=20000)]))
+    locked = dict(parent_dir=str(tmp_path / "parent"), parent_fingerprint="parent",
+        parent_profile_sha256=runner.pilot.hash_file(parent_profile_path))
+    manifest = dict(fingerprint="continuation", continuation=locked)
+    monkeypatch.setattr(runner, "setup", lambda options: (None, None, [], manifest))
+    options = args(tmp_path / "continued")
+    runner.profile(options)
+    inherited = runner.previous.read(options.output_dir / "profile/complete.json")
+    assert inherited["passed"] and inherited["fingerprint"] == "continuation"
+    assert inherited["reused_parent_fingerprint"] == "parent"
+    assert inherited["reports"] == [dict(context_rows=20000)]

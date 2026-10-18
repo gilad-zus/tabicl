@@ -1,4 +1,4 @@
-"""One shared zero-shot spline model using all rows in 80/20 dataset episodes."""
+"""Shared zero-shot spline learning with large contexts and sampled training queries."""
 from __future__ import annotations
 
 import argparse
@@ -23,6 +23,8 @@ ROOT = Path(__file__).resolve().parents[1]
 EXPECTED_COUNTS = dict(train=83, validation=10, evaluation=58)
 SOURCE_FINGERPRINT = "f28b919a88dac747f4a4c998edf9ce996cd374bf0c8b307ff01af6fd4ea2c427"
 CATALOG_FINGERPRINT = "4aae70bd8544a962a8c83448b5b00ea6779632b575a2bb9d027c7d0c781a8405"
+CONTINUATION_FINGERPRINT = "8e406f6e46e0550b01c089b846753a3570f40dbabb467d28a48d34a82760cf10"
+CONTINUATION_STATE_SHA256 = "930fa1981520f689e665242ac7fc278bdf223536ad7d985bbf2c92af16c21b1e"
 
 
 def split_positions(labels, available_positions, seed, context_row_cap=None):
@@ -43,7 +45,8 @@ def split_positions(labels, available_positions, seed, context_row_cap=None):
     return dict(context=context_positions, query=query_positions)
 
 
-def episode_for(entry, source_cache, *, step=None, episode_position=0, split=0, probe=False, context_row_cap=None):
+def episode_for(entry, source_cache, *, step=None, episode_position=0, split=0, probe=False,
+                context_row_cap=None, training_query_row_cap=None):
     source = source_cache.get(entry["family"])
     if probe:
         query_positions = entry["probe_query_positions"].numpy()
@@ -60,8 +63,17 @@ def episode_for(entry, source_cache, *, step=None, episode_position=0, split=0, 
         seed = int(np.random.SeedSequence([SEED, step or 0, episode_position, split]).generate_state(1)[0])
         available_positions = entry["fitting_positions"].numpy() if entry["panel"] == "train" else np.arange(len(source["labels"]))
         positions = split_positions(source["labels"], available_positions, seed, context_row_cap)
+    query_pool_rows = len(positions["query"])
+    # Only training visits sample supervision; evaluation retains the complete query pool.
+    if step is not None and entry["panel"] == "train" and not probe and training_query_row_cap is not None:
+        if training_query_row_cap < 1:
+            raise ValueError("training query cap must be positive")
+        if query_pool_rows > training_query_row_cap:
+            query_generator = np.random.default_rng(np.random.SeedSequence([seed, 731]))
+            sampled_query_positions = query_generator.choice(query_pool_rows, training_query_row_cap, replace=False)
+            positions["query"] = positions["query"][sampled_query_positions]
     episode = prior.episode_from_rows(source, positions["context"], positions["query"], seed)
-    episode.update(source_seed=seed, split=split)
+    episode.update(source_seed=seed, split=split, query_pool_rows=query_pool_rows)
     return episode
 
 
@@ -161,10 +173,13 @@ def specification(args):
                  ROOT / "src/tabicl/_hyperspline/statistics_preprocessing.py"):
         settings["code_hashes"][path.relative_to(ROOT).as_posix()] = residual.objective.canonical_hash(path)
     context_row_cap = getattr(args, "context_row_cap", None)
+    training_query_row_cap = getattr(args, "training_query_row_cap", None)
     if context_row_cap is not None and context_row_cap < 10:
         raise ValueError("context cap must retain support for all supported classes")
+    if training_query_row_cap is not None and not 1 <= training_query_row_cap <= args.query_chunk_rows:
+        raise ValueError("sampled training queries must fit one positive query chunk")
     settings.update(arms=["fraction"], alpha=None, seed=SEED, context_fraction=.8, query_fraction=.2,
-        context_row_cap=context_row_cap, query_row_cap=None, query_chunk_rows=args.query_chunk_rows,
+        context_row_cap=context_row_cap, query_row_cap=training_query_row_cap, query_chunk_rows=args.query_chunk_rows,
         reuse_prepared_dir=str(getattr(args, "reuse_prepared_dir", None)),
         initialization="fresh seed0 restricted statistics hypernetwork; exact native16 identity",
         model_parameters=5912, training_precision="FP32; per-view replay; encoder activation recomputation",
@@ -178,6 +193,14 @@ def specification(args):
         hypothesis="substantial context and query fractions improve zero-shot preprocessing",
         runtime_gate="one maximum-cell-count capped gradient check inside training job" if context_row_cap else
             "resource profile must pass at actual uncapped representative sizes before training")
+    if training_query_row_cap is not None:
+        settings["objective"] = "uniform sampled query mean, one chunk, four equal-weight source episodes per update"
+    if getattr(args, "continue_from_dir", None) is not None:
+        if training_query_row_cap is None or args.reuse_prepared_dir is None:
+            raise ValueError("continuation requires sampled queries and the locked preparation")
+        settings.update(continue_from_dir=str(args.continue_from_dir),
+            initialization="completed step46 model and AdamW state; discard unfinished step47 gradients",
+            continuation_validation="validate imported checkpoint before any update; then every32 absolute updates")
     return settings
 
 
@@ -275,6 +298,9 @@ def prepare_from_locked(args, settings):
         entry["nominal_context_rows"] = entry["context_rows"]
         entry["context_rows"] = min(entry["context_rows"], args.context_row_cap)
         entry["unused_context_rows"] = entry["nominal_context_rows"] - entry["context_rows"]
+        # Allocation distinguishes the full query pool from supervision consumed per visit.
+        if getattr(args, "training_query_row_cap", None) is not None:
+            entry["training_query_rows"] = min(entry["query_rows"], args.training_query_row_cap) if entry["panel"] == "train" else None
     pilot.atomic_save(args.output_dir / "sources.pt", dict(entries=entries))
     pilot.atomic_save(args.output_dir / "initial.pt", dict(model=pilot.state_cpu(prior.new_model())))
     pilot.json_write(args.output_dir / "allocation.json", dict(counts=source_manifest["counts"], entries=[
@@ -283,10 +309,63 @@ def prepare_from_locked(args, settings):
         catalog_fingerprint=CATALOG_FINGERPRINT, reused_preparation_fingerprint=source_manifest["fingerprint"],
         backbone=source_manifest["backbone"], previous_checkpoints=source_manifest["previous_checkpoints"],
         files={filename: pilot.hash_file(args.output_dir / filename) for filename in ("sources.pt", "initial.pt", "allocation.json")})
+    if getattr(args, "continue_from_dir", None) is not None:
+        manifest["continuation"] = lock_continuation(args, settings)
     manifest["fingerprint"] = previous.digest(manifest)
     pilot.json_write(args.output_dir / "manifest.json", manifest)
     print(f"Prepared capped experiment: counts={manifest['counts']}, context_cap={args.context_row_cap}, "
-          f"all20% queries retained, fingerprint={manifest['fingerprint']}", flush=True)
+          f"training_query_cap={getattr(args, 'training_query_row_cap', None)}, "
+          f"evaluation retains all20% queries, fingerprint={manifest['fingerprint']}", flush=True)
+
+
+def lock_continuation(args, settings):
+    """Permit only the authorized query-policy/cadence change from the audited step46 run."""
+    parent_manifest = verified_json(args.continue_from_dir, "sources.pt")
+    if parent_manifest["fingerprint"] != CONTINUATION_FINGERPRINT:
+        raise ValueError("unexpected continuation experiment")
+    state_path = args.continue_from_dir / "state.pt"
+    if pilot.hash_file(state_path) != CONTINUATION_STATE_SHA256:
+        raise ValueError("continuation checkpoint differs from downloaded audited state")
+    # Optimizer, backbone, source membership and transformation implementation must match.
+    allowed_settings = {"code_hashes", "expected_revision", "query_row_cap", "evaluate_every", "objective",
+                        "initialization", "continue_from_dir", "continuation_validation"}
+    parent_settings = parent_manifest["settings"]
+    for name in set(parent_settings) | set(settings):
+        if name not in allowed_settings and parent_settings.get(name) != settings.get(name):
+            raise ValueError(f"unauthorized continuation setting change: {name}")
+    allowed_code = {"scripts/joint_preprocessing_fraction_context.py", "scripts/run_joint_preprocessing_fraction_context.sh"}
+    for filename in set(parent_settings["code_hashes"]) | set(settings["code_hashes"]):
+        if filename not in allowed_code and parent_settings["code_hashes"].get(filename) != settings["code_hashes"].get(filename):
+            raise ValueError(f"continuation model/dependency changed: {filename}")
+    parent_state = torch.load(state_path, weights_only=True, map_location="cpu")
+    if parent_state["fingerprint"] != CONTINUATION_FINGERPRINT or parent_state["step"] != 46:
+        raise ValueError("expected completed step46 checkpoint")
+    if (parent_state["episode_position"], parent_state["query_offset"]) != (1, 0):
+        raise ValueError("unexpected unfinished step47 cursor")
+    profile_path = args.continue_from_dir / "profile/complete.json"
+    profile_result = previous.read(profile_path)
+    if profile_result["fingerprint"] != CONTINUATION_FINGERPRINT or not profile_result["passed"]:
+        raise ValueError("parent profile did not pass")
+    return dict(parent_dir=str(args.continue_from_dir), parent_fingerprint=CONTINUATION_FINGERPRINT,
+        state_sha256=CONTINUATION_STATE_SHA256, completed_updates=46,
+        parent_profile_sha256=pilot.hash_file(profile_path),
+        discarded_partial_update=dict(step=47, completed_episodes=1),
+        coverage="historical exposure retained, including discarded partial update; new chunks logged separately")
+
+
+def imported_state(args, manifest):
+    """Copy completed weights/moments without applying the unfinished old-policy gradients."""
+    locked = manifest["continuation"]
+    state_path = Path(locked["parent_dir"]) / "state.pt"
+    if pilot.hash_file(state_path) != locked["state_sha256"]:
+        raise ValueError("locked continuation checkpoint changed")
+    state = torch.load(state_path, weights_only=True, map_location="cpu")
+    if state["fingerprint"] != locked["parent_fingerprint"] or state["step"] != locked["completed_updates"]:
+        raise ValueError("locked continuation cursor changed")
+    state.update(fingerprint=manifest["fingerprint"], episode_position=0, query_offset=0,
+        episode_loss_sum=0., update_loss_sum=0., record=0, pending_validation=True,
+        gradients={name: None for name in state["gradients"]}, continuation=locked)
+    return state
 
 
 def checked_manifest(args):
@@ -325,6 +404,17 @@ def profile(args):
     if (args.output_dir / "profile/complete.json").exists():
         if previous.read(args.output_dir / "profile/complete.json")["fingerprint"] != manifest["fingerprint"]:
             raise ValueError("profile fingerprint changed")
+        return
+    if "continuation" in manifest:
+        # The context and execution chunk sizes are unchanged; reuse the passed GPU shape check.
+        locked = manifest["continuation"]
+        parent_profile_path = Path(locked["parent_dir"]) / "profile/complete.json"
+        if pilot.hash_file(parent_profile_path) != locked["parent_profile_sha256"]:
+            raise ValueError("locked parent GPU profile changed")
+        inherited_profile = previous.read(parent_profile_path)
+        pilot.json_write(args.output_dir / "profile/complete.json", dict(inherited_profile,
+            fingerprint=manifest["fingerprint"], reused_parent_fingerprint=locked["parent_fingerprint"]))
+        print("Reusing passed 20000-context/2048-query GPU check; validating step46 before training", flush=True)
         return
     candidates = [entry for entry in entries if entry["panel"] != "evaluation"]
     # Include the longest context, median training table and largest cell count.
@@ -506,6 +596,8 @@ def train(args):
     train_entries = [entry for entry in entries if entry["panel"] == "train"]
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4, betas=(.9, .999), eps=1e-8)
     state_path = args.output_dir / "state.pt"
+    if not state_path.exists() and "continuation" in manifest:
+        pilot.atomic_save(state_path, imported_state(args, manifest))
     if state_path.exists():
         if not args.resume:
             raise FileExistsError("training state exists; pass --resume")
@@ -559,7 +651,8 @@ def train(args):
         scheduled_entries = residual.diversity.scheduled_sources(train_entries, state["step"] + 1)
         entry = scheduled_entries[state["episode_position"]]
         episode = episode_for(entry, cache, step=state["step"] + 1, episode_position=state["episode_position"],
-            context_row_cap=getattr(args, "context_row_cap", None))
+            context_row_cap=getattr(args, "context_row_cap", None),
+            training_query_row_cap=getattr(args, "training_query_row_cap", None))
         coverage = state["coverage"][entry["family"]]
         coverage["context"][episode["context_indices"]] = True
         prepared = PreparedEpisode(episode)
@@ -583,7 +676,8 @@ def train(args):
             state["record"] += 1
             append_jsonl(args.output_dir / "chunks.jsonl", dict(record=state["record"], step=state["step"] + 1,
                 episode_position=state["episode_position"], family=entry["family"], n_context=episode["n_context"],
-                n_query=episode["n_query"], query_start=query_start, query_stop=query_stop, chunk_loss=loss,
+                n_query=episode["n_query"], query_pool_rows=episode["query_pool_rows"],
+                query_start=query_start, query_stop=query_stop, chunk_loss=loss,
                 context_hash=prior.row_digest(episode["context_indices"]), query_hash=prior.row_digest(episode["query_indices"][query_start:query_stop]),
                 seconds=time.monotonic() - started,
                 native_chunk_nll=generated.last_native_nll,
@@ -594,7 +688,8 @@ def train(args):
             if state["record"] % args.save_every == 0:
                 save()
             print(f"TRAIN step={state['step']+1} episode={state['episode_position']} {entry['family']} "
-                  f"context={episode['n_context']} queries={query_stop}/{episode['n_query']} CE={loss:.6f}", flush=True)
+                  f"context={episode['n_context']} queries={query_stop}/{episode['n_query']} "
+                  f"query_pool={episode['query_pool_rows']} CE={loss:.6f}", flush=True)
             del context, views
             if args.max_records is not None and state["record"] >= args.max_records:
                 save()
@@ -681,14 +776,16 @@ def parse_args():
     parser.add_argument("--source-dir", type=Path, required=True)
     parser.add_argument("--catalog-dir", type=Path, required=True)
     parser.add_argument("--reuse-prepared-dir", type=Path)
+    parser.add_argument("--continue-from-dir", type=Path, help="Import the audited step46 checkpoint and AdamW moments")
     parser.add_argument("--context-row-cap", type=int, default=20000)
+    parser.add_argument("--training-query-row-cap", type=int, help="Uniform query subset per training visit; evaluation remains complete")
     parser.add_argument("--candidate-manifest", type=Path, default=residual.DEFAULT_CANDIDATES)
     parser.add_argument("--expected-revision")
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--steps", type=int, default=2048)
     parser.add_argument("--lr", type=float, default=.0003)
-    parser.add_argument("--evaluate-every", type=int, default=256)
+    parser.add_argument("--evaluate-every", type=int, default=32)
     parser.add_argument("--save-every", type=int, default=10)
     parser.add_argument("--query-chunk-rows", type=int, default=2048)
     parser.add_argument("--continuation-seed", type=int, choices=(0,), default=0)
